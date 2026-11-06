@@ -244,6 +244,14 @@ impl RelativeWorktreeFixture {
         let linked = temp.path().join("linked");
 
         run_git(&["init", path_str(&primary)?])?;
+        run_git(&["-C", path_str(&primary)?, "config", "user.name", "Example"])?;
+        run_git(&[
+            "-C",
+            path_str(&primary)?,
+            "config",
+            "user.email",
+            "example@example.invalid",
+        ])?;
         fs::create_dir_all(primary.join("src")).context("create fixture source directory")?;
         fs::write(primary.join("src/lib.rs"), "pub fn fixture() {}\n")
             .context("write tracked fixture source")?;

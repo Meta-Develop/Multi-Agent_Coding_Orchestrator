@@ -1525,7 +1525,10 @@ fn explicit_ssh_selection_roundtrips_and_never_falls_back() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("uncreated-repository");
+    let repo = temp.path().join("repository");
+    Repository::init(&repo).unwrap();
+    ensure_test_repository_identity(&repo);
+    fs::write(repo.join("README.md"), "baseline\n").unwrap();
     let options = injected_options(&repo, temp.path(), "ssh-must-not-launch");
     let error = run_supervisor_plan_with_runner_and_creation(
         remote,
@@ -1548,7 +1551,7 @@ fn explicit_ssh_selection_roundtrips_and_never_falls_back() {
         assert!(diagnostic.contains(expected), "{diagnostic}");
     }
     assert!(
-        !repo.exists(),
+        !repo.join(".maco").exists(),
         "refusal must precede worktree/artifact creation"
     );
 }
@@ -1590,6 +1593,7 @@ fn assignment_executor_rejects_unknown_kinds_and_invalid_ssh_targets() {
 fn ssh_executor_cannot_be_erased_by_plan_only_loaders() {
     let temp = tempfile::tempdir().unwrap();
     Repository::init(temp.path()).unwrap();
+    ensure_test_repository_identity(temp.path());
     let plan_file = temp.path().join("plan.json");
     let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
     document["assignments"][0]["executor"] = ssh_executor_selection_json();
@@ -2032,6 +2036,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
+    ensure_test_repository_identity(repo);
     fs::create_dir_all(repo.join("src")).expect("create src");
     fs::write(repo.join("src/alpha.rs"), "pub struct AlphaHandler;\n").expect("write alpha");
     fs::write(repo.join("src/beta.rs"), "pub struct BetaHandler;\n").expect("write beta");
@@ -2236,6 +2241,7 @@ fn authoritative_single_file_goal_lowers_to_one_direct_worker() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
+    ensure_test_repository_identity(repo);
     fs::write(repo.join("RELEASE_NOTES.md"), "# Releases\n").expect("write release notes");
     fs::write(
         repo.join("src.rs"),
@@ -2385,6 +2391,7 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
+    ensure_test_repository_identity(&repo);
     fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
     fs::create_dir_all(repo.join(".agents/scripts")).expect("create scripts");
     fs::write(
@@ -2524,6 +2531,7 @@ fn plain_text_gitignored_policy_path_emits_workstream() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
+    ensure_test_repository_identity(&repo);
     fs::write(repo.join(".gitignore"), ".agents/\n").expect("write gitignore");
     fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
     fs::write(
@@ -5886,6 +5894,7 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
+    ensure_test_repository_identity(&repo);
     fs::write(repo.join("README.md"), "# test\n").expect("write readme");
 
     let plain = temp.path().join("task.txt");
@@ -6086,6 +6095,7 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");
+    ensure_test_repository_identity(repo);
     std::fs::create_dir_all(repo.join("src")).expect("src dir");
     std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
     std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");

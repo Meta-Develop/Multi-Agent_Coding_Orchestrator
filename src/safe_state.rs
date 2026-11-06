@@ -3097,6 +3097,16 @@ fn ensure_root_policy(path: &Path, metadata: &fs::Metadata, policy: RootPolicy) 
     ensure_unix_mode_policy(path, mode, policy)
 }
 
+/// Read-only managed-directory policy check. Reuses the root policy that
+/// `SafeRoot::open_existing` enforces, including the group/world-writable refusal.
+#[cfg(unix)]
+pub(crate) fn inspect_managed_directory_mode(path: &Path) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)
+        .with_context(|| format!("failed to inspect managed directory {}", path.display()))?;
+    ensure_directory_metadata(path, &metadata)?;
+    ensure_root_policy(path, &metadata, RootPolicy::Managed)
+}
+
 #[cfg(unix)]
 fn ensure_unix_mode_policy(path: &Path, mode: u32, policy: RootPolicy) -> Result<()> {
     match policy {

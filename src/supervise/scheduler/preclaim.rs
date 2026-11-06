@@ -2438,6 +2438,7 @@ mod tests {
         let temp = tempfile::tempdir().expect("temporary preclaim repository");
         let repo_path = temp.path().join("repo");
         let repository = git2::Repository::init(&repo_path).expect("initialize repository");
+        super::super::super::tests::ensure_test_repository_identity(&repo_path);
         std::fs::create_dir_all(repo_path.join(relative).parent().expect("file parent"))
             .expect("create repository file parent");
         std::fs::write(repo_path.join(relative), contents).expect("write repository file");

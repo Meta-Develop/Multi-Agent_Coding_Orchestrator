@@ -2601,6 +2601,14 @@ mod tests {
         TaskProfile,
         crate::selection::routing_policy::RoutingPolicyGuard,
     )> {
+        // The selector binds a writable execution plan, which refuses a path that
+        // is not a repository with local identity before any provider dispatch.
+        let repository = git2::Repository::init(repo)
+            .context("initialize this-run selector fixture repository")?;
+        let mut local = git2::Config::open(&repository.path().join("config"))
+            .context("open this-run selector fixture config")?;
+        local.set_str("user.name", "maco test")?;
+        local.set_str("user.email", "maco-test@example.invalid")?;
         let priors = crate::selection::built_in_prior_dataset()?;
         let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
             priors

@@ -12,7 +12,15 @@ fn init_repo() -> (tempfile::TempDir, std::path::PathBuf) {
     let repo = temp.path().join("repo");
     fs::create_dir_all(repo.join("src")).expect("src");
     fs::write(repo.join("README.md"), "hello\n").expect("readme");
-    Repository::init(&repo).expect("initialize repository");
+    let repository = Repository::init(&repo).expect("initialize repository");
+    let mut local =
+        git2::Config::open(&repository.path().join("config")).expect("open local Git config");
+    local
+        .set_str("user.name", "maco test")
+        .expect("set repository-local user.name");
+    local
+        .set_str("user.email", "maco-test@example.invalid")
+        .expect("set repository-local user.email");
     (temp, repo)
 }
 

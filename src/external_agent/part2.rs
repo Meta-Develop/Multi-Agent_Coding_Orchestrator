@@ -2910,6 +2910,13 @@ fn managed_child_commit_edge_paths(
 }
 
 const MANAGED_CHILD_PRIVATE_GIT_DIR: &str = "maco-private-git-v1";
+
+#[cfg(unix)]
+fn stale_retained_private_git_remediation() -> String {
+    format!(
+        "Private state retained from a prior run is stale. Remove each retained {MANAGED_CHILD_PRIVATE_GIT_DIR} directory under the common Git worktrees directory and start a fresh managed run so private config is recreated from the current repository-local policy. Do not edit the retained file in place."
+    )
+}
 const MANAGED_CHILD_PRIVATE_REF: &str = "refs/heads/maco-managed-child";
 
 #[cfg(unix)]
@@ -4004,6 +4011,58 @@ fn decode_managed_child_config_value(raw: &[u8]) -> Result<String> {
 }
 
 #[cfg(unix)]
+fn validate_private_regular_file(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
+    if metadata.file_type().is_symlink()
+        || !metadata.is_file()
+        || metadata.nlink() != 1
+        || metadata.len() > max_bytes
+    {
+        bail!("{label} is not a bounded single-link regular file");
+    }
+    fs::read(path).with_context(|| format!("failed to read {label}"))
+}
+
+#[cfg(unix)]
+fn expected_managed_child_private_config(
+    common_config: &Path,
+    require_attribution: bool,
+) -> Result<Vec<u8>> {
+    let common_config_bytes = read_bounded_regular_file_nofollow(common_config, 1024 * 1024)
+        .context("failed to read managed child common Git config")?;
+    let common_policy =
+        crate::worktree::parse_bounded_local_git_config(Some(&common_config_bytes))?;
+    let filemode = if common_policy.core_filemode {
+        "true"
+    } else {
+        "false"
+    };
+    managed_child_private_config_with_attribution(
+        &common_config_bytes,
+        filemode,
+        require_attribution,
+    )
+}
+
+#[cfg(unix)]
+fn retained_private_git_config_matches(
+    private_git_dir: &Path,
+    expected_config: &[u8],
+) -> Result<()> {
+    if validate_private_regular_file(
+        &private_git_dir.join("config"),
+        "managed child private Git config",
+        16 * 1024,
+    )? != expected_config
+    {
+        bail!("managed child private Git config changed from its fixed policy");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn prepare_managed_child_private_git_dir(
     workspace: &Path,
     worktree_git_dir: &Path,
@@ -4036,32 +4095,8 @@ fn prepare_managed_child_private_git_dir(
             .with_context(|| format!("failed to sync private Git file {}", path.display()))
     }
 
-    fn validate_private_regular_file(path: &Path, label: &str, max_bytes: u64) -> Result<Vec<u8>> {
-        let metadata = fs::symlink_metadata(path).with_context(|| format!("{label} is missing"))?;
-        if metadata.file_type().is_symlink()
-            || !metadata.is_file()
-            || metadata.nlink() != 1
-            || metadata.len() > max_bytes
-        {
-            bail!("{label} is not a bounded single-link regular file");
-        }
-        fs::read(path).with_context(|| format!("failed to read {label}"))
-    }
-
-    let common_config_bytes = read_bounded_regular_file_nofollow(common_config, 1024 * 1024)
-        .context("failed to read managed child common Git config")?;
-    let common_policy =
-        crate::worktree::parse_bounded_local_git_config(Some(&common_config_bytes))?;
-    let filemode = if common_policy.core_filemode {
-        "true"
-    } else {
-        "false"
-    };
-    let expected_config = managed_child_private_config_with_attribution(
-        &common_config_bytes,
-        filemode,
-        require_attribution,
-    )?;
+    let expected_config =
+        expected_managed_child_private_config(common_config, require_attribution)?;
     let private_git_dir = worktree_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR);
     match fs::symlink_metadata(&private_git_dir) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound && !create_if_missing => {
@@ -4140,14 +4175,7 @@ fn prepare_managed_child_private_git_dir(
         .context("managed child private Git ref is not UTF-8")?
         .trim_end_matches(['\r', '\n']);
     Oid::from_str(ref_text).context("managed child private Git ref is not an object id")?;
-    if validate_private_regular_file(
-        &private_git_dir.join("config"),
-        "managed child private Git config",
-        16 * 1024,
-    )? != expected_config
-    {
-        bail!("managed child private Git config changed from its fixed policy");
-    }
+    retained_private_git_config_matches(&private_git_dir, &expected_config)?;
     validate_private_regular_file(
         &private_git_dir.join("index"),
         "managed child private Git index",
@@ -4492,6 +4520,220 @@ fn reject_git_read_only_tree_aliases(root: &Path, label: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct StaticRepositoryCondition {
+    pub message: String,
+    pub paths: Vec<PathBuf>,
+}
+
+#[cfg(unix)]
+fn identity_condition_message(error: &anyhow::Error) -> String {
+    if error.is::<ManagedChildPreflightRefusal>() {
+        let guidance = environment_remediation(EnvironmentFailureCategory::MissingGitAttribution)
+            .into_iter()
+            .map(|item| item.guidance)
+            .collect::<Vec<_>>()
+            .join(" ");
+        format!("{error} {guidance}")
+    } else {
+        error.to_string()
+    }
+}
+
+/// Read-only evaluation of the static repository conditions that a writable
+/// managed child rechecks at launch. This does not create private Git state.
+pub(crate) fn static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepositoryCondition>> {
+    #[cfg(unix)]
+    {
+        unix_static_repository_conditions(repo)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = repo;
+        Ok(Vec::new())
+    }
+}
+
+#[cfg(unix)]
+fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepositoryCondition>> {
+    const MAX_RETAINED_WORKTREES: usize = 10_000;
+
+    let repository = crate::git_repository::open(repo).with_context(|| {
+        format!(
+            "failed to open repository for static condition preflight {}",
+            repo.display()
+        )
+    })?;
+    let workdir = repository
+        .workdir()
+        .context("repository has no worktree for static condition preflight")?;
+    let workdir = fs::canonicalize(workdir)
+        .context("repository worktree could not be resolved for static condition preflight")?;
+    let common_dir = fs::canonicalize(repository.commondir())
+        .context("repository common directory could not be resolved for static condition preflight")?;
+
+    let mut identity: Option<(String, Vec<PathBuf>)> = None;
+    let mut hardlink_messages = Vec::new();
+    let mut hardlink_paths = Vec::new();
+    let mut mode_messages = Vec::new();
+    let mut mode_paths = Vec::new();
+    let mut expected_config = None;
+
+    for (path, label) in [
+        (workdir.as_path(), "worktree"),
+        (common_dir.as_path(), "Git common directory"),
+    ] {
+        if let Err(error) = crate::safe_state::inspect_managed_directory_mode(path) {
+            mode_messages.push(format!("{label}: {error}"));
+            mode_paths.push(path.to_path_buf());
+        }
+    }
+
+    match canonical_git_directory(&common_dir.join("objects"), "Git object directory") {
+        Ok(objects) => {
+            if let Err(error) = reject_git_object_aliases(&objects) {
+                hardlink_messages.push(error.to_string());
+                hardlink_paths.push(objects);
+            }
+        }
+        Err(error) => {
+            hardlink_messages.push(error.to_string());
+            hardlink_paths.push(common_dir.join("objects"));
+        }
+    }
+
+    let config_path = match canonical_git_file(&common_dir.join("config"), "Git common config") {
+        Ok(path) => Some(path),
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("hard-link") {
+                hardlink_paths.push(common_dir.join("config"));
+                hardlink_messages.push(message);
+                None
+            } else {
+                return Err(error);
+            }
+        }
+    };
+    if let Some(config_path) = config_path {
+        match expected_managed_child_private_config(&config_path, true) {
+            Ok(bytes) => expected_config = Some(bytes),
+            Err(error) => {
+                identity = Some((identity_condition_message(&error), vec![config_path]));
+            }
+        }
+    }
+
+    let stale = if let Some(expected_config) = expected_config.as_deref() {
+        scan_stale_retained_private_git_configs(&common_dir, expected_config, MAX_RETAINED_WORKTREES)?
+    } else {
+        None
+    };
+
+    let mut findings = Vec::new();
+    if let Some((message, paths)) = identity {
+        findings.push(StaticRepositoryCondition { message, paths });
+    }
+    push_static_condition(&mut findings, hardlink_messages, hardlink_paths);
+    push_static_condition(&mut findings, mode_messages, mode_paths);
+    if let Some(stale) = stale {
+        findings.push(stale);
+    }
+    Ok(findings)
+}
+
+#[cfg(unix)]
+fn push_static_condition(
+    findings: &mut Vec<StaticRepositoryCondition>,
+    messages: Vec<String>,
+    paths: Vec<PathBuf>,
+) {
+    if messages.is_empty() {
+        return;
+    }
+    findings.push(StaticRepositoryCondition {
+        message: messages.join(" "),
+        paths,
+    });
+}
+
+#[cfg(unix)]
+fn scan_stale_retained_private_git_configs(
+    common_dir: &Path,
+    expected_config: &[u8],
+    max_entries: usize,
+) -> Result<Option<StaticRepositoryCondition>> {
+    let worktrees = common_dir.join("worktrees");
+    let metadata = match fs::symlink_metadata(&worktrees) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).context("failed to inspect retained managed child worktrees")
+        }
+        Ok(metadata) => metadata,
+    };
+    if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Ok(Some(StaticRepositoryCondition {
+            message: format!(
+                "managed child private Git path is not a non-symlink directory. {}",
+                stale_retained_private_git_remediation()
+            ),
+            paths: vec![worktrees],
+        }));
+    }
+    let entries = fs::read_dir(&worktrees).context("failed to inspect retained managed child worktrees")?;
+    let mut messages = Vec::new();
+    let mut paths = Vec::new();
+    let mut policy_changed = false;
+    for (index, entry) in entries.enumerate() {
+        if index >= max_entries {
+            bail!(
+                "retained managed child worktree inspection exceeded its {max_entries}-entry safety bound"
+            );
+        }
+        let entry = entry.context("failed to inspect a retained managed child worktree")?;
+        let entry_metadata = fs::symlink_metadata(entry.path())
+            .context("failed to inspect a retained managed child worktree")?;
+        if entry_metadata.file_type().is_symlink() || !entry_metadata.is_dir() {
+            continue;
+        }
+        let private_git_dir = entry.path().join(MANAGED_CHILD_PRIVATE_GIT_DIR);
+        match fs::symlink_metadata(&private_git_dir) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                messages.push(format!(
+                    "failed to inspect retained managed child private Git directory: {error}"
+                ));
+                paths.push(private_git_dir);
+            }
+            Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                messages.push(
+                    "managed child private Git path is not a non-symlink directory".to_string(),
+                );
+                paths.push(private_git_dir);
+            }
+            Ok(_) => match retained_private_git_config_matches(&private_git_dir, expected_config) {
+                Ok(()) => {}
+                Err(error) => {
+                    let message = error.to_string();
+                    policy_changed |= message.contains("changed from its fixed policy");
+                    messages.push(message);
+                    paths.push(private_git_dir);
+                }
+            },
+        }
+    }
+    if messages.is_empty() {
+        return Ok(None);
+    }
+    if policy_changed {
+        messages.push(stale_retained_private_git_remediation());
+    }
+    Ok(Some(StaticRepositoryCondition {
+        message: messages.join(" "),
+        paths,
+    }))
 }
 
 #[cfg(not(unix))]

@@ -525,7 +525,45 @@ pub(super) fn validate_supervisor_plan_in_repo(
 
     validate_assignment_decision_refs_for_repo(&plan.assignments, repo)?;
     assignment_shape::validate_assignment_shapes(&plan, &metadata)?;
+    if let Some(repo) = repo {
+        if plan_has_writable_worker_or_assignment(&plan) {
+            // Same static conditions as the pre-dispatch preflight. Launch checks
+            // them again because the repository can change before a child starts.
+            refuse_writable_static_repository_conditions(repo)?;
+        }
+    }
     Ok((plan, metadata))
+}
+
+pub(super) fn plan_has_writable_worker_or_assignment(plan: &SupervisorPlan) -> bool {
+    plan.assignments.iter().any(|assignment| {
+        assignment.phase == AssignmentPhase::Execution
+            && (assignment.effective_role_category().may_write()
+                || assignment
+                    .worker_assignments
+                    .iter()
+                    .any(|worker| worker.effective_role_category().may_write()))
+    })
+}
+
+pub(super) fn refuse_writable_static_repository_conditions(repo: &Path) -> Result<()> {
+    let findings = crate::external_agent::static_repository_conditions(repo)
+        .context("failed to evaluate static repository conditions")?;
+    if findings.is_empty() {
+        return Ok(());
+    }
+    let messages = findings
+        .into_iter()
+        .map(|finding| finding.message)
+        .collect::<Vec<_>>();
+    let mut error = anyhow::anyhow!(messages
+        .last()
+        .cloned()
+        .unwrap_or_else(|| "static repository condition failed".to_string()));
+    for message in messages.iter().rev().skip(1) {
+        error = error.context(message.clone());
+    }
+    Err(error.context("static repository conditions refuse this writable plan"))
 }
 
 /// Citations declared on assignments. Empty or omitted refs do not require a

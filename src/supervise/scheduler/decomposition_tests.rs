@@ -1728,6 +1728,14 @@ fn test_repository() -> (tempfile::TempDir, PathBuf) {
     let temp = tempfile::tempdir().expect("temporary scheduler repository");
     let repo = temp.path().join("repo");
     let repository = Repository::init(&repo).expect("initialize scheduler repository");
+    let mut local = git2::Config::open(&repository.path().join("config"))
+        .expect("open scheduler fixture config");
+    local
+        .set_str("user.name", "maco test")
+        .expect("set scheduler fixture user.name");
+    local
+        .set_str("user.email", "maco-test@example.invalid")
+        .expect("set scheduler fixture user.email");
     fs::write(repo.join("README.md"), "scheduler fixture\n")
         .expect("write scheduler repository fixture");
     fs::write(

@@ -326,6 +326,14 @@ operator-reported native catalog on 2026-10-17 lists `grok-4.7` (default),
 The run must still admit the selected model and effort from CAM-bound metadata.
 
 Set: `repo=/path/to/target-repo`, `base=$XDG_RUNTIME_DIR/maco-e2e`, `run_id=example-1`, `maco=/path/to/target/release/maco`.
+
+A writable fixture repository has to satisfy these conditions before `supervise plan` or `supervise run`. `supervise plan` with `--repo` refuses a writable plan when any condition fails, one message per condition, and does not start a runtime. Launch checks them again because the repository can change before a child starts. Read-only plans skip the repository-local identity check. These checks do not select an account or a catalog.
+
+- Repository-local `user.name` and `user.email`. Global Git identity is not projected.
+- Clone with `git clone --no-hardlinks` and without `--reference`, so Git object storage has no hard-link aliases.
+- The worktree and the Git common directory must not be group- or world-writable (no mode bit `022`).
+- Remove stale `maco-private-git-v1` directories retained under `.git/worktrees/` from an earlier run, then start a fresh managed run so private Git config is recreated from the current repository-local policy. Do not edit the retained file in place.
+
 Copy the complete example plan for the exact README append task:
 
 ```bash
@@ -341,7 +349,8 @@ fragment, and worker scope against the bundled frozen policy. Its risk,
 complexity, horizon, and context are explicitly `policy_heuristic`, not measured
 runtime evidence. Omitting it leaves task risk unknown; selection refuses with
 `task.risk must be known before candidate evaluation` even when preclaim passed.
-The non-spawning JSON plan check validates the document and replay; it does not
+The non-spawning JSON plan check validates the document and replay. With
+`--repo`, it also applies the writable fixture conditions above. It does not
 check live account/catalog eligibility or run the selector. Notes are opaque to
 that check, so parser success alone does not prove that an older executable
 understands the verification contract. The wrapper also probes goal lowering.

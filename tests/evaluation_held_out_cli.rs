@@ -87,6 +87,9 @@ fn execute(commands: Value, max_dispatches: u32) -> Result<(TempDir, ExecutedExp
 fn init_source_repo(workspace: &Path) -> Result<(PathBuf, String, String)> {
     let repo_path = workspace.join("evaluated-source");
     let repo = git2::Repository::init(&repo_path)?;
+    let mut local = git2::Config::open(&repo.path().join("config"))?;
+    local.set_str("user.name", "held-out-cli")?;
+    local.set_str("user.email", "held-out-cli@example.invalid")?;
     fs::write(repo_path.join("README.md"), "evaluated source tree\n")?;
     let mut index = repo.index()?;
     index.add_all(["*"], git2::IndexAddOption::DEFAULT, None)?;

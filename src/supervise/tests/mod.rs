@@ -17,6 +17,7 @@ mod role_transition;
 mod run_artifacts;
 mod scheduler;
 mod source_base;
+mod static_repository_preflight;
 use super::*;
 use crate::{
     external_agent::{
@@ -284,6 +285,24 @@ fn assert_final_decision_event<T: ReportStatus>(
         event.payload["status"],
         serde_json::to_value(report.status()).expect("serialize report status")
     );
+}
+
+/// Repository-local author for writable fixture plans. Global identity is not projected.
+pub(super) fn ensure_test_repository_identity(repo: &Path) {
+    let repository =
+        crate::git_repository::open(repo).expect("open fixture repository for local identity");
+    let mut local = git2::Config::open(&repository.commondir().join("config"))
+        .expect("open fixture local Git config");
+    for (key, value) in [
+        ("user.name", "maco test"),
+        ("user.email", "maco-test@example.invalid"),
+    ] {
+        if !local.get_string(key).is_ok_and(|actual| actual == value) {
+            local
+                .set_str(key, value)
+                .expect("set fixture local identity");
+        }
+    }
 }
 
 pub(super) fn injected_repository() -> (tempfile::TempDir, PathBuf) {
