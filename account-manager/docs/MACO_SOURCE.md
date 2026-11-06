@@ -66,7 +66,15 @@ cargo run --locked -p coding-agent-manager --bin cam-grok-setup -- complete work
 `status` shows stored metadata only; it does not read vendor auth. `complete`
 requires the exact pending incarnation, validates the vendor-written OAuth
 file using the adapter, and atomically marks the account complete and selects
-it. This explicit command may replace a previous Grok selection. Active CAM
+it. It then runs `grok --no-auto-update models` with `GROK_HOME` set to the
+managed home and with `GROK_AUTH_PATH`, `XAI_API_KEY`, and `OPENAI_API_KEY`
+removed. Only that vendor command may write `models_cache.json`. Setup reports
+the count of models with a non-empty known effort menu, and holds that account's
+use lease until the vendor exits. If the refresh fails, the account
+stays complete and selected, the command exits 0, and the output gives
+`cam-grok-setup --data-dir … refresh-models <id>`. `refresh-models` repeats
+only that catalog refresh for an existing complete account. `complete` may
+replace a previous Grok selection. Active CAM
 use/login leases, vendor locks, unsafe homes, stale incarnations, missing or
 invalid auth, and completion replay are refused. Failed validation leaves the
 previous selection and pending state unchanged. If a storage write fails,

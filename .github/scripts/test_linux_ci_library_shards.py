@@ -26,7 +26,7 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
         self.assertEqual(
             self.shards.SHARDS,
             ("autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
-             "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
+             "supervise-nested-driver", "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
              "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest"),
         )
 
@@ -58,6 +58,12 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
             "supervise::assignment_execution::decomposition_tests::new",
             "supervise::assignment_execution::managed_parent_controller_tests::new",
             "supervise::assignment_execution::nested_worker::new",
+            "supervise::assignment_execution::nested_driver_tests::new",
+            "supervise::assignment_execution::worker_dispatch_limits_tests::new",
+            "supervise::assignment_execution::isolated_worker_evidence_tests::new",
+            "supervise::assignment_execution::messaging_ipc_tests::new",
+            "supervise::assignment_execution::managed_parent_process_tests::new",
+            "supervise::assignment_execution::future_nested::new",
             "supervise::assignment_execution::attached_parent_capture_tests::new",
             "supervise::assignment_execution::bound_parent_turn_tests::new",
             "external_agent::new", "worktree::new", "future_module::new",
@@ -70,8 +76,13 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
                           and not n.startswith("supervise::tests::"))
         old_rest = sorted(n for n in inventory if not n.startswith(("autopilot::", "supervise::")))
         self.assertEqual(sorted(n for key in ("supervise-core", "supervise-bound", "supervise-decomposition",
-                                              "supervise-parent", "supervise-nested")
+                                              "supervise-parent", "supervise-nested-driver", "supervise-nested")
                                 for n in parts[key]), old_core)
+        for prefix in self.shards.NESTED_DRIVER_PREFIXES:
+            self.assertIn(f"{prefix}new", parts["supervise-nested-driver"])
+        self.assertIn("supervise::assignment_execution::managed_parent_process_tests::new", parts["supervise-nested"])
+        self.assertIn("supervise::assignment_execution::nested_worker::new", parts["supervise-nested"])
+        self.assertIn("supervise::assignment_execution::future_nested::new", parts["supervise-nested"])
         self.assertEqual(sorted(n for key in ("external-agent", "worktree", "rest")
                                 for n in parts[key]), old_rest)
         flattened = [n for group in parts.values() for n in group]

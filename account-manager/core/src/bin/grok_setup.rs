@@ -1,4 +1,5 @@
-//! Owner-operated setup only: this binary never launches Grok or reads stdin.
+//! Owner-operated setup. This binary never reads stdin and never starts login.
+//! `complete` and `refresh-models` may run one catalog-only Grok command.
 
 fn main() -> std::process::ExitCode {
     let args: Result<Vec<_>, _> = std::env::args_os()

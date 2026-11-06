@@ -57,7 +57,12 @@ and exactly `binary_sha256`, `source_manifest_sha256`, and `setup_entry_sha256`
 in addition to `schema`. It binds the final setup ELF, the same source manifest,
 and immutable `account-manager/core/src/bin/grok_setup.rs`. Packaging checks
 its metadata-only `--help` route without preparing an account or starting
-vendor login.
+vendor login. At runtime, `complete` and `refresh-models` on `cam-codex-setup`
+and `cam-grok-setup` run one catalog-only vendor command and report the
+count of models with a non-empty known effort menu in text and JSON. The
+command holds that account's use lease until the vendor exits. A failed refresh leaves the account
+complete and prints the `refresh-models` command. The install check does not
+run those commands.
 
 The main and setup binaries are regular native ELFs. Both manifest copies and
 the declarations are regular, bounded files installed with mode
@@ -105,7 +110,7 @@ final main ELF and entry source. The producer also validates the setup
 declaration and exposes the final setup ELF hash as `grok_setup_sha256`.
 The existing closure receipt schema and consumer checks are preserved; the
 payload covers the setup binary and its declaration in the same package root.
-The three library shards and integration job
+The Linux library shards and integration jobs
 download that exact artifact in the same run. They verify hashes before parsing
 the receipt or importing into a real Nix store, retain normal signature/trust
 policy, and check protected ancestry, final bytes and checkout source entries.

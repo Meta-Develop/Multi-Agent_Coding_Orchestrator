@@ -274,6 +274,135 @@ fn worker_journal_native_edit_observes_repeated_edits_and_never_executes_argv() 
 }
 
 #[test]
+fn worker_journal_pending_native_delta_has_exact_recoverable_observation() {
+    use clap::Parser;
+
+    for fresh_attempt in [false, true] {
+        let (_temp, worktree, prior_path, prior_identity) = observed_fixture();
+        let observation = observed_entry(&worktree, &["true"]);
+        run_worker_execution_journal_command(&prior_path, &prior_identity, &observation, true)
+            .unwrap();
+        let prior_bytes = fs::read(&prior_path).unwrap();
+        fs::write(worktree.join("README.md"), "original\nnative edit once\n").unwrap();
+        // Relaunches reserve a fresh journal while keeping the dirty worktree.
+        // Quotes/newlines must survive the copyable recovery argv too.
+        let (path, identity) = if fresh_attempt {
+            let path = prior_path.with_file_name("attempt 2's\nworker.jsonl");
+            let identity = journal(&path);
+            (path, identity)
+        } else {
+            (prior_path.clone(), prior_identity.clone())
+        };
+        let before = fs::read(&path).unwrap();
+        let command = observed_entry(
+            &worktree,
+            &["/bin/sh", "-c", "test -f README.md; touch verified"],
+        );
+        let error = run_worker_execution_journal_command(&path, &identity, &command, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.starts_with("WorkerJournalObservationRequired:"),
+            "{error}"
+        );
+        assert!(error.contains("no command launched; journal unchanged"));
+        assert!(error.contains("as the very next action"));
+        assert!(error.contains("Only after successful observation"));
+        assert_eq!(fs::read(&path).unwrap(), before);
+        assert!(!worktree.join("verified").exists());
+        let argv: Vec<String> = serde_json::from_str(
+            error
+                .split_once("Observation argv (JSON array): ")
+                .unwrap()
+                .1,
+        )
+        .unwrap();
+        assert_eq!(Path::new(&argv[0]), std::env::current_exe().unwrap());
+        assert_eq!(argv[4], path.to_str().unwrap());
+        assert_eq!(argv[6], identity.device.to_string());
+        assert_eq!(argv[8], identity.file.to_string());
+        assert_eq!(argv[10], worktree.to_str().unwrap());
+        assert_eq!(
+            &argv[11..],
+            ["--auto-timestamps", "--observe-changes", "--", "true"]
+        );
+        crate::cli::Cli::try_parse_from(argv)
+            .unwrap()
+            .run()
+            .unwrap();
+        let entries = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+        let observed = entries.last().unwrap();
+        assert_eq!(observed.command, ["true"]);
+        assert_eq!(observed.changed_paths, [PathBuf::from("README.md")]);
+        assert_eq!(
+            observed.observation.as_ref().unwrap().phase,
+            WorkerJournalObservationPhase::NativeEdit
+        );
+        if fresh_attempt {
+            assert!(observed.observation.as_ref().unwrap().before.is_empty());
+            assert_eq!(fs::read(&prior_path).unwrap(), prior_bytes);
+        }
+        assert!(!worktree.join("verified").exists());
+        run_worker_execution_journal_command(&path, &identity, &command, false).unwrap();
+        assert!(worktree.join("verified").exists());
+        assert_eq!(
+            fs::read_to_string(worktree.join("README.md")).unwrap(),
+            "original\nnative edit once\n"
+        );
+        verify_worker_journal_identity(&fs::metadata(&path).unwrap(), &identity).unwrap();
+    }
+}
+
+#[test]
+fn worker_journal_pending_delta_does_not_make_integrity_failures_recoverable() {
+    for failure in ["identity", "head", "unfinished", "symlink"] {
+        let (_temp, worktree, path, mut identity) = observed_fixture();
+        let observation = observed_entry(&worktree, &["true"]);
+        run_worker_execution_journal_command(&path, &identity, &observation, true).unwrap();
+        fs::write(worktree.join("README.md"), "pending native edit\n").unwrap();
+        match failure {
+            "identity" => identity.file = identity.file.wrapping_add(1),
+            "head" => fs::write(worktree.join(".git/HEAD"), "ref: refs/heads/other\n").unwrap(),
+            "unfinished" => {
+                let mut records =
+                    parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+                records[0].observation.as_mut().unwrap().phase =
+                    WorkerJournalObservationPhase::Started;
+                // Model an interrupted wrapped command, never a repair.
+                fs::write(
+                    &path,
+                    format!("{}\n", serde_json::to_string(&records[0]).unwrap()),
+                )
+                .unwrap();
+            }
+            "symlink" => {
+                fs::remove_file(worktree.join("README.md")).unwrap();
+                symlink("../outside", worktree.join("README.md")).unwrap();
+            }
+            _ => unreachable!(),
+        }
+        let before = fs::read(&path).unwrap();
+        for observe_changes in [false, true] {
+            let error = run_worker_execution_journal_command(
+                &path,
+                &identity,
+                &observed_entry(&worktree, &["/bin/sh", "-c", "touch should-not-run"]),
+                observe_changes,
+            )
+            .unwrap_err();
+            assert!(
+                !error
+                    .to_string()
+                    .contains("WorkerJournalObservationRequired"),
+                "{failure}: {error:#}"
+            );
+            assert_eq!(fs::read(&path).unwrap(), before, "{failure}");
+            assert!(!worktree.join("should-not-run").exists());
+        }
+    }
+}
+
+#[test]
 fn worker_journal_native_observation_recovers_after_proven_no_launch() {
     let _fallback = Openat2Error::force(libc::ENOSYS).with_statx_enosys();
     for tool_startup_failure in [true, false] {
@@ -504,6 +633,9 @@ fn worker_journal_failed_command_retains_observed_mutation() {
     );
     let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
     assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
+    assert!(!error
+        .to_string()
+        .contains("WorkerJournalObservationRequired"));
     let records =
         parse_worker_execution_journal(&fs::read(path).unwrap(), Path::new("journal")).unwrap();
     assert_eq!(records[1].changed_paths, vec![PathBuf::from("README.md")]);
@@ -517,6 +649,9 @@ fn worker_journal_enosys_launch_failure_has_completed_observation() {
     let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
     assert!(error.to_string().contains("failed to launch"));
     assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
+    assert!(!error
+        .to_string()
+        .contains("WorkerJournalObservationRequired"));
     let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
     assert_eq!(records.len(), 2);
     assert_eq!(
@@ -545,6 +680,9 @@ fn worker_journal_enosys_observation_failure_is_terminal_and_refuses_retry() {
             "{error:#}"
         );
         assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
+        assert!(!error
+            .to_string()
+            .contains("WorkerJournalObservationRequired"));
         let bytes = fs::read(&path).unwrap();
         let records: Vec<WorkerExecutionJournalEntry> = bytes
             .split(|byte| *byte == b'\n')

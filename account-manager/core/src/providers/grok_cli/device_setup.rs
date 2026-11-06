@@ -2,6 +2,9 @@
 //!
 //! Only non-secret metadata and derived managed-home paths cross this boundary.
 //! Vendor credentials stay in place and are validated by the existing adapter.
+//! `complete` and `refresh-models` may run one catalog-only
+//! `grok --no-auto-update models` command. The vendor alone writes
+//! `models_cache.json`; its output is discarded.
 
 use super::*;
 use crate::account_authority::PendingLoginBinding;
@@ -9,12 +12,19 @@ use crate::account_authority::PendingLoginBinding;
 const USAGE: &str = "Usage: cam-grok-setup [--data-dir ABSOLUTE_PATH] prepare ACCOUNT_ID
        cam-grok-setup [--data-dir ABSOLUTE_PATH] status
        cam-grok-setup [--data-dir ABSOLUTE_PATH] complete ACCOUNT_ID --incarnation INCARNATION
+       cam-grok-setup [--data-dir ABSOLUTE_PATH] refresh-models ACCOUNT_ID
 
 Linux only. Defaults to the CAM application data directory.
 prepare creates a new pending home and prints a command for your own terminal;
 it never starts login. status shows metadata, including accountIncarnation.
 complete validates vendor-written auth and explicitly selects the account,
 replacing any previous selection only if no CAM use/login lease is active.
+It then runs `grok --no-auto-update models` in the managed home so the vendor
+can write models_cache.json, and reports how many models have a usable effort
+menu. The vendor runs while that account's use lease is held. A failed
+refresh leaves the account complete and prints the refresh-models command.
+refresh-models repeats only that catalog refresh for one complete account.
+Setup never writes models_cache.json itself.
 Use the incarnation from status for the pending account you prepared.
 No passwords, tokens, auth paths, or default-home import are accepted.
 Account IDs cannot contain double underscores or end with an underscore.
@@ -24,6 +34,7 @@ enum Action<'a> {
     Prepare(&'a str),
     Status,
     Complete { id: &'a str, incarnation: &'a str },
+    RefreshModels(&'a str),
 }
 
 fn setup_account_id_is_safe(id: &str) -> bool {
@@ -52,6 +63,9 @@ pub fn run(args: &[String]) -> std::result::Result<String, &'static str> {
         {
             Action::Complete { id, incarnation }
         }
+        [command, id] if command == "refresh-models" && setup_account_id_is_safe(id) => {
+            Action::RefreshModels(id)
+        }
         _ => return Err("invalid arguments; see --help"),
     };
     if !cfg!(target_os = "linux") {
@@ -64,6 +78,11 @@ pub fn run(args: &[String]) -> std::result::Result<String, &'static str> {
     execute(&adapter, action).map_err(|error| match error {
         Error::StaleAccount { .. } => "stale pending incarnation; inspect status before retrying",
         Error::AccountAuthorityBusy { .. } => "account authority is in use; no selection changed",
+        Error::ConfigWrite { reason, .. }
+            if reason == "model refresh requires an existing complete managed account" =>
+        {
+            "model refresh requires an existing complete managed account"
+        }
         // A durable write may fail after rename (e.g. directory fsync). Do not
         // claim rollback or blindly retry; status resolves the visible state.
         _ => "setup failed; inspect status before retrying (no login was launched)",
@@ -72,7 +91,9 @@ pub fn run(args: &[String]) -> std::result::Result<String, &'static str> {
 
 fn execute(adapter: &GrokCliAdapter, action: Action<'_>) -> Result<String> {
     match action {
-        Action::Prepare(id) | Action::Complete { id, .. } if !setup_account_id_is_safe(id) => {
+        Action::Prepare(id) | Action::Complete { id, .. } | Action::RefreshModels(id)
+            if !setup_account_id_is_safe(id) =>
+        {
             return Err(config_write(
                 "account id is incompatible with the lease format",
             ));
@@ -134,9 +155,79 @@ fn execute(adapter: &GrokCliAdapter, action: Action<'_>) -> Result<String> {
                     adapter.finish_pending_oauth_login(&home)
                 },
             )?;
-            Ok("Completed and selected the managed Grok account.\n".to_string())
+            Ok(catalog_report(
+                adapter,
+                &registry,
+                id,
+                &data_dir,
+                "setup-complete",
+                "Completed and selected the managed Grok account.\n",
+            ))
+        }
+        Action::RefreshModels(id) => {
+            let account = registry.account(PROVIDER_ID, id).map_err(|_| {
+                config_write("model refresh requires an existing complete managed account")
+            })?;
+            if account.state != StoredAccountState::Complete {
+                return Err(config_write(
+                    "model refresh requires an existing complete managed account",
+                ));
+            }
+            Ok(catalog_report(
+                adapter,
+                &registry,
+                id,
+                &data_dir,
+                "refresh-models",
+                "",
+            ))
         }
     }
+}
+
+fn catalog_report(
+    adapter: &GrokCliAdapter,
+    registry: &StoredAccountRegistry,
+    id: &str,
+    data_dir: &Path,
+    event: &str,
+    preamble: &str,
+) -> String {
+    let remediation =
+        crate::providers::catalog_refresh::remediation_command("cam-grok-setup", data_dir, id);
+    let model_count = observed_model_count_after_catalog(adapter, registry, id, data_dir);
+    crate::providers::catalog_refresh::format_model_refresh_report(
+        preamble,
+        event,
+        id,
+        model_count,
+        &remediation,
+    )
+}
+
+fn observed_model_count_after_catalog(
+    adapter: &GrokCliAdapter,
+    registry: &StoredAccountRegistry,
+    id: &str,
+    data_dir: &Path,
+) -> Option<usize> {
+    let (_lease, account) = registry
+        .acquire_complete_account_use(PROVIDER_ID, id)
+        .ok()?;
+    let home = adapter.managed_home(&account).ok()?;
+    validate_managed_directories(data_dir, &home, false).ok()?;
+    let _operation = HomeOperationGuard::acquire(&home).ok()?;
+    gate_managed_home(&home, true).ok()?;
+    let exited = crate::providers::catalog_refresh::vendor_catalog_exited_zero(
+        &crate::providers::catalog_refresh::grok_catalog_command(),
+        &home,
+    );
+    if !exited || !crate::providers::catalog_refresh::managed_models_cache_is_regular_file(&home) {
+        return None;
+    }
+    let observation =
+        crate::providers::ProviderAdapter::observe_models_for_account(adapter, &account).ok()?;
+    crate::providers::catalog_refresh::observed_model_count(&observation)
 }
 
 fn prepare(adapter: &GrokCliAdapter, registry: &StoredAccountRegistry, id: &str) -> Result<String> {

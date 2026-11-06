@@ -10,7 +10,7 @@ fi
 partition="$1"
 case "${partition}:${2:-}" in
   lib:autopilot | lib:supervise-core | lib:supervise-bound | lib:supervise-decomposition | lib:supervise-parent | \
-  lib:supervise-nested | lib:supervise-fixtures | lib:supervise-fixtures-budget | \
+  lib:supervise-nested-driver | lib:supervise-nested | lib:supervise-fixtures | lib:supervise-fixtures-budget | \
   lib:supervise-fixtures-licensed | lib:supervise-fixtures-runtime | \
   lib:external-agent | lib:worktree | lib:rest | \
   non-lib: | non-lib:merge | non-lib:other | doc:) ;;
