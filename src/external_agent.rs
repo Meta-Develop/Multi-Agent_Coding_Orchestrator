@@ -1631,8 +1631,13 @@ fn bind_worker_journal_append_operation(
     } else {
         "If this operation fails, stop and report WorkerExecutionJournalRecordError without repairing the journal."
     };
+    let observation_recovery = if codex {
+        "- WorkerJournalObservationRequired (no command launched; journal unchanged): invoke the error's exact observation argv with its exact tool workdir as the very next action. No inspection, edit, validation, or reapplication first. If observation succeeds, retry only the rejected command ONCE through the bound wrapper and preserve the rejection as an informational finding; do not invent a journal row for it. A failed observation or second rejection stops the worker. This exception does not authorize retrying generic failures or executed/possibly executed calls.\n"
+    } else {
+        ""
+    };
     let appendix = format!(
-        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n{examples}- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. {failure_rule} Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
+        "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n{examples}- Start EVERY attempt, including a correction/relaunch, with the copyable observation call BEFORE inspection, editing, or validation. Observe any pending prior-attempt delta without reapplying edits; use this attempt's bound prefix.\n- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n{observation_recovery}- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. {failure_rule} Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
         binding.helper_sha256,
     );
     if prompt
@@ -2318,6 +2323,13 @@ mod worker_journal_append_binding_tests {
         assert!(prompt.contains("informational finding after successful correction"));
         assert!(prompt.contains("no unresolved typed environment failure remains"));
         assert!(prompt.contains("A second rejection stops the worker"));
+        assert!(prompt.contains("Start EVERY attempt, including a correction/relaunch"));
+        assert!(prompt.contains("use this attempt's bound prefix"));
+        assert!(prompt
+            .contains("WorkerJournalObservationRequired (no command launched; journal unchanged)"));
+        assert!(prompt.contains("invoke the error's exact observation argv with its exact tool workdir as the very next action"));
+        assert!(prompt.contains("If observation succeeds, retry only the rejected command ONCE"));
+        assert!(prompt.contains("A failed observation or second rejection stops the worker"));
         assert!(controls.exact_read_only_input_files.is_empty());
         binding.revalidate().unwrap();
         assert!(fs::read(&binding.journal.path).unwrap().is_empty());

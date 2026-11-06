@@ -34,6 +34,7 @@ pub mod launch_lifecycle;
 pub mod observe;
 pub use observe::observe_selected_account;
 
+pub(crate) mod catalog_refresh;
 pub mod claude_code;
 pub mod codex_cli;
 pub mod cursor;

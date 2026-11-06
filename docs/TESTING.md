@@ -28,6 +28,7 @@ lane-check s2 1200 'cargo test --locked --lib supervise::tests::budget::'
 | `supervise::assignment_execution::bound_parent_turn*` | `lib supervise-bound` |
 | `supervise::assignment_execution::decomposition_tests` | `lib supervise-decomposition` |
 | `supervise::assignment_execution::managed_parent_controller_tests` | `lib supervise-parent` |
+| `supervise::assignment_execution::nested_driver_tests`, `worker_dispatch_limits_tests`, `isolated_worker_evidence_tests`, `messaging_ipc_tests` | `lib supervise-nested-driver` |
 | Other assignment execution, except attached parent capture | `lib supervise-nested` |
 | Other `supervise`, including attached parent capture | `lib supervise-core` |
 | `supervise::tests::budget`, `prompts_gates` | `lib supervise-fixtures-budget` |
@@ -60,7 +61,7 @@ changes warrant all affected partitions, often the complete matrix.
 
 Doctests have a separate required execution because neither `--lib` nor explicit
 integration targets run them. The `supervise-decomposition` CI job runs them
-after its source-bound build and checks the full inventory against all thirteen
+after its source-bound build and checks the full inventory against all fourteen
 library shards, both integration shards and rustdoc. The check compares test
 occurrences, so repeated names in separate binaries remain distinct; explicit
 Criterion benchmarks are retained in addition to Cargo's default test set.

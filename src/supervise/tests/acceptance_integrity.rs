@@ -1862,17 +1862,24 @@ fn worker_journal_reconciliation_accepts_exact_multiline_and_failed_command_iden
 #[cfg(target_os = "linux")]
 #[test]
 fn worker_journal_native_and_wrapped_edit_reports_require_exact_observed_command() {
-    use std::os::unix::fs::MetadataExt;
+    use clap::Parser;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
     // R39x1b captured a native Codex edit between two --observe-changes -- true
     // calls, then reported an unjournaled apply_patch. Exercise both documented
     // native reporting choices and the productive Grok wrapped-shell path.
     let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
-    for mode in ["native_true", "native_payload", "wrapped_shell"] {
+    for mode in [
+        "native_true",
+        "native_payload",
+        "native_pending",
+        "native_relaunch",
+        "wrapped_shell",
+    ] {
         let (temp, worktree, base, _) = observed_parent_journal("true");
-        let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+        let mut journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
         let metadata = fs::metadata(&journal).unwrap();
-        let identity = crate::safe_state::FileIdentity {
+        let mut identity = crate::safe_state::FileIdentity {
             device: metadata.dev(),
             file: metadata.ino(),
         };
@@ -1911,19 +1918,63 @@ fn worker_journal_native_and_wrapped_edit_reports_require_exact_observed_command
             // launch apply_patch or apply its payload a second time.
             fs::write(worktree.join("README.md"), "original\nHello from MACO\n").unwrap();
         }
-        run_worker_execution_journal_command_with_clock(
-            &journal,
-            &identity,
-            &automatic_entry(edit_argv.clone()),
-            mode != "wrapped_shell",
-            true,
-        )
-        .unwrap();
         let verify_argv = vec![
             "/bin/sh".into(),
             "-c".into(),
             "test \"$(cat README.md)\" = \"$(printf 'original\\nHello from MACO')\"".into(),
         ];
+        if matches!(mode, "native_pending" | "native_relaunch") {
+            if mode == "native_relaunch" {
+                // Production corrections keep the worktree and bind a new,
+                // empty journal. Never reuse or repair the previous attempt.
+                journal = journal.with_file_name("relaunch.jsonl");
+                let file = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(&journal)
+                    .unwrap();
+                identity = crate::safe_state::FileIdentity {
+                    device: file.metadata().unwrap().dev(),
+                    file: file.metadata().unwrap().ino(),
+                };
+            }
+            let before = fs::read(&journal).unwrap();
+            let error = run_worker_execution_journal_command_with_clock(
+                &journal,
+                &identity,
+                &automatic_entry(verify_argv.clone()),
+                false,
+                true,
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(
+                error.starts_with("WorkerJournalObservationRequired:"),
+                "{error}"
+            );
+            assert_eq!(fs::read(&journal).unwrap(), before);
+            let argv: Vec<String> = serde_json::from_str(
+                error
+                    .split_once("Observation argv (JSON array): ")
+                    .unwrap()
+                    .1,
+            )
+            .unwrap();
+            crate::cli::Cli::try_parse_from(argv)
+                .unwrap()
+                .run()
+                .unwrap();
+        } else {
+            run_worker_execution_journal_command_with_clock(
+                &journal,
+                &identity,
+                &automatic_entry(edit_argv.clone()),
+                mode != "wrapped_shell",
+                true,
+            )
+            .unwrap();
+        }
         run_worker_execution_journal_command_with_clock(
             &journal,
             &identity,
@@ -1976,6 +2027,20 @@ fn worker_journal_native_and_wrapped_edit_reports_require_exact_observed_command
             fs::read_to_string(worktree.join("README.md")).unwrap(),
             "original\nHello from MACO\n"
         );
+
+        if matches!(mode, "native_pending" | "native_relaunch") {
+            let mut outside_scope = assignment.clone();
+            outside_scope.assigned_paths = vec![PathBuf::from("src/allowed.rs")];
+            let mut rejected = report.clone();
+            validate_worker_execution_journal_evidence(
+                &outside_scope,
+                report_path,
+                &journals,
+                &mut rejected,
+            );
+            assert!(!rejected.accepted, "{mode}: recovered edit escaped scope");
+            assert!(finding_messages(&rejected).contains("outside assigned_paths"));
+        }
 
         // Neither a true observation nor an observed content digest is a
         // license to infer a native command identity. A modified payload is
