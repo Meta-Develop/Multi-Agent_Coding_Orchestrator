@@ -75,7 +75,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested, supervise-fixtures, supervise-fixtures-budget, supervise-fixtures-licensed, supervise-fixtures-runtime, external-agent, worktree, rest]
+        shard: [autopilot, supervise-core, supervise-bound, supervise-decomposition, supervise-parent, supervise-nested-driver, supervise-nested, supervise-fixtures, supervise-fixtures-budget, supervise-fixtures-licensed, supervise-fixtures-runtime, external-agent, worktree, rest]
     steps:
       - name: Check out repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

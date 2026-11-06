@@ -794,6 +794,8 @@ mod supervise {
             #[test] fn new_managed_parent_body() {}
         }
         mod nested_driver_tests { #[test] fn new_nested_body() {} }
+        // Empty body verifies wrapper selection only, not process semantics.
+        mod managed_parent_process_tests { #[test] fn new_process_body() {} }
         mod attached_parent_capture_tests {
             // Empty body verifies wrapper selection only, not real ownership semantics.
             #[test] fn attached_capture_bookkeeping_and_shutdown_errors_retain_owners() {}
@@ -826,7 +828,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 29)
+            self.assertEqual(len(inventory), 30)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -852,7 +854,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 29', result.stdout)
+                self.assertIn('"total": 30', result.stdout)
 
 
 if __name__ == "__main__":

@@ -105,7 +105,7 @@ final main ELF and entry source. The producer also validates the setup
 declaration and exposes the final setup ELF hash as `grok_setup_sha256`.
 The existing closure receipt schema and consumer checks are preserved; the
 payload covers the setup binary and its declaration in the same package root.
-The three library shards and integration job
+The Linux library shards and integration jobs
 download that exact artifact in the same run. They verify hashes before parsing
 the receipt or importing into a real Nix store, retain normal signature/trust
 policy, and check protected ancestry, final bytes and checkout source entries.
