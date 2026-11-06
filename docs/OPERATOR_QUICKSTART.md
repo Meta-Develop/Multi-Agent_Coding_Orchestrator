@@ -257,9 +257,10 @@ cam-codex-setup status
 cam-codex-setup complete work --incarnation <n>
 ```
 
-All three commands accept `--data-dir ABSOLUTE_PATH` before the action; omit it
-for the CAM directory MACO uses by default. `--data-dir` overrides setup only;
-it does not redirect MACO's default registry.
+`prepare`, `status`, `complete`, and `refresh-models` accept
+`--data-dir ABSOLUTE_PATH` before the action; omit it for the CAM directory
+MACO uses by default. `--data-dir` overrides setup only; it does not redirect
+MACO's default registry.
 IDs cannot contain `__`, end with `_`, or use the reserved `codex-cli-on-disk` id.
 `prepare` exclusively reserves a private pending home and never starts login.
 `complete` checks for a bounded, regular, non-symlink JSON object and atomically
@@ -279,10 +280,21 @@ explicitly configured socket remains the selection source and must be available.
 
 Use the selected CAM id (`work` here) as the pricing contract scope's
 `account_id`, with exact runtime `codex`, model, and plan id. See
-[operator pricing](OPERATOR_PRICING.md). Login does not populate all catalog
-metadata: CAM observes `{data}/accounts/codex-cli/<id>/models_cache.json`.
-Missing or invalid model/effort metadata still refuses automatic selection;
-setup does not fabricate a cache or make provider calls.
+[operator pricing](OPERATOR_PRICING.md). After `complete` selects the account,
+setup runs `codex debug models` with `CODEX_HOME` set to the managed home and
+the working directory inside that home. The vendor alone writes
+`{data}/accounts/codex-cli/<id>/models_cache.json`. Setup reports the count of
+models with a non-empty known effort menu, in text and one JSON object, and
+holds that account's use lease until the vendor exits. Models that omit
+supported efforts stay unobserved for this report. If the refresh fails, the account
+stays complete and selected, the command exits 0, and the output prints the
+exact `cam-codex-setup refresh-models <id>` command (including `--data-dir`
+when one was resolved). Setup does not fabricate a cache. Missing or invalid
+model/effort metadata still refuses automatic selection. Retry with:
+
+```bash
+cam-codex-setup refresh-models work
+```
 
 Owner device login. `cam-grok-setup` is Linux-only and does not start login.
 The Nix `maco` package includes the binary. From a source checkout:
@@ -304,20 +316,29 @@ cam-grok-setup complete <id> --incarnation <n>
 ```
 `<n>` is `accountIncarnation` from `status` for that pending account.
 `prepare` does not select the account. `complete` validates `auth.json` and
-selects it. `prepare` refuses an id whose managed home already exists. This
-tool has no delete or overwrite command.
+selects it, then runs `grok --no-auto-update models` with `GROK_HOME` set to
+the managed home and with `GROK_AUTH_PATH`, `XAI_API_KEY`, and `OPENAI_API_KEY`
+removed. The vendor alone writes
+`{data}/accounts/grok-cli/<id>/models_cache.json`. Setup reports the count of
+models with a non-empty known effort menu, in text and one JSON object, and
+holds that account's use lease until the vendor exits. Models that omit
+supported efforts stay unobserved for this report. A failed refresh leaves the account
+complete and selected, exits 0, and prints the exact
+`cam-grok-setup refresh-models <id>` command. `refresh-models` repeats only
+that catalog refresh for an existing complete account. Setup does not
+fabricate a cache or start login. `prepare` refuses an id whose managed home
+already exists. This tool has no delete or overwrite command.
 
 Unset:
 ```bash
 unset MACO_CAM_AUTHORITY_SOCKET CODEX_HOME XAI_API_KEY MACO_GROK_INTERACTION_PROTOCOL
 ```
-CAM model observation is separate from login. The Grok adapter reads
-`{data}/accounts/grok-cli/<id>/models_cache.json`; an absent cache produces
-`Unknown` model metadata. An observation without models or supported efforts
-admits no candidates, even if a separate CLI listing succeeds. The native
-cache must contain valid model/effort metadata; do not fabricate metadata or
-copy credentials into it. Fresh device login alone may leave this prerequisite
-unmet. Inspect `normalized_input.catalogs` in the final report's
+CAM model observation reads the managed `models_cache.json` written by the
+vendor catalog command above. An absent or invalid cache produces `Unknown`
+model metadata and setup's unobserved warning. An observation without models
+or supported efforts admits no candidates, even if a separate CLI listing
+succeeds. Do not fabricate metadata or copy credentials into the cache.
+Inspect `normalized_input.catalogs` in the final report's
 `role_economics_profile.execution.selection_decisions[].provenance` for the
 actual admitted catalog. `account-observe-models-unobserved-sha256:` with
 `models: []` means CAM supplied no usable observed models. The work2 account's

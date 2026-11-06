@@ -390,6 +390,10 @@ fn worker_prompt_includes_execution_journal_contract() {
 
 fn assert_native_edit_journal_reporting_contract(prompt: &str) {
     for required in [
+        "Start EVERY attempt, including a correction/relaunch",
+        "BEFORE inspection, editing, or validation",
+        "pending delta from the prior attempt; observe it without reapplying edits",
+        "WorkerJournalObservationRequired recovery",
         "Run journal-append commands one at a time; never in parallel tool calls",
         "Both observation records contain [\"true\"]",
         "omit the native apply_patch/Edit command itself",
