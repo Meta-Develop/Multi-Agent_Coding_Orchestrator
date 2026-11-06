@@ -2793,6 +2793,7 @@ fn review_lens_config_schema_value() -> serde_json::Value {
                             "kind": {"const": "model"},
                             "backend_id": {"type": "string", "minLength": 1},
                             "model": {"type": "string", "minLength": 1},
+                            "model_provider": {"type": "string", "minLength": 1},
                             "reasoning_effort": {"type": "string", "minLength": 1}
                         }
                     },

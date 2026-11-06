@@ -7169,6 +7169,7 @@ pub(super) mod tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "openai".to_string(),
                 model: other_model,
+                model_provider: None,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::FullChildTranscript,
@@ -7233,6 +7234,7 @@ pub(super) mod tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "openai".to_string(),
                 model: FRONTIER_PROFILE_MODEL.to_string(),
+                model_provider: None,
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,

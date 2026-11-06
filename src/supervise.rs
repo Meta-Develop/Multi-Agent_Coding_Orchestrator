@@ -899,6 +899,7 @@ pub(crate) fn default_stacked_uncorrelated_review_lenses() -> Vec<ReviewLensConf
     let model_backend = || ReviewLensBackendConfig::Model {
         backend_id: "automatic".to_string(),
         model: "automatic".to_string(),
+        model_provider: None,
         reasoning_effort: None,
     };
     vec![

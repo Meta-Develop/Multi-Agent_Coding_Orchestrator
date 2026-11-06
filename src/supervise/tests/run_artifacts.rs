@@ -5530,6 +5530,7 @@ fn bounded_transcript_review_lens() -> ReviewLensConfig {
         backend: ReviewLensBackendConfig::Model {
             backend_id: "bounded-transcript-backend".to_string(),
             model: "bounded-transcript-model".to_string(),
+            model_provider: None,
             reasoning_effort: None,
         },
         information_scope: ReviewInformationScope::FullChildTranscript,
