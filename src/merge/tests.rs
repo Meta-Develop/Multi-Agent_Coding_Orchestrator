@@ -2356,6 +2356,151 @@ fn repository_index_digest_rejects_oversized_file_before_reading() {
     assert!(error.to_string().contains("bounded real regular file"));
 }
 
+#[cfg(unix)]
+fn run_git_with_umask(repo: &Path, umask: libc::mode_t, args: &[&str]) -> std::process::Output {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("git");
+    command
+        .current_dir(repo)
+        .args(args)
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    // SAFETY: pre_exec runs in the forked child. umask is async-signal-safe.
+    unsafe {
+        command.pre_exec(move || {
+            libc::umask(umask);
+            Ok(())
+        });
+    }
+    command.output().expect("spawn git")
+}
+
+#[cfg(unix)]
+fn assert_mode(path: &Path, mode: u32) {
+    use std::os::unix::fs::PermissionsExt;
+    let actual = fs::symlink_metadata(path)
+        .unwrap_or_else(|_| panic!("stat {}", path.display()))
+        .permissions()
+        .mode()
+        & 0o7777;
+    assert_eq!(actual, mode, "{}", path.display());
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_index_digest_tightens_owned_group_writable_git_index() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path();
+    let init = run_git_with_umask(repo, 0o002, &["init", "-q"]);
+    assert!(
+        init.status.success(),
+        "git init: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    fs::write(repo.join("tracked.txt"), "tracked\n").expect("write tracked file");
+    let add = run_git_with_umask(repo, 0o002, &["add", "--", "tracked.txt"]);
+    assert!(
+        add.status.success(),
+        "git add: {}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let index = repo.join(".git/index");
+    let before = fs::symlink_metadata(&index)
+        .expect("index")
+        .permissions()
+        .mode()
+        & 0o777;
+    assert_ne!(
+        before & 0o022,
+        0,
+        "git under umask 002 must leave a group-writable index, got {before:o}"
+    );
+    let directory = repo.join("group-writable");
+    fs::create_dir(&directory).expect("directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).expect("chmod directory");
+    let digest = hash_optional_file(&index).expect("owned single-link index is tightened");
+    assert!(digest.is_some());
+    let after_metadata = fs::symlink_metadata(&index).expect("index");
+    let after = after_metadata.permissions().mode() & 0o777;
+    assert_eq!(after & 0o077, 0, "tightened index mode {after:o}");
+    assert_eq!(after & 0o600, 0o600);
+    assert_eq!(after_metadata.nlink(), 1);
+    assert_eq!(
+        fs::symlink_metadata(&directory)
+            .expect("directory")
+            .permissions()
+            .mode()
+            & 0o777,
+        0o775
+    );
+    assert_eq!(hash_optional_file(&index).expect("stable index"), digest);
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_index_digest_refuses_hardlinked_group_writable_index_without_chmod() {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let temp = tempfile::tempdir().expect("tempdir");
+    let index = temp.path().join("index");
+    let other = temp.path().join("index-link");
+    fs::write(&index, b"DIRC").expect("write index");
+    fs::set_permissions(&index, fs::Permissions::from_mode(0o664)).expect("chmod index");
+    fs::hard_link(&index, &other).expect("hard link");
+    let error = hash_optional_file(&index).expect_err("hardlinked index must fail closed");
+    assert!(error
+        .to_string()
+        .contains("foreign owner, multiple links, or unsafe write mode"));
+    for path in [&index, &other] {
+        let metadata = fs::symlink_metadata(path).expect("stat link");
+        assert_eq!(metadata.nlink(), 2);
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o664);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn repository_index_digest_refuses_symlink_directory_fifo_and_special_mode_without_chmod() {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir().expect("tempdir");
+    let target = temp.path().join("real");
+    fs::write(&target, b"DIRC").expect("write target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o664)).expect("chmod target");
+    let link = temp.path().join("index-link");
+    std::os::unix::fs::symlink(&target, &link).expect("symlink");
+    let error = hash_optional_file(&link).expect_err("symlink index must fail closed");
+    assert!(error.to_string().contains("bounded real regular file"));
+    assert_mode(&target, 0o664);
+
+    let directory = temp.path().join("index-dir");
+    fs::create_dir(&directory).expect("directory");
+    fs::set_permissions(&directory, fs::Permissions::from_mode(0o775)).expect("chmod directory");
+    let error = hash_optional_file(&directory).expect_err("directory index must fail closed");
+    assert!(error.to_string().contains("bounded real regular file"));
+    assert_mode(&directory, 0o775);
+
+    let fifo = temp.path().join("index-fifo");
+    let name = std::ffi::CString::new(fifo.as_os_str().as_encoded_bytes()).expect("fifo path");
+    // SAFETY: name is NUL-terminated and this test owns the temporary directory.
+    assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o664) }, 0);
+    fs::set_permissions(&fifo, fs::Permissions::from_mode(0o664)).expect("chmod fifo");
+    let error = hash_optional_file(&fifo).expect_err("fifo index must fail closed");
+    assert!(error.to_string().contains("bounded real regular file"));
+    assert_mode(&fifo, 0o664);
+
+    let special = temp.path().join("index-special");
+    fs::write(&special, b"DIRC").expect("write special");
+    fs::set_permissions(&special, fs::Permissions::from_mode(0o4664)).expect("chmod special");
+    let error = hash_optional_file(&special).expect_err("special mode must fail closed");
+    assert!(error
+        .to_string()
+        .contains("foreign owner, multiple links, or unsafe write mode"));
+    assert_mode(&special, 0o4664);
+}
+
 unsafe fn restore_test_environment(key: &str, value: Option<OsString>) {
     match value {
         Some(value) => {
