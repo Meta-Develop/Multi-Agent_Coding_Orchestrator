@@ -22,6 +22,7 @@ pub mod test_worker;
 pub use binding::SelectedAccountBinding;
 pub use incarnation::new_account_incarnation;
 pub use launch_operation::{LaunchOperationState, LaunchOperationStatus};
+pub(crate) use observe::model_has_selectable_efforts;
 pub use observe::{
     validate_observed_models, validate_observed_models_for_binding, AccountObserveRequest,
     AccountObserveResult, AuthObservation, CategoryObservation, ModelAccessBasis,

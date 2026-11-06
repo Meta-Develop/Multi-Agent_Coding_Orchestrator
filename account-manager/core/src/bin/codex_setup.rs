@@ -1,4 +1,5 @@
-//! Owner-operated setup only: this binary never launches Codex or reads stdin.
+//! Owner-operated setup. This binary never reads stdin and never starts login.
+//! `complete` and `refresh-models` may run one catalog-only Codex command.
 
 fn main() -> std::process::ExitCode {
     let args: Result<Vec<_>, _> = std::env::args_os()

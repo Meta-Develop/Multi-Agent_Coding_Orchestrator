@@ -150,6 +150,17 @@ fn is_known_observed_effort(value: &str) -> bool {
     )
 }
 
+/// Selection drops a row unless it has a non-empty menu of known efforts.
+/// Omitted efforts stay representable on an Observed cache row.
+pub(crate) fn model_has_selectable_efforts(model: &ObservedModel) -> bool {
+    model.supported_efforts.as_ref().is_some_and(|efforts| {
+        !efforts.is_empty()
+            && efforts
+                .iter()
+                .all(|effort| is_known_observed_effort(effort))
+    })
+}
+
 /// Validate content that would be admitted as [`ObservationOutcome::Observed`].
 ///
 /// Empty `models`, empty `supportedEfforts`, unknown effort spellings, and a

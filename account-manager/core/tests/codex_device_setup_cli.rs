@@ -2,6 +2,7 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 use coding_agent_manager_lib::model::StoredAccountMetadata;
@@ -44,7 +45,7 @@ fn binary_owner_flow_never_launches_login_and_uses_only_managed_home() {
     fs::write(
         &fake_codex,
         format!(
-            "#!/bin/sh\nprintf launched > '{}'\nexit 99\n",
+            "#!/bin/sh\nif [ \"${{1:-}}\" = login ]; then printf launched > '{}'; exit 99; fi\nexit 0\n",
             marker.display()
         ),
     )
@@ -85,8 +86,243 @@ fn binary_owner_flow_never_launches_login_and_uses_only_managed_home() {
         .success());
     assert!(!marker.exists());
     assert_eq!(fs::read(default_auth).unwrap(), b"FAKE-default-credential");
-    for output in [status.stdout, completed.stdout, completed.stderr] {
+    for output in [status.stdout, completed.stdout.clone(), completed.stderr] {
         assert!(!String::from_utf8(output).unwrap().contains("FAKE"));
     }
     assert!(!root.path().join("unused-xdg").exists());
+    let text = String::from_utf8(completed.stdout.clone()).unwrap();
+    assert!(text.contains("model metadata is still unobserved"));
+    assert!(text.contains("refresh-models work"));
+}
+
+const CODEX_CACHE: &str = r#"{"models":[{"slug":"gpt-6.1-sol","supported_reasoning_levels":[{"effort":"high"}],"default_reasoning_level":"high"},{"slug":"gpt-6.1","supported_reasoning_levels":[{"effort":"low"},{"effort":"high"}],"default_reasoning_level":"low"}]}"#;
+
+struct FakeCodex {
+    _root: tempfile::TempDir,
+    bin: PathBuf,
+    data: PathBuf,
+    mode: PathBuf,
+    env_file: PathBuf,
+    argv_file: PathBuf,
+    cwd_file: PathBuf,
+    stdin_file: PathBuf,
+    marker: PathBuf,
+}
+
+impl FakeCodex {
+    fn new() -> Self {
+        let root = tempfile::tempdir().unwrap();
+        let bin = root.path().join("bin");
+        let record = root.path().join("record");
+        fs::create_dir_all(&bin).unwrap();
+        fs::create_dir_all(&record).unwrap();
+        let mode = record.join("mode");
+        let env_file = record.join("env");
+        let argv_file = record.join("argv");
+        let cwd_file = record.join("cwd");
+        let stdin_file = record.join("stdin");
+        let marker = record.join("login");
+        fs::write(&mode, b"fail").unwrap();
+        let program = bin.join("codex");
+        fs::write(
+            &program,
+            format!(
+                r#"#!/bin/sh
+cp /proc/self/environ '{env}'
+printf '%s\n' "$@" > '{argv}'
+pwd -P > '{cwd}'
+readlink /proc/self/fd/0 > '{stdin}' || true
+printf 'VENDOR-STDOUT-SECRET\n'
+printf 'VENDOR-STDERR-SECRET\n' >&2
+if [ "${{1:-}}" = login ] || [ "${{2:-}}" = login ]; then
+  printf launched > '{marker}'
+  exit 99
+fi
+mode=$(cat '{mode}')
+if [ "$mode" = fail ]; then
+  exit 7
+fi
+umask 077
+cat > "$CODEX_HOME/models_cache.json" <<'EOF'
+{cache}
+EOF
+exit 0
+"#,
+                env = env_file.display(),
+                argv = argv_file.display(),
+                cwd = cwd_file.display(),
+                stdin = stdin_file.display(),
+                marker = marker.display(),
+                mode = mode.display(),
+                cache = CODEX_CACHE,
+            ),
+        )
+        .unwrap();
+        fs::set_permissions(&program, fs::Permissions::from_mode(0o700)).unwrap();
+        Self {
+            data: root.path().join("data"),
+            bin,
+            mode,
+            env_file,
+            argv_file,
+            cwd_file,
+            stdin_file,
+            marker,
+            _root: root,
+        }
+    }
+
+    fn run(&self, args: &[&str]) -> Output {
+        Command::new(env!("CARGO_BIN_EXE_cam-codex-setup"))
+            .env("HOME", self._root.path().join("user"))
+            .env("PATH", &self.bin)
+            .env("OPENAI_API_KEY", "FAKE-openai")
+            .env("XAI_API_KEY", "FAKE-xai")
+            .env("GROK_AUTH_PATH", "FAKE-grok-auth")
+            .env("CODEX_API_KEY", "FAKE-codex")
+            .args(["--data-dir", self.data.to_str().unwrap()])
+            .args(args)
+            .stdin(std::process::Stdio::null())
+            .output()
+            .unwrap()
+    }
+}
+
+fn assert_vendor_was_contained(fake: &FakeCodex, home: &std::path::Path) {
+    assert!(!fake.marker.exists(), "catalog refresh must not run login");
+    assert_eq!(
+        fs::read_to_string(&fake.argv_file).unwrap(),
+        "debug\nmodels\n"
+    );
+    let cwd = fs::read_to_string(&fake.cwd_file).unwrap();
+    assert_eq!(
+        std::path::Path::new(cwd.trim()).canonicalize().unwrap(),
+        home.canonicalize().unwrap()
+    );
+    assert_eq!(
+        fs::read_to_string(&fake.stdin_file).unwrap().trim(),
+        "/dev/null"
+    );
+    let environ = String::from_utf8(fs::read(&fake.env_file).unwrap()).unwrap();
+    for secret in ["FAKE-openai", "FAKE-xai", "FAKE-grok-auth", "FAKE-codex"] {
+        assert!(!environ.contains(secret), "{secret} reached the vendor");
+    }
+    for name in [
+        "OPENAI_API_KEY",
+        "XAI_API_KEY",
+        "GROK_AUTH_PATH",
+        "CODEX_API_KEY",
+    ] {
+        assert!(
+            !environ
+                .split('\0')
+                .any(|entry| entry.starts_with(&format!("{name}="))),
+            "{name} was present"
+        );
+    }
+    let home_text = home.canonicalize().unwrap();
+    assert!(
+        environ.contains(&format!("CODEX_HOME={}", home_text.display()))
+            || environ.contains(&format!("CODEX_HOME={}", home.display()))
+    );
+}
+
+fn prepared_account(fake: &FakeCodex) -> String {
+    assert!(fake.run(&["prepare", "work"]).status.success());
+    let status = fake.run(&["status"]);
+    assert!(status.status.success());
+    let accounts: Vec<StoredAccountMetadata> = serde_json::from_slice(&status.stdout).unwrap();
+    let home = fake.data.join("accounts/codex-cli/work");
+    fs::write(
+        home.join("auth.json"),
+        br#"{"tokens":{"access_token":"FAKE-vendor-token"}}"#,
+    )
+    .unwrap();
+    accounts[0].account_incarnation.clone()
+}
+
+fn observe_count(fake: &FakeCodex) -> usize {
+    use coding_agent_manager_lib::account_authority::ObservationOutcome;
+    use coding_agent_manager_lib::providers::codex_cli::CodexCliAdapter;
+    use coding_agent_manager_lib::providers::ProviderAdapter;
+    let status = fake.run(&["status"]);
+    let accounts: Vec<StoredAccountMetadata> = serde_json::from_slice(&status.stdout).unwrap();
+    let adapter = CodexCliAdapter::default().with_data_dir(&fake.data);
+    let observation = adapter.observe_models_for_account(&accounts[0]).unwrap();
+    assert_eq!(observation.outcome, ObservationOutcome::Observed);
+    observation.content.unwrap().models.len()
+}
+
+#[test]
+fn catalog_success_reports_observed_model_count_without_vendor_secrets() {
+    let fake = FakeCodex::new();
+    fs::write(&fake.mode, b"success").unwrap();
+    let incarnation = prepared_account(&fake);
+    let completed = fake.run(&["complete", "work", "--incarnation", &incarnation]);
+    let stdout = String::from_utf8(completed.stdout).unwrap();
+    let stderr = String::from_utf8(completed.stderr).unwrap();
+    assert!(completed.status.success(), "{stdout}{stderr}");
+    assert!(stdout.contains("Observed 2 models."));
+    assert!(!stdout.contains("FAKE"));
+    assert!(!stdout.contains("VENDOR-STDOUT-SECRET"));
+    assert!(!stderr.contains("VENDOR-STDERR-SECRET"));
+    assert!(!stderr.contains("FAKE"));
+    let json: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(json["event"], "setup-complete");
+    assert_eq!(json["modelObservation"], "observed");
+    assert_eq!(json["modelCount"], 2);
+    assert!(json.get("remediation").is_none());
+    let home = fake.data.join("accounts/codex-cli/work");
+    assert_vendor_was_contained(&fake, &home);
+    assert_eq!(observe_count(&fake), 2);
+    let selected = fake.run(&["status"]);
+    let accounts: Vec<StoredAccountMetadata> = serde_json::from_slice(&selected.stdout).unwrap();
+    assert!(accounts[0].is_selected);
+    assert_eq!(
+        accounts[0].state,
+        coding_agent_manager_lib::model::StoredAccountState::Complete
+    );
+}
+
+#[test]
+fn catalog_failure_warns_and_refresh_models_can_recover() {
+    let fake = FakeCodex::new();
+    let incarnation = prepared_account(&fake);
+    let completed = fake.run(&["complete", "work", "--incarnation", &incarnation]);
+    assert!(completed.status.success());
+    let stdout = String::from_utf8(completed.stdout).unwrap();
+    assert!(stdout.contains("model metadata is still unobserved"));
+    assert!(stdout.contains("refresh-models work"));
+    assert!(!stdout.contains("FAKE"));
+    assert!(!fake
+        .data
+        .join("accounts/codex-cli/work/models_cache.json")
+        .exists());
+    let accounts: Vec<StoredAccountMetadata> =
+        serde_json::from_slice(&fake.run(&["status"]).stdout).unwrap();
+    assert!(accounts[0].is_selected);
+    assert_eq!(
+        accounts[0].state,
+        coding_agent_manager_lib::model::StoredAccountState::Complete
+    );
+    let home = fake.data.join("accounts/codex-cli/work");
+    assert_vendor_was_contained(&fake, &home);
+
+    fs::write(&fake.mode, b"success").unwrap();
+    let refreshed = fake.run(&["refresh-models", "work"]);
+    assert!(refreshed.status.success());
+    let stdout = String::from_utf8(refreshed.stdout).unwrap();
+    assert!(stdout.contains("Observed 2 models."));
+    assert!(!stdout.contains("FAKE"));
+    assert!(!stdout.contains("VENDOR-STDOUT-SECRET"));
+    let json: serde_json::Value = serde_json::from_str(stdout.lines().last().unwrap()).unwrap();
+    assert_eq!(json["event"], "refresh-models");
+    assert_eq!(json["modelCount"], 2);
+    assert_eq!(observe_count(&fake), 2);
+
+    let missing = fake.run(&["refresh-models", "missing"]);
+    assert!(!missing.status.success());
+    let error = String::from_utf8(missing.stderr).unwrap();
+    assert!(error.contains("existing complete managed account"));
+    assert!(!error.contains("FAKE"));
 }
