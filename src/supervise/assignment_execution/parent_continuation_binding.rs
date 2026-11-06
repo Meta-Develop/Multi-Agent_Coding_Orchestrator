@@ -87,7 +87,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
             semantic_token: preflight.semantic_token,
             ordered_worker_ids,
             summaries: serde_json::to_string(&summaries)?,
-            _held_workers: held_workers,
+            held_workers,
         };
         contract.revalidate(context, preflight, attempt)?;
         completed.revalidate(context, preflight, source_attempt, current)?;
@@ -225,7 +225,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
             semantic_token: preflight.semantic_token,
             ordered_worker_ids,
             summaries: serde_json::to_string(&summaries)?,
-            _held_workers: held_workers,
+            held_workers,
         };
         contract.revalidate(context, preflight, attempt)?;
         completed.revalidate(context, preflight, source_attempt, current)?;

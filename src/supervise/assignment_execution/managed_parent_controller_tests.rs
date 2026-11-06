@@ -257,7 +257,7 @@ fn exercise_isolated_result(
             .err()
             .expect("parent acceptance forgery must fail");
         assert!(
-            format!("{error:#}").contains("substitutes the actual ordered Worker captures"),
+            format!("{error:#}").contains("must omit worker_reports"),
             "{error:#}"
         );
     }

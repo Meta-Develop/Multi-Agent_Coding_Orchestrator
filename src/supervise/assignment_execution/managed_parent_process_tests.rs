@@ -72,12 +72,38 @@ pub(super) fn run(
             )?);
             assert!(!report_failed(&parent));
         }
-        if case == "forged-report" {
-            parent.worker_reports[0].id = "foreign".into();
+        let mut turn = super::parent_continuation_response::final_turn_for_test(command, &parent);
+        match case {
+            "forged-report" => turn["worker_report_refs"][0]["assignment_id"] = json!("foreign"),
+            "isolated-wrong-digest" => {
+                turn["worker_report_refs"][0]["capture_sha256"] = json!("0".repeat(64))
+            }
+            "isolated-swapped-references" => turn["worker_report_refs"]
+                .as_array_mut()
+                .unwrap()
+                .swap(0, 1),
+            "isolated-missing-reference" => {
+                turn["worker_report_refs"].as_array_mut().unwrap().pop();
+            }
+            "isolated-extra-reference" => {
+                let extra = turn["worker_report_refs"][0].clone();
+                turn["worker_report_refs"]
+                    .as_array_mut()
+                    .unwrap()
+                    .push(extra);
+            }
+            "isolated-duplicate-reference" => {
+                turn["worker_report_refs"][1] = turn["worker_report_refs"][0].clone()
+            }
+            "isolated-parent-payload" => {
+                parent.worker_reports[0].commands_run[0].stdout = "parent substitution".into();
+                turn["report"]["worker_reports"] = json!(parent.worker_reports);
+            }
+            _ => {}
         }
-        report = json!({"version":1,"run_id":identity.run_id,"parent_id":"parent",
+        report = json!({"version":2,"run_id":identity.run_id,"parent_id":"parent",
             "source_parent_attempt":1,"parent_attempt":2,"completed_worker_ids":["worker","worker-two"],
-            "turn":{"outcome":"final_report","report":parent}});
+            "turn":turn});
     }
     payload["mode"] = json!(mode);
     payload["report"] = report;
@@ -265,6 +291,36 @@ pub(super) fn exercise(
                 current_head_oid(&preflight.worktree.path)?,
                 preflight.child_base_head
             );
+        }
+        "isolated-wrong-digest"
+        | "isolated-swapped-references"
+        | "isolated-missing-reference"
+        | "isolated-extra-reference"
+        | "isolated-duplicate-reference"
+        | "isolated-parent-payload" => {
+            let error = format!(
+                "{:#}",
+                result.err().context("invalid Worker reference accepted")?
+            );
+            let expected = match case {
+                "isolated-wrong-digest" => "digest mismatch",
+                "isolated-swapped-references" => "in authored order",
+                "isolated-missing-reference" | "isolated-extra-reference" => "expected 2",
+                "isolated-duplicate-reference" => "duplicates Worker",
+                "isolated-parent-payload" => "must omit worker_reports",
+                _ => unreachable!(),
+            };
+            assert!(error.contains(expected), "{error}");
+            assert_eq!(observed.len(), 4);
+            assert_eq!(
+                fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
+                "pub fn selected() {}\n"
+            );
+            assert_eq!(
+                current_head_oid(&preflight.worktree.path)?,
+                preflight.child_base_head
+            );
+            assert_eq!(outcome.released_claims.len(), 2);
         }
         "forged-report" => {
             assert!(result.is_err(), "forged report accepted");
@@ -469,7 +525,8 @@ pub(super) fn exercise(
         | "isolated-happy"
         | "isolated-observed-journals"
         | "isolated-masked-rustup"
-        | "isolated-misreported-paths" => {
+        | "isolated-misreported-paths"
+        | "isolated-long-output" => {
             let collected = result?;
             assert!(
                 collected.report_shape_problems.is_empty(),
@@ -477,6 +534,33 @@ pub(super) fn exercise(
                 collected.report_shape_problems
             );
             assert!(collected.attempt_containment_verified);
+            if case == "isolated-long-output" {
+                for report in &collected.attempt_report.worker_reports {
+                    let bytes = with_supervisor_artifacts(context.artifacts, |writer, _| {
+                        writer.read_authenticated(
+                            &PathBuf::from("evidence/incoming").join(format!("{}.json", report.id)),
+                            MAX_SUPERVISOR_REPORT_BYTES,
+                        )
+                    })?;
+                    let captured =
+                        read_worker_report(Some(&bytes), Path::new("worker.json"))?.report;
+                    assert_eq!(
+                        *report, captured,
+                        "accepted Worker report differs from the capture"
+                    );
+                    assert_eq!(
+                        report.commands_run[0].stdout,
+                        "captured Worker output\n".repeat(768)
+                    );
+                }
+                let final_bytes = with_supervisor_artifacts(context.artifacts, |writer, _| {
+                    writer.read_authenticated(
+                        &collected.attempt_artifacts.raw_report_relative,
+                        MAX_SUPERVISOR_REPORT_BYTES,
+                    )
+                })?;
+                assert!(!String::from_utf8(final_bytes)?.contains("captured Worker output"));
+            }
             if case == "isolated-misreported-paths" {
                 assert_eq!(
                     collected.attempt_report.files_changed,
@@ -779,4 +863,27 @@ fn managed_parent_process_isolated_initial_evidence_refusal_precedes_worker_disp
     super::nested_driver_tests::driver_fixture(
         "managed-cycle-process-isolated-initial-import-failure",
     )
+}
+
+#[test]
+fn managed_parent_process_isolated_long_worker_output_reaches_acceptance_intact() -> Result<()> {
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-long-output")
+}
+
+#[test]
+fn managed_parent_process_isolated_refuses_invalid_capture_references_and_parent_payloads(
+) -> Result<()> {
+    for case in [
+        "wrong-digest",
+        "swapped-references",
+        "missing-reference",
+        "extra-reference",
+        "duplicate-reference",
+        "parent-payload",
+    ] {
+        super::nested_driver_tests::driver_fixture(&format!(
+            "managed-cycle-process-isolated-{case}"
+        ))?;
+    }
+    Ok(())
 }

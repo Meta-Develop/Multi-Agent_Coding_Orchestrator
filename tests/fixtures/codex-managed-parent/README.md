@@ -59,3 +59,15 @@ union claim for supervisor recovery. No rollback drops an advanced private ref.
 A private directory at the initial report destination refuses evidence import
 before any isolated Worker dispatch. No Worker worktrees or private commits are
 created, and the parent remains at the captured base without needing quarantine.
+
+Final parents return version-2 envelopes containing ordered Worker assignment ids
+and SHA-256 digests copied from the supervisor prompt, with no embedded Worker
+reports. The supervisor resolves those references from authenticated captures
+before journal binding, acceptance and review-request construction. The long
+output case runs a command producing more than 16 KiB per Worker, checks that each accepted
+report equals its capture, and checks that the final parent never echoes that
+output. Contained negative cases cover wrong digests, reordered, missing, extra
+and duplicate references, and attempted parent payload substitution. Parser tests
+also refuse legacy echo envelopes and duplicate JSON fields. Both authoritative
+and provider-projected continuation schemas omit the Worker payload contract;
+published normalized/final-report schemas remain unchanged.
