@@ -196,10 +196,16 @@ pub(crate) fn redact_feedback_text(text: &str, ctx: &FeedbackRedactionContext) -
             output.push('\n');
         }
         let key = sensitive_key_start(line);
-        let prefix = key.map_or(line, |start| &line[..start]);
+        let prefix = key.map_or(line, |start| &line[..token_start(line, start)]);
         let mut words = Vec::new();
         for token in prefix.split_whitespace().chain(key.map(|_| REDACTED)) {
-            let token = scrub_prose(token);
+            // Whitespace already split the input. Reject remaining controls
+            // before normalization can change the token's shape.
+            let token = if token.chars().any(char::is_control) {
+                REDACTED.to_string()
+            } else {
+                scrub_prose(token)
+            };
             let token =
                 if allowed_token(&token) && remove_identities(&token, &ctx.identities) == token {
                     token
@@ -321,29 +327,59 @@ impl FeedbackRedactionContext {
 }
 
 fn remove_identities(text: &str, identities: &[String]) -> String {
-    let mut output = String::with_capacity(text.len());
+    let mut withheld: Vec<std::ops::Range<usize>> = Vec::new();
     let mut cursor = 0;
     while cursor < text.len() {
-        // This fixed marker carries no run value, even when an identity happens
-        // to be a substring of its spelling. Keep the filter idempotent.
-        if text[cursor..].starts_with(REDACTED) {
-            output.push_str(REDACTED);
-            cursor += REDACTED.len();
-            continue;
-        }
         if let Some(identity) = identities.iter().find(|identity| {
             text.get(cursor..cursor + identity.len())
                 .is_some_and(|value| value.eq_ignore_ascii_case(identity))
         }) {
-            output.push_str(" <redacted> ");
-            cursor += identity.len();
-        } else {
-            let ch = text[cursor..].chars().next().expect("character boundary");
-            output.push(ch);
-            cursor += ch.len_utf8();
+            let end = cursor + identity.len();
+            if withheld.last().is_none_or(|range| end > range.end) {
+                // Expand to original token boundaries, including every token
+                // touched by an identity containing whitespace. Never insert
+                // separators that could expose allowed fragments of a token.
+                let start = withheld
+                    .last()
+                    .filter(|range| cursor <= range.end)
+                    .map(|range| range.start)
+                    .unwrap_or_else(|| token_start(text, cursor));
+                let end = end
+                    + text[end..]
+                        .find(char::is_whitespace)
+                        .unwrap_or(text.len() - end);
+                if let Some(range) = withheld.last_mut().filter(|range| start <= range.end) {
+                    range.end = end;
+                } else {
+                    withheld.push(start..end);
+                }
+            }
         }
+        // An overlapping identity can start inside an already withheld token
+        // and extend across whitespace into another token. Check every start.
+        cursor += text[cursor..]
+            .chars()
+            .next()
+            .expect("character boundary")
+            .len_utf8();
     }
+    let mut output = String::with_capacity(text.len());
+    let mut copied = 0;
+    for range in withheld {
+        output.push_str(&text[copied..range.start]);
+        output.push_str(REDACTED);
+        copied = range.end;
+    }
+    output.push_str(&text[copied..]);
     output
+}
+
+fn token_start(text: &str, index: usize) -> usize {
+    text[..index]
+        .char_indices()
+        .rev()
+        .find_map(|(index, ch)| ch.is_whitespace().then_some(index + ch.len_utf8()))
+        .unwrap_or(0)
 }
 
 fn sensitive_key_start(line: &str) -> Option<usize> {
@@ -1137,10 +1173,7 @@ fn scrub_prose(text: &str) -> String {
                 output.push_str(word);
             }
         } else {
-            let ch = text[index..].chars().next().unwrap_or('\0');
-            if ch == '\0' {
-                break;
-            }
+            let ch = text[index..].chars().next().expect("character boundary");
             output.push(ch);
             index += ch.len_utf8();
         }
@@ -1501,6 +1534,54 @@ mod tests {
         let text = redact_feedback_text("check failed api_key: shortprivate", &ctx);
         assert!(!text.contains("shortprivate"));
         ensure_redacted(&text, &ctx).expect("identity removal cannot erase key context");
+    }
+
+    #[test]
+    fn identity_removal_preserves_original_token_boundaries() {
+        for (identity, input) in [
+            ("ada", "purple-garden-lantern-ada-window-marble"),
+            ("ada", "qqqqqqqqqqqqadawwwwwwwwwwwwww"),
+            (
+                "Fixture Person",
+                "purple-garden-lantern-Fixture Person-window-marble",
+            ),
+            (
+                "Fixture\u{a0}Person",
+                "purple-garden-lantern-Fixture\u{a0}Person-window-marble",
+            ),
+            ("a a", "a a a"),
+            ("redacted", "(<redacted>)"),
+            (
+                "<redacted> Person",
+                "purple-garden-lantern-<redacted> Person-window-marble",
+            ),
+        ] {
+            let ctx = FeedbackRedactionContext::from_values([identity.to_string()]);
+            assert_eq!(
+                remove_identities(input, &ctx.identities),
+                REDACTED,
+                "{input:?}"
+            );
+            assert_eq!(redact_feedback_text(input, &ctx), REDACTED, "{input:?}");
+        }
+    }
+
+    #[test]
+    fn non_whitespace_controls_withhold_the_entire_original_token() {
+        let prefix = "m".repeat(20);
+        let suffix = "n".repeat(20);
+        for control in (0..=0x9f)
+            .filter_map(char::from_u32)
+            .filter(|ch| ch.is_control() && !ch.is_whitespace())
+        {
+            let token = format!("{prefix}{control}{suffix}");
+            assert_eq!(scrub_prose(&token), token, "{control:?}");
+            assert_eq!(
+                redact_feedback_text(&token, &context()),
+                REDACTED,
+                "{control:?}"
+            );
+        }
     }
 
     #[test]
@@ -2025,6 +2106,80 @@ mod tests {
             &format!("{} {secret}", "x".repeat(480)),
             &[&secret[..19]],
             &[REDACTED],
+        );
+    }
+
+    #[test]
+    #[ignore = "helper executed only with synthetic identity variables"]
+    fn identity_token_boundaries_child() {
+        let (_temp, repo) = init_repo();
+        let prefix = "q".repeat(12);
+        let suffix = "w".repeat(14);
+        let message = format!(
+            "signature purple-garden-lantern-ada-window-marble repeat {prefix}ada{suffix} spaced purple-garden-lantern-Fixture Person-window-marble ending copper-lantern+api_key=hidden"
+        );
+        let mut report = failed_report(&repo, "feedback-boundaries", &message);
+        report
+            .role_economics_profile
+            .as_mut()
+            .expect("profile")
+            .role_models
+            .get_mut(&crate::supervise::AgentRole::Worker)
+            .expect("worker")
+            .model = Some("violet-harbor-lantern-ada-silver-candle".to_string());
+        finalize(&repo, &report);
+        assert_feedback_bodies(
+            &repo,
+            "feedback-boundaries",
+            &[
+                "purple-garden-lantern-",
+                "-window-marble",
+                &prefix,
+                &suffix,
+                "violet-harbor-lantern-",
+                "-silver-candle",
+                "Fixture Person",
+                "Person-window-marble",
+                "copper-lantern",
+            ],
+            &[
+                "Finding: signature <redacted> repeat <redacted> spaced <redacted> ending <redacted>",
+                "model=<redacted>",
+            ],
+        );
+    }
+
+    #[test]
+    fn identity_matches_withhold_whole_tokens_through_publication() {
+        let status = Command::new(std::env::current_exe().expect("test harness"))
+            .env_clear()
+            .env("USER", "ada")
+            .env("LOGNAME", "ada")
+            .env("HOME", "/home/ada")
+            .env("USERNAME", "ada")
+            .env("USERPROFILE", "/home/Fixture Person")
+            .env("COMPUTERNAME", "fixturebox")
+            .args([
+                "--exact",
+                "supervise::beta_feedback::tests::identity_token_boundaries_child",
+                "--ignored",
+            ])
+            .status()
+            .expect("isolated token-boundary test");
+        assert!(status.success());
+    }
+
+    #[test]
+    fn nul_tokens_withhold_prefix_and_suffix_through_publication() {
+        let prefix = "m".repeat(20);
+        let suffix = "n".repeat(20);
+        let message = format!(
+            "nul {prefix}\0{suffix} zwsp violetgarden\u{200b}silvercandle cr purplegarden\rwindowmarble"
+        );
+        assert_redacted_and_published(
+            &message,
+            &[&prefix, &suffix, "violetgarden", "silvercandle"],
+            &["Finding: nul <redacted> zwsp <redacted> cr purplegarden windowmarble"],
         );
     }
 
