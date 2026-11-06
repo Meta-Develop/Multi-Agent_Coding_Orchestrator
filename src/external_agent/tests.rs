@@ -2712,6 +2712,14 @@ fn create_mandatory_control_roots(workspace: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
+fn clear_group_world_write(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::symlink_metadata(path)?.permissions().mode() & 0o777;
+    fs::set_permissions(path, fs::Permissions::from_mode(mode & !0o022))?;
+    Ok(())
+}
+
+#[cfg(unix)]
 fn create_linked_git_metadata_fixture(root: &Path) -> Result<(PathBuf, PathBuf, PathBuf, PathBuf)> {
     use std::os::unix::fs::PermissionsExt;
 
@@ -16134,6 +16142,108 @@ fn q714_configured_git_attribution_proceeds_after_typed_refusal() -> Result<()> 
         "approved-fixture@example.invalid"
     );
     verify_managed_git_boundary_after_launch(&metadata)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn static_preflight_passes_then_launch_still_refuses_missing_attribution() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    clear_group_world_write(&primary)?;
+    clear_group_world_write(&common)?;
+    assert!(
+        static_repository_conditions(&primary)?.is_empty(),
+        "configured fixture passes static preflight"
+    );
+    let mut local = git2::Config::open(&common.join("config"))?;
+    for key in ["user.name", "user.email"] {
+        let _ = local.remove(key);
+    }
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Execution,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    let error = protected_worktree_controls(&command)
+        .err()
+        .context("launch must still refuse missing attribution")?;
+    let message = error.to_string();
+    assert!(message.contains("user.name"), "{message}");
+    assert!(message.contains("user.email"), "{message}");
+    assert!(
+        !message.contains("retained from a prior run is stale"),
+        "{message}"
+    );
+    assert!(
+        !message.contains("Preserve the repository attribution and hook policy"),
+        "{message}"
+    );
+    let findings = static_repository_conditions(&primary)?;
+    assert_eq!(findings.len(), 1, "{findings:?}");
+    assert!(
+        findings[0].message.contains("user.name"),
+        "{}",
+        findings[0].message
+    );
+    assert!(
+        findings[0]
+            .message
+            .contains("Preserve the repository attribution and hook policy"),
+        "{}",
+        findings[0].message
+    );
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn static_preflight_names_stale_retained_config_and_launch_keeps_its_message() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    clear_group_world_write(&primary)?;
+    clear_group_world_write(&common)?;
+    assert!(static_repository_conditions(&primary)?.is_empty());
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = crate::supervise::configure_assignment_phase_command_for_test(
+        managed_git_command(&child, &incoming),
+        crate::supervise::AssignmentPhase::Execution,
+        &[PathBuf::from("RELEASE_NOTES.md")],
+    )?;
+    let controls = protected_worktree_controls(&command)?;
+    let metadata = controls.managed_git.context("configured managed Git")?;
+    fs::write(
+        metadata.private_git_dir.join("config"),
+        b"not-the-fixed-policy\n",
+    )?;
+    let launch_error = protected_worktree_controls(&command)
+        .err()
+        .context("launch must still refuse a changed private Git config")?;
+    let launch_message = launch_error.to_string();
+    assert!(
+        launch_message.contains("managed child private Git config changed from its fixed policy"),
+        "{launch_message}"
+    );
+    assert!(
+        !launch_message.contains("retained from a prior run is stale"),
+        "{launch_message}"
+    );
+    let findings = static_repository_conditions(&primary)?;
+    assert!(
+        findings.iter().any(|finding| {
+            finding.message.contains("changed from its fixed policy")
+                && finding
+                    .message
+                    .contains("retained from a prior run is stale")
+                && finding.message.contains(MANAGED_CHILD_PRIVATE_GIT_DIR)
+        }),
+        "{findings:?}"
+    );
+    assert!(child_git_dir.join(MANAGED_CHILD_PRIVATE_GIT_DIR).exists());
+    let _ = common;
     Ok(())
 }
 

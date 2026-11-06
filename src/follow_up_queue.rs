@@ -4177,6 +4177,22 @@ mod tests {
     }
 
     #[test]
+    fn recorded_queue_reopens_without_repository_local_identity() {
+        let (_temp, repo) = repository();
+        let source = source(&repo, "source-no-identity-reopen");
+        let mut queue =
+            GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                .expect("create queue");
+        queue
+            .enqueue_all_before_dispatch(&[generated_task("01")])
+            .expect("enqueue without repository-local identity");
+        drop(queue);
+        let reopened = GeneratedFollowUpQueue::open(authenticator(&repo), &source)
+            .expect("reopen recorded queue without repository-local identity");
+        assert_eq!(reopened.snapshot().pending_item_ids().len(), 1);
+    }
+
+    #[test]
     fn conflicting_duplicate_item_id_is_refused_during_replay() {
         let (_temp, repo) = repository();
         let source = source(&repo, "source-conflict");

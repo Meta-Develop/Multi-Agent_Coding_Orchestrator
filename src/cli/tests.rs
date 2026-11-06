@@ -2846,6 +2846,40 @@ fn sniff_loadable_plan_with_assignment_runtime_uses_plan_runtime() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sniff_loads_without_local_identity_and_plan_command_refuses() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let plan = repo.join("plan.json");
+    write_sniff_plan(&plan, None);
+    assert_eq!(
+        sniff_supervise_runtime_from_plan(&plan, &repo)
+            .expect("sniff ignores repository-local identity"),
+        supervise::SupervisorRuntime::Codex
+    );
+    supervise::load_supervisor_plan_file_in_repo(&plan, &repo)
+        .expect("load ignores repository-local identity");
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "plan",
+        plan.to_str().expect("plan path"),
+        "--repo",
+        repo.to_str().expect("repo path"),
+        "--json",
+    ])
+    .expect("parse supervise plan");
+    let error = expect_supervise_command(parsed.command)
+        .run()
+        .expect_err("supervise plan --repo refuses a writable plan without local identity");
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("static repository conditions refuse this writable plan"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("user.name"), "{diagnostic}");
+}
+
 #[test]
 fn sniff_missing_and_unparsable_plans_require_runtime() {
     let (_temp, repo) = sniff_fixture_repo();

@@ -1525,7 +1525,10 @@ fn explicit_ssh_selection_roundtrips_and_never_falls_back() {
     }
 
     let temp = tempfile::tempdir().unwrap();
-    let repo = temp.path().join("uncreated-repository");
+    let repo = temp.path().join("repository");
+    Repository::init(&repo).unwrap();
+    ensure_test_repository_identity(&repo);
+    fs::write(repo.join("README.md"), "baseline\n").unwrap();
     let options = injected_options(&repo, temp.path(), "ssh-must-not-launch");
     let error = run_supervisor_plan_with_runner_and_creation(
         remote,
@@ -1548,7 +1551,7 @@ fn explicit_ssh_selection_roundtrips_and_never_falls_back() {
         assert!(diagnostic.contains(expected), "{diagnostic}");
     }
     assert!(
-        !repo.exists(),
+        !repo.join(".maco").exists(),
         "refusal must precede worktree/artifact creation"
     );
 }

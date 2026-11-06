@@ -186,13 +186,33 @@ pub fn supervisor_plan_document_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<Value> {
+    Ok(supervisor_plan_and_document_from_task_file(repo, task_file)?.1)
+}
+
+pub(crate) fn supervisor_plan_and_document_from_task_file(
+    repo: impl AsRef<Path>,
+    task_file: impl AsRef<Path>,
+) -> Result<(SupervisorPlan, Value)> {
     let loaded = supervisor_plan_and_consultant_from_task_file(repo, task_file)?;
-    supervisor_plan_value(
+    let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
-    )
+    )?;
+    Ok((loaded.plan, document))
+}
+
+/// Static repository conditions for the offline `supervise plan` command.
+/// Shared parse and validation do not call this. A read-only plan is skipped.
+pub(crate) fn refuse_writable_plan_static_repository_conditions(
+    plan: &SupervisorPlan,
+    repo: &Path,
+) -> Result<()> {
+    if super::plan_validation::plan_has_writable_worker_or_assignment(plan) {
+        super::plan_validation::refuse_writable_static_repository_conditions(repo)?;
+    }
+    Ok(())
 }
 
 /// Machine-readable failure envelope for `supervise plan --json`.

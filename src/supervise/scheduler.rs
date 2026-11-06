@@ -7286,6 +7286,13 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     runtime_model_catalog: RuntimeModelCatalogAcquisition,
     external_runner: &CancellableExternalRunner<'_>,
 ) -> Result<SupervisorFinalReport> {
+    // Before run preparation, provider reservation, or the external runner.
+    // Launch still rechecks these conditions on the child workspace.
+    // The evaluator opens without searching, so discover the worktree root the same way preparation does.
+    if super::plan_validation::plan_has_writable_worker_or_assignment(&loaded.plan) {
+        let repo = discover_repo_root(&options.repo)?;
+        super::plan_validation::refuse_writable_static_repository_conditions(&repo)?;
+    }
     let PreparedSupervisorRun {
         plan,
         requested_plan,
@@ -8621,6 +8628,14 @@ mod selection_policy_tests {
         let temporary = tempfile::tempdir().expect("temporary selector repository");
         let repo_path = temporary.path().join("repo");
         let repository = git2::Repository::init(&repo_path).expect("initialize repository");
+        let mut local = git2::Config::open(&repository.path().join("config"))
+            .expect("open selector fixture config");
+        local
+            .set_str("user.name", "maco test")
+            .expect("set selector fixture user.name");
+        local
+            .set_str("user.email", "maco-test@example.invalid")
+            .expect("set selector fixture user.email");
         fs::write(repo_path.join("README.md"), "baseline\n").expect("write baseline");
         fs::create_dir(repo_path.join("tests")).expect("create selector test directory");
         fs::write(

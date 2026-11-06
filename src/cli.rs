@@ -1115,17 +1115,19 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 objective_profile,
                 json,
             } = args;
-            let mut plan = match (task_file, from_goal) {
+            let (checked_plan, mut plan) = match (task_file, from_goal) {
                 (Some(task_file), None) => {
-                    match supervise::supervisor_plan_document_from_task_file(repo, task_file) {
-                        Ok(plan) => plan,
+                    match supervise::supervisor_plan_and_document_from_task_file(&repo, task_file) {
+                        Ok(loaded) => loaded,
                         Err(error) => return emit_supervisor_plan_error(error, json),
                     }
                 }
                 (None, Some(goal_file)) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
-                    match supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec) {
-                        Ok(plan) => plan,
+                    match supervise::supervisor_plan_and_document_from_goal_spec(
+                        &repo, "", &goal_spec,
+                    ) {
+                        Ok(loaded) => loaded,
                         Err(error) => return emit_supervisor_plan_error(error, json),
                     }
                 }
@@ -1133,6 +1135,18 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
                 ),
             };
+            // Command entry only. Parse and validate stay independent of these
+            // conditions so sniff, queue reopen, and other loaders do not.
+            let discovered = match artifacts::discover_repo_root(&repo) {
+                Ok(root) => root,
+                Err(error) => return emit_supervisor_plan_error(error, json),
+            };
+            if let Err(error) = supervise::refuse_writable_plan_static_repository_conditions(
+                &checked_plan,
+                &discovered,
+            ) {
+                return emit_supervisor_plan_error(error, json);
+            }
             if let Some(objective_profile) = objective_profile {
                 plan.as_object_mut()
                     .context("normalized supervisor plan must be a JSON object")?

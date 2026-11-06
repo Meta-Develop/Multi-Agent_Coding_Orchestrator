@@ -1486,6 +1486,7 @@ impl IsolatedSuperviseState {
             Repository::init(&repo).map_err(|error| EvaluationError::FakeSuperviseExperiment {
                 message: format!("failed to initialize isolated Fake supervise repo: {error}"),
             })?;
+        configure_isolated_repository_identity(&git)?;
         fs::write(
             repo.join("README.md"),
             format!("{}\n\n{}\n", manifest.goal, manifest.spec),
@@ -1531,6 +1532,7 @@ impl IsolatedSuperviseState {
             Repository::init(&repo).map_err(|error| EvaluationError::FakeSuperviseExperiment {
                 message: format!("failed to initialize isolated Fake supervise repo: {error}"),
             })?;
+        configure_isolated_repository_identity(&git)?;
         let source_repo = crate::git_repository::open(&source.source_repo).map_err(|error| {
             EvaluationError::FakeSuperviseExperiment {
                 message: format!(
@@ -1586,6 +1588,7 @@ impl IsolatedSuperviseState {
                     "failed to initialize isolated production supervise repo: {error}"
                 ),
             })?;
+        configure_isolated_repository_identity(&git)?;
         let source_repo = crate::git_repository::open(&source.source_repo).map_err(|error| {
             EvaluationError::FakeSuperviseExperiment {
                 message: format!(
@@ -1950,6 +1953,25 @@ fn materialize_commit_object_closure(
                 "isolated held-out repository omitted materialized commit {root_commit}: {error}"
             ),
         })?;
+    Ok(())
+}
+
+fn configure_isolated_repository_identity(repo: &Repository) -> Result<(), EvaluationError> {
+    let mut local = git2::Config::open(&repo.path().join("config")).map_err(|error| {
+        EvaluationError::FakeSuperviseExperiment {
+            message: format!("failed to open isolated repository config: {error}"),
+        }
+    })?;
+    for (key, value) in [
+        ("user.name", "maco-eval"),
+        ("user.email", "maco-eval@example.invalid"),
+    ] {
+        local
+            .set_str(key, value)
+            .map_err(|error| EvaluationError::FakeSuperviseExperiment {
+                message: format!("failed to set isolated repository {key}: {error}"),
+            })?;
+    }
     Ok(())
 }
 
