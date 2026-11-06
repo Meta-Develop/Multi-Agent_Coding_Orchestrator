@@ -4573,8 +4573,13 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
         .context("repository worktree could not be resolved for static condition preflight")?;
     let common_dir = fs::canonicalize(repository.commondir())
         .context("repository common directory could not be resolved for static condition preflight")?;
+    let worktree_git_dir = fs::canonicalize(repository.path()).context(
+        "repository Git directory could not be resolved for static condition preflight",
+    )?;
 
     let mut identity: Option<(String, Vec<PathBuf>)> = None;
+    let mut hooks_messages = Vec::new();
+    let mut hooks_paths = Vec::new();
     let mut hardlink_messages = Vec::new();
     let mut hardlink_paths = Vec::new();
     let mut mode_messages = Vec::new();
@@ -4604,6 +4609,19 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
         }
     }
 
+    match canonical_git_directory(&common_dir.join("refs"), "Git refs directory") {
+        Ok(refs) => {
+            if let Err(error) = reject_git_read_only_tree_aliases(&refs, "Git refs") {
+                hardlink_messages.push(error.to_string());
+                hardlink_paths.push(refs);
+            }
+        }
+        Err(error) => {
+            hardlink_messages.push(error.to_string());
+            hardlink_paths.push(common_dir.join("refs"));
+        }
+    }
+
     let config_path = match canonical_git_file(&common_dir.join("config"), "Git common config") {
         Ok(path) => Some(path),
         Err(error) => {
@@ -4618,11 +4636,57 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
         }
     };
     if let Some(config_path) = config_path {
+        collect_hooks_path_refusal(
+            &mut hooks_messages,
+            &mut hooks_paths,
+            &config_path,
+            "Git common config",
+        )?;
         match expected_managed_child_private_config(&config_path, true) {
             Ok(bytes) => expected_config = Some(bytes),
             Err(error) => {
                 identity = Some((identity_condition_message(&error), vec![config_path]));
             }
+        }
+    }
+    match canonical_optional_git_file(
+        &worktree_git_dir.join("config.worktree"),
+        "Git worktree config",
+    ) {
+        Ok(Some(path)) => {
+            collect_hooks_path_refusal(
+                &mut hooks_messages,
+                &mut hooks_paths,
+                &path,
+                "Git worktree config",
+            )?;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let message = error.to_string();
+            if message.contains("hard-link") {
+                hardlink_paths.push(worktree_git_dir.join("config.worktree"));
+                hardlink_messages.push(message);
+            } else {
+                return Err(error);
+            }
+        }
+    }
+    if let Err(error) = canonical_optional_active_git_hook(
+        &common_dir.join("hooks/commit-msg"),
+        "Git commit-msg hook",
+    ) {
+        hardlink_messages.push(error.to_string());
+        hardlink_paths.push(common_dir.join("hooks/commit-msg"));
+    }
+    for (relative, label) in [
+        ("packed-refs", "Git packed refs"),
+        ("info/exclude", "Git exclude file"),
+        ("shallow", "Git shallow boundary"),
+    ] {
+        if let Err(error) = canonical_optional_git_file(&common_dir.join(relative), label) {
+            hardlink_messages.push(error.to_string());
+            hardlink_paths.push(common_dir.join(relative));
         }
     }
 
@@ -4636,12 +4700,32 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
     if let Some((message, paths)) = identity {
         findings.push(StaticRepositoryCondition { message, paths });
     }
+    push_static_condition(&mut findings, hooks_messages, hooks_paths);
     push_static_condition(&mut findings, hardlink_messages, hardlink_paths);
     push_static_condition(&mut findings, mode_messages, mode_paths);
     if let Some(stale) = stale {
         findings.push(stale);
     }
     Ok(findings)
+}
+
+#[cfg(unix)]
+fn collect_hooks_path_refusal(
+    messages: &mut Vec<String>,
+    paths: &mut Vec<PathBuf>,
+    config: &Path,
+    label: &str,
+) -> Result<()> {
+    if let Err(error) = reject_managed_git_hooks_path(config, label) {
+        let message = error.to_string();
+        if message.contains("core.hooksPath") {
+            messages.push(message);
+            paths.push(config.to_path_buf());
+        } else {
+            return Err(error);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(unix)]

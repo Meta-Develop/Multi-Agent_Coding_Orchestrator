@@ -486,6 +486,19 @@ pub(crate) use reporting::command_record_from_external;
 mod schema_artifacts;
 use schema_artifacts::*;
 
+mod beta_feedback;
+pub use beta_feedback::{
+    supervise_feedback, FeedbackForge, FeedbackOptions, FeedbackReason, FeedbackReport,
+};
+
+fn read_finished_supervisor_report(
+    repo: &Path,
+    run_id: &RunId,
+    run_dir: &Path,
+) -> Result<Option<SupervisorFinalReport>> {
+    schema_artifacts::read_finalized_supervisor_report(repo, run_id, run_dir)
+}
+
 /// Persists the normalized plan and admits the durable messaging session descriptor before
 /// scheduler dispatch. Live broker journals remain in the authenticated state namespace, not the
 /// run manifest. This local definition intentionally takes precedence over the private
@@ -899,6 +912,7 @@ pub(crate) fn default_stacked_uncorrelated_review_lenses() -> Vec<ReviewLensConf
     let model_backend = || ReviewLensBackendConfig::Model {
         backend_id: "automatic".to_string(),
         model: "automatic".to_string(),
+        model_provider: None,
         reasoning_effort: None,
     };
     vec![

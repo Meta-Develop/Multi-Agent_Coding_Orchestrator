@@ -1115,17 +1115,19 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 objective_profile,
                 json,
             } = args;
-            let mut plan = match (task_file, from_goal) {
+            let (checked_plan, mut plan) = match (task_file, from_goal) {
                 (Some(task_file), None) => {
-                    match supervise::supervisor_plan_document_from_task_file(repo, task_file) {
-                        Ok(plan) => plan,
+                    match supervise::supervisor_plan_and_document_from_task_file(&repo, task_file) {
+                        Ok(loaded) => loaded,
                         Err(error) => return emit_supervisor_plan_error(error, json),
                     }
                 }
                 (None, Some(goal_file)) => {
                     let goal_spec = read_supervise_goal_file(&goal_file)?;
-                    match supervise::supervisor_plan_document_from_goal_spec(repo, "", &goal_spec) {
-                        Ok(plan) => plan,
+                    match supervise::supervisor_plan_and_document_from_goal_spec(
+                        &repo, "", &goal_spec,
+                    ) {
+                        Ok(loaded) => loaded,
                         Err(error) => return emit_supervisor_plan_error(error, json),
                     }
                 }
@@ -1133,6 +1135,18 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                     "supervise plan requires exactly one positional TASK_FILE or --from-goal <FILE>"
                 ),
             };
+            // Command entry only. Parse and validate stay independent of these
+            // conditions so sniff, queue reopen, and other loaders do not.
+            let discovered = match artifacts::discover_repo_root(&repo) {
+                Ok(root) => root,
+                Err(error) => return emit_supervisor_plan_error(error, json),
+            };
+            if let Err(error) = supervise::refuse_writable_plan_static_repository_conditions(
+                &checked_plan,
+                &discovered,
+            ) {
+                return emit_supervisor_plan_error(error, json);
+            }
             if let Some(objective_profile) = objective_profile {
                 plan.as_object_mut()
                     .context("normalized supervisor plan must be a JSON object")?
@@ -1539,6 +1553,15 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
             }
             Ok(())
         }
+        SuperviseSubcommand::Feedback(args) => {
+            let report = supervise::supervise_feedback(supervise::FeedbackOptions {
+                repo: args.repo,
+                run_id: args.run_id,
+                forge: args.forge,
+                dry_run: args.dry_run,
+            })?;
+            print_feedback_report(&report, args.json)
+        }
         SuperviseSubcommand::Artifacts(command) => command.run(RunArtifactFamily::Supervise),
     }
 }
@@ -1568,6 +1591,8 @@ enum SuperviseSubcommand {
     Resume(ResumeSuperviseArgs),
     /// Collect the durable supervisor final report.
     Collect(CollectSuperviseArgs),
+    /// File a redacted defect issue for a finished run that did not succeed.
+    Feedback(FeedbackSuperviseArgs),
     /// List, inspect, or prune durable run artifacts.
     Artifacts(ArtifactsCommand),
 }
@@ -2128,6 +2153,25 @@ struct CollectSuperviseArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
+}
+
+#[derive(Debug, Args)]
+struct FeedbackSuperviseArgs {
+    /// Finished supervise run id.
+    #[arg(long)]
+    run_id: String,
+    /// Repository path.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Issue forge. `fake` stays local; `github` uses the existing gh boundary.
+    #[arg(long, value_parser = parse_feedback_forge)]
+    forge: supervise::FeedbackForge,
+    /// Print the redacted title, body, and fingerprint without contacting a forge.
+    #[arg(long)]
+    dry_run: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

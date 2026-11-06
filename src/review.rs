@@ -405,18 +405,24 @@ pub struct ReviewLensConfig {
 /// The execution source for a review lens.
 ///
 /// Model-backed lenses are dispatched by the supervisor's model runtime, with
-/// every executable selection represented directly on the variant. The
-/// autopilot-oriented [`ReviewerConfig`] is deliberately absent: its fake and
-/// direct-program modes are not executable through this boundary. Precomputed
-/// lenses let independently verified evidence, such as future process evidence,
-/// participate in the same aggregation without pretending that it was produced
-/// by a model invocation.
+/// every executable selection represented directly on the variant. `backend_id`
+/// selects that runtime and is never a model-provider override; `model_provider`
+/// is emitted only when the plan sets it. The autopilot-oriented
+/// [`ReviewerConfig`] is deliberately absent: its fake and direct-program modes
+/// are not executable through this boundary. Precomputed lenses let
+/// independently verified evidence, such as future process evidence, participate
+/// in the same aggregation without pretending that it was produced by a model
+/// invocation.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields, tag = "kind", rename_all = "snake_case")]
 pub enum ReviewLensBackendConfig {
     Model {
         backend_id: String,
         model: String,
+        /// Explicit Codex `model_provider` override. Absent means the runtime's
+        /// own provider, which is how Workers launch the same executable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        model_provider: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reasoning_effort: Option<String>,
     },
@@ -445,6 +451,15 @@ impl ReviewLensBackendConfig {
             Self::Model {
                 reasoning_effort, ..
             } => reasoning_effort.as_deref(),
+            Self::Precomputed { .. } => None,
+        }
+    }
+
+    /// Explicit provider override. `None` for precomputed lenses and for model
+    /// lenses that leave the runtime provider untouched. This is never `backend_id`.
+    pub fn model_provider(&self) -> Option<&str> {
+        match self {
+            Self::Model { model_provider, .. } => model_provider.as_deref(),
             Self::Precomputed { .. } => None,
         }
     }
@@ -911,6 +926,7 @@ pub fn cheap_default_review_lenses() -> Vec<ReviewLensConfig> {
     let backend = || ReviewLensBackendConfig::Model {
         backend_id: "deterministic-local-reviewer".to_string(),
         model: "deterministic-local-reviewer".to_string(),
+        model_provider: None,
         reasoning_effort: None,
     };
     vec![
@@ -1602,6 +1618,9 @@ fn validate_review_lens_config(lens: &ReviewLensConfig) -> Result<()> {
         bail!("review lens model selection contains unsafe private or external evidence");
     }
     if matches!(lens.backend, ReviewLensBackendConfig::Model { .. }) {
+        // Validate even when dispatch never runs, so an empty or unsafe override
+        // cannot reach argv through a later projection.
+        configured_review_lens_model_provider(lens)?;
         if let Some(reasoning_effort) = lens.backend.reasoning_effort() {
             validate_bounded_scalar(
                 reasoning_effort,
@@ -1612,6 +1631,18 @@ fn validate_review_lens_config(lens: &ReviewLensConfig) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Provider override for a model lens. `backend_id` is a runtime selector and is
+/// never returned here. `Ok(None)` means the launch must omit `model_provider`.
+pub(crate) fn configured_review_lens_model_provider(
+    lens: &ReviewLensConfig,
+) -> Result<Option<String>> {
+    let Some(provider) = lens.backend.model_provider() else {
+        return Ok(None);
+    };
+    validate_review_lens_id(provider, "review lens model provider")?;
+    Ok(Some(provider.to_string()))
 }
 
 fn validate_review_lens_descriptor(descriptor: &ReviewLensDescriptor, label: &str) -> Result<()> {

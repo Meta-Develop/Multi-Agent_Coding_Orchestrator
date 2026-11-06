@@ -385,18 +385,20 @@ pub(super) fn collect_child_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
 ) -> (OrchestratorReviewReport, Vec<String>) {
-    collect_child_report_from_source(context, runtime, ChildReportSource::CapturedBytes)
+    collect_child_report_from_source(context, runtime, ChildReportSource::CapturedBytes, None)
 }
 
 pub(super) fn collect_managed_parent_report_for_runtime(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
     parsed: Result<ParsedReport<OrchestratorReviewReport>>,
+    worker_worktree_bindings: Option<&WorkerJournalWorktreeBindings>,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     collect_child_report_from_source(
         context,
         runtime,
         ChildReportSource::ManagedParentParsed(Box::new(parsed)),
+        worker_worktree_bindings,
     )
 }
 
@@ -415,6 +417,7 @@ fn collect_child_report_from_source(
     context: ChildReportCollectionContext<'_>,
     runtime: SupervisorRuntime,
     source: ChildReportSource,
+    worker_worktree_bindings: Option<&WorkerJournalWorktreeBindings>,
 ) -> (OrchestratorReviewReport, Vec<String>) {
     let ChildReportCollectionContext {
         assignment,
@@ -746,12 +749,24 @@ fn collect_child_report_from_source(
     if let Some(source) = evidence_only_source {
         validate_evidence_only_report_preservation(source, report_path, &mut report);
     } else {
-        validate_worker_journal_worktree_binding(
-            worker_journals,
-            worktree_path,
-            child_base_head,
-            &mut report,
-        );
+        if let Some(bindings) = worker_worktree_bindings {
+            validate_worker_journal_bindings(
+                worker_journals,
+                &mut report,
+                |worker_id, observations| {
+                    bindings
+                        .get(worker_id)
+                        .is_some_and(|binding| binding.matches(observations))
+                },
+            );
+        } else {
+            validate_worker_journal_worktree_binding(
+                worker_journals,
+                worktree_path,
+                child_base_head,
+                &mut report,
+            );
+        }
         validate_worker_execution_journal_evidence(
             assignment,
             report_path,
@@ -2857,11 +2872,69 @@ pub(super) fn validate_worker_report_evidence(
         "inspect worker reports and rerun the child scope with corrected evidence".to_string();
 }
 
+/// Supervisor-only bindings. Construction verifies a live lease; report and
+/// journal paths never select the directory or base used for acceptance.
+pub(super) struct WorkerJournalWorktreeBinding {
+    directory: crate::safe_state::DirectoryBindingGuard,
+    base: Oid,
+}
+
+pub(super) type WorkerJournalWorktreeBindings = BTreeMap<String, WorkerJournalWorktreeBinding>;
+
+impl WorkerJournalWorktreeBinding {
+    pub(super) fn from_write_lease(
+        manager: &WorktreeManager,
+        worker_id: &str,
+        lease: &ManagedWorktreeWriteLease,
+        base: Oid,
+    ) -> Result<Self> {
+        manager.verify_write_execution_lease(worker_id, lease)?;
+        let directory = crate::safe_state::DirectoryBindingGuard::bind(lease.path())?;
+        manager.verify_write_execution_lease(worker_id, lease)?;
+        Ok(Self { directory, base })
+    }
+
+    fn matches(&self, observations: &[&WorkerJournalObservation]) -> bool {
+        journal_observations_match_worktree(observations, &self.directory, &self.base)
+    }
+}
+
+fn journal_observations_match_worktree(
+    observations: &[&WorkerJournalObservation],
+    directory: &crate::safe_state::DirectoryBindingGuard,
+    base: &Oid,
+) -> bool {
+    let base = base.to_string();
+    observations.iter().all(|observation| {
+        observation.worktree == directory.path()
+            && observation.worktree_identity == *directory.identity()
+            && observation.head_oid.as_deref() == Some(base.as_str())
+    }) && directory.verify().is_ok()
+}
+
 pub(super) fn validate_worker_journal_worktree_binding(
     journals: &WorkerExecutionJournalEvidenceSet,
     worktree: &Path,
     base: &Oid,
     report: &mut OrchestratorReviewReport,
+) {
+    validate_worker_journal_bindings(journals, report, |_, observations| {
+        crate::safe_state::DirectoryBindingGuard::bind(worktree)
+            .as_ref()
+            .is_ok_and(|directory| {
+                observations.iter().all(|observation| {
+                    observation.worktree == worktree
+                        && observation.worktree_identity == *directory.identity()
+                        && observation.head_oid.as_deref() == Some(base.to_string().as_str())
+                }) && directory.verify().is_ok()
+            })
+    });
+}
+
+fn validate_worker_journal_bindings(
+    journals: &WorkerExecutionJournalEvidenceSet,
+    report: &mut OrchestratorReviewReport,
+    matches: impl Fn(&str, &[&WorkerJournalObservation]) -> bool,
 ) {
     for (worker_id, journal) in journals {
         let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {
@@ -2874,15 +2947,7 @@ pub(super) fn validate_worker_journal_worktree_binding(
         if observations.is_empty() {
             continue;
         }
-        let binding = crate::safe_state::DirectoryBindingGuard::bind(worktree);
-        let valid = binding.as_ref().is_ok_and(|binding| {
-            observations.iter().all(|observation| {
-                observation.worktree == worktree
-                    && observation.worktree_identity == *binding.identity()
-                    && observation.head_oid.as_deref() == Some(base.to_string().as_str())
-            }) && binding.verify().is_ok()
-        });
-        if !valid {
+        if !matches(worker_id, &observations) {
             let message = format!("worker '{worker_id}' journal observation is not bound to the supervisor's assigned worktree identity and base HEAD");
             let paths = vec![journal.evidence_relative_path.clone()];
             for worker in &mut report.worker_reports {

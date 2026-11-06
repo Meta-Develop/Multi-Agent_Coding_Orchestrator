@@ -2846,6 +2846,40 @@ fn sniff_loadable_plan_with_assignment_runtime_uses_plan_runtime() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn sniff_loads_without_local_identity_and_plan_command_refuses() {
+    let (_temp, repo) = sniff_fixture_repo();
+    let plan = repo.join("plan.json");
+    write_sniff_plan(&plan, None);
+    assert_eq!(
+        sniff_supervise_runtime_from_plan(&plan, &repo)
+            .expect("sniff ignores repository-local identity"),
+        supervise::SupervisorRuntime::Codex
+    );
+    supervise::load_supervisor_plan_file_in_repo(&plan, &repo)
+        .expect("load ignores repository-local identity");
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "plan",
+        plan.to_str().expect("plan path"),
+        "--repo",
+        repo.to_str().expect("repo path"),
+        "--json",
+    ])
+    .expect("parse supervise plan");
+    let error = expect_supervise_command(parsed.command)
+        .run()
+        .expect_err("supervise plan --repo refuses a writable plan without local identity");
+    let diagnostic = format!("{error:#}");
+    assert!(
+        diagnostic.contains("static repository conditions refuse this writable plan"),
+        "{diagnostic}"
+    );
+    assert!(diagnostic.contains("user.name"), "{diagnostic}");
+}
+
 #[test]
 fn sniff_missing_and_unparsable_plans_require_runtime() {
     let (_temp, repo) = sniff_fixture_repo();
@@ -3032,5 +3066,48 @@ fn supervise_machine_global_binding_names_each_missing_flag() {
     assert!(
         root.contains("missing --machine-global-runtime-root-id"),
         "{root}"
+    );
+}
+
+#[test]
+fn supervise_feedback_parses_fake_and_rejects_git_forge() {
+    let parsed = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "feedback",
+        "--run-id",
+        "run-1",
+        "--repo",
+        ".",
+        "--forge",
+        "fake",
+        "--dry-run",
+        "--json",
+    ])
+    .expect("feedback command parses");
+    let supervise = expect_supervise_command(parsed.command);
+    let SuperviseSubcommand::Feedback(args) = supervise.command else {
+        panic!("expected supervise feedback");
+    };
+    assert_eq!(args.run_id, "run-1");
+    assert_eq!(args.repo, PathBuf::from("."));
+    assert_eq!(args.forge, supervise::FeedbackForge::Fake);
+    assert!(args.dry_run);
+    assert!(args.json);
+
+    let error = Cli::try_parse_from([
+        "maco",
+        "supervise",
+        "feedback",
+        "--run-id",
+        "run-1",
+        "--forge",
+        "git",
+    ])
+    .expect_err("git is not a feedback forge");
+    let rendered = error.to_string();
+    assert!(
+        rendered.contains("expected one of: fake, github"),
+        "{rendered}"
     );
 }

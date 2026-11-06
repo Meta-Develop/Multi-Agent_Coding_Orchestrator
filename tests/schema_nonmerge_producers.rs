@@ -333,6 +333,179 @@ fn eval_harness_fixture_pairs_validate_and_reject_declared_invalids() -> Result<
     Ok(())
 }
 
+#[test]
+fn beta_feedback_cli_json_matches_the_published_schema() -> Result<()> {
+    let schema = Draft202012Schema::load("beta-feedback-report-v1.schema.json")?;
+    schema.assert_valid(&load_fixture("beta-feedback-report-v1.valid.json")?)?;
+    schema.assert_valid(&load_fixture("beta-feedback-report-noop-v1.valid.json")?)?;
+    schema.assert_rejected(
+        &load_fixture("beta-feedback-report-v1.invalid.json")?,
+        "created was not a boolean",
+    )?;
+
+    let temp = TempDir::new().context("create beta feedback fixture root")?;
+    let repo = temp.path().join("repo");
+    Repository::init(&repo).context("initialize beta feedback repository")?;
+    fs::write(repo.join("README.md"), "baseline\n").context("write baseline")?;
+    let git = Repository::open(&repo).context("open beta feedback repository")?;
+    git.config()
+        .context("repository config")?
+        .set_str("user.name", "Fixture")
+        .context("set fixture name")?;
+    git.config()
+        .context("repository config")?
+        .set_str("user.email", "fixture@example.invalid")
+        .context("set fixture email")?;
+    let add = Command::new("git")
+        .current_dir(&repo)
+        .args(["add", "README.md"])
+        .status()
+        .context("git add")?;
+    if !add.success() {
+        bail!("git add failed: {add}");
+    }
+    let commit = Command::new("git")
+        .current_dir(&repo)
+        .args(["commit", "-m", "baseline"])
+        .status()
+        .context("git commit")?;
+    if !commit.success() {
+        bail!("git commit failed: {commit}");
+    }
+    let repo = repo
+        .canonicalize()
+        .context("canonical beta feedback repository")?;
+    write_beta_feedback_run(&repo, "beta-ok", true)?;
+    write_beta_feedback_run(&repo, "beta-failed", false)?;
+
+    let success = run_json_in(
+        &repo,
+        [
+            "supervise",
+            "feedback",
+            "--run-id",
+            "beta-ok",
+            "--repo",
+            path_text(&repo)?,
+            "--forge",
+            "fake",
+            "--json",
+        ],
+    )?;
+    schema.assert_valid(&success)?;
+    assert_eq!(success["created"], Value::Bool(false));
+    assert_eq!(
+        success["reason"],
+        Value::String("run_succeeded".to_string())
+    );
+    assert!(success.get("body").is_none());
+    assert_eq!(success["fingerprint"], Value::String(String::new()));
+    assert!(success["url"].is_null());
+
+    let dry_run = run_json_in(
+        &repo,
+        [
+            "supervise",
+            "feedback",
+            "--run-id",
+            "beta-failed",
+            "--repo",
+            path_text(&repo)?,
+            "--forge",
+            "fake",
+            "--dry-run",
+            "--json",
+        ],
+    )?;
+    schema.assert_valid(&dry_run)?;
+    assert_eq!(dry_run["created"], Value::Bool(false));
+    assert_eq!(dry_run["reason"], Value::String("dry_run".to_string()));
+    assert!(dry_run["url"].is_null());
+    let fingerprint = dry_run["fingerprint"]
+        .as_str()
+        .context("dry-run fingerprint")?;
+    assert_eq!(fingerprint.len(), 64);
+    let body = dry_run["body"].as_str().context("dry-run body")?;
+    assert!(body.contains("## Summary"), "{body}");
+    assert!(body.contains("## Expected behavior"), "{body}");
+    assert!(body.contains("## Actual behavior"), "{body}");
+    assert!(body.contains("## Reproduction"), "{body}");
+    assert!(body.contains("## Evidence"), "{body}");
+    assert!(body.contains("## Impact"), "{body}");
+    assert!(body.contains(&format!("<!-- maco-feedback:{fingerprint} -->")));
+    Ok(())
+}
+
+fn write_beta_feedback_run(repo: &Path, run_id: &str, succeeded: bool) -> Result<()> {
+    use multi_agent_coding_orchestrator::artifacts::{
+        ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily,
+    };
+    use multi_agent_coding_orchestrator::orchestrator::RunId;
+    use multi_agent_coding_orchestrator::supervise::SupervisorFinalReport;
+
+    let status = if succeeded { "succeeded" } else { "failed" };
+    let report: SupervisorFinalReport = serde_json::from_value(serde_json::json!({
+        "version": 1,
+        "run_id": run_id,
+        "role": "supervisor",
+        "repo": ".",
+        "plan_file": "plan.json",
+        "run_dir": format!(".maco/o2/runs/{run_id}"),
+        "runtime": "fake",
+        "publishable": false,
+        "success": succeeded,
+        "accepted": false,
+        "rejected": false,
+        "status": status,
+        "run_lifecycle": "finalized",
+        "remaining_risk": "private remaining text",
+        "next_safe_action": "private next text",
+        "total_usage": {"input_tokens": 3, "output_tokens": 4, "total_tokens": 7},
+        "total_cost_usd": 1.25,
+        "executable": {
+            "package_version": "9.9.9",
+            "source_revision": "0123456789abcdef0123456789abcdef01234567",
+            "source_state": "clean"
+        },
+        "role_economics_profile": {
+            "name": "feedback-schema",
+            "evidence": "fixture",
+            "evidence_notice": "fixture",
+            "production_eligible": false,
+            "role_models": {
+                "worker": {"model": "demo-model", "reasoning_effort": "low"}
+            }
+        },
+        "findings": if succeeded {
+            serde_json::json!([])
+        } else {
+            serde_json::json!([{
+                "severity": "error",
+                "message": "check failed at src/lib.rs",
+                "paths": ["src/lib.rs"]
+            }])
+        }
+    }))
+    .context("beta feedback fixture report")?;
+    let mut writer = ArtifactRunWriter::reserve(
+        repo,
+        RunArtifactFamily::Supervise,
+        RunId::new(run_id)?,
+        "feedback-schema",
+    )
+    .context("reserve beta feedback run")?;
+    let mut bytes = serde_json::to_vec_pretty(&report).context("serialize beta feedback report")?;
+    bytes.push(b'\n');
+    let relative = RunArtifactFamily::Supervise.final_report_relative_path();
+    writer
+        .write_bytes(&relative, &bytes, ArtifactFileDisposition::PrivateEvidence)
+        .context("write beta feedback report")?;
+    writer
+        .finalize(&relative, false)
+        .context("finalize beta feedback run")?;
+    Ok(())
+}
+
 fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
 }

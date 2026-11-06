@@ -64,6 +64,15 @@ fn read_only_plan() -> SupervisorPlan {
 }
 
 #[cfg(unix)]
+fn execution_read_only_plan() -> SupervisorPlan {
+    let mut assignment = injected_assignment(false);
+    assignment.phase = AssignmentPhase::Execution;
+    assignment.role = AgentRole::Researcher;
+    assignment.role_category = Some(RoleCategory::ReadOnlyResearcher);
+    injected_plan(assignment, 0)
+}
+
+#[cfg(unix)]
 fn add_object_hardlink(repo: &std::path::Path) {
     let object = repo.join(".git/objects/aa/static-preflight-object");
     std::fs::create_dir_all(object.parent().expect("object parent")).expect("object dir");
@@ -82,6 +91,92 @@ fn write_stale_private_config(repo: &std::path::Path) {
     let private = repo.join(".git/worktrees/prior/maco-private-git-v1");
     std::fs::create_dir_all(&private).expect("retained private dir");
     std::fs::write(private.join("config"), b"not-the-fixed-policy\n").expect("stale config");
+}
+
+#[cfg(unix)]
+fn set_repository_hooks_path(repo: &std::path::Path) {
+    let mut local = git2::Config::open(&repo.join(".git/config")).expect("local config");
+    local
+        .set_str("core.hooksPath", "alternate-hooks")
+        .expect("hooksPath");
+}
+
+#[cfg(unix)]
+fn add_refs_hardlink(repo: &std::path::Path) {
+    let reference = repo.join(".git/refs/heads/main");
+    std::fs::create_dir_all(reference.parent().expect("refs parent")).expect("refs dir");
+    std::fs::write(&reference, b"ref\n").expect("ref");
+    std::fs::hard_link(&reference, repo.join(".git/static-preflight-ref-alias"))
+        .expect("ref alias");
+}
+
+#[cfg(unix)]
+fn add_active_hook_hardlink(repo: &std::path::Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let hook = repo.join(".git/hooks/commit-msg");
+    std::fs::create_dir_all(hook.parent().expect("hooks parent")).expect("hooks dir");
+    std::fs::write(&hook, b"#!/bin/sh\nexit 0\n").expect("hook");
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).expect("hook mode");
+    std::fs::hard_link(&hook, repo.join(".git/hooks/commit-msg-alias")).expect("hook alias");
+}
+
+#[cfg(unix)]
+fn add_packed_refs_hardlink(repo: &std::path::Path) {
+    let packed = repo.join(".git/packed-refs");
+    std::fs::write(&packed, b"# pack-refs\n").expect("packed-refs");
+    std::fs::hard_link(
+        &packed,
+        repo.join(".git/static-preflight-packed-refs-alias"),
+    )
+    .expect("packed-refs alias");
+}
+
+#[cfg(unix)]
+fn add_exclude_hardlink(repo: &std::path::Path) {
+    let exclude = repo.join(".git/info/exclude");
+    std::fs::create_dir_all(exclude.parent().expect("exclude parent")).expect("exclude dir");
+    std::fs::write(&exclude, b"# exclude\n").expect("exclude");
+    std::fs::hard_link(&exclude, repo.join(".git/static-preflight-exclude-alias"))
+        .expect("exclude alias");
+}
+
+#[cfg(unix)]
+fn add_shallow_hardlink(repo: &std::path::Path) {
+    let shallow = repo.join(".git/shallow");
+    std::fs::write(&shallow, b"0123456789abcdef0123456789abcdef01234567\n").expect("shallow");
+    std::fs::hard_link(&shallow, repo.join(".git/static-preflight-shallow-alias"))
+        .expect("shallow alias");
+}
+
+#[cfg(unix)]
+fn assert_offline_and_before_preparation(repo: &std::path::Path, needles: &[&str]) {
+    assert_shared_validation_independent(repo);
+    assert_refused_before_reservation(repo, 1, needles);
+    let error = command_refusal(repo);
+    let causes = supervisor_plan_error_envelope(&error).causes;
+    assert_eq!(causes.len(), 1, "{causes:?}\n{error:#}");
+    for needle in needles {
+        assert!(
+            causes.iter().any(|cause| cause.contains(needle)),
+            "{needle} missing from {causes:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+fn assert_shared_validation_independent(repo: &std::path::Path) {
+    plan_validation::validate_supervisor_plan_in_repo(
+        writable_plan(),
+        metadata_for(&writable_plan()),
+        Some(repo),
+    )
+    .expect("shared validation does not apply static repository conditions");
+}
+
+#[cfg(unix)]
+fn command_refusal(repo: &std::path::Path) -> anyhow::Error {
+    refuse_writable_plan_static_repository_conditions(&writable_plan(), repo)
+        .expect_err("supervise plan command refuses static repository conditions")
 }
 
 #[cfg(unix)]
@@ -131,13 +226,25 @@ fn assert_refused_before_reservation(
 #[test]
 fn missing_identity_refuses_before_dispatch_and_reservation() {
     let (_temp, repo) = init_repo(false);
-    let plan = writable_plan();
-    let error = plan_validation::validate_supervisor_plan_in_repo(
-        plan,
-        metadata_for(&writable_plan()),
-        Some(&repo),
+    assert_shared_validation_independent(&repo);
+    let plan_file = repo.join("plan.json");
+    std::fs::write(
+        &plan_file,
+        r#"{
+            "version": 1,
+            "task": "sniff fixture",
+            "assignments": [{
+                "id": "child-a",
+                "phase": "execution",
+                "assigned_paths": ["README.md"],
+                "worker_assignments": []
+            }]
+        }"#,
     )
-    .expect_err("offline validation refuses missing identity");
+    .expect("write loadable plan");
+    load_supervisor_plan_file_in_repo(&plan_file, &repo)
+        .expect("loading a plan does not require repository-local identity");
+    let error = command_refusal(&repo);
     let envelope = supervisor_plan_error_envelope(&error);
     assert!(envelope
         .causes
@@ -162,13 +269,9 @@ fn missing_identity_refuses_before_dispatch_and_reservation() {
 fn object_hardlink_refuses_before_dispatch_and_reservation() {
     let (_temp, repo) = init_repo(true);
     add_object_hardlink(&repo);
+    assert_shared_validation_independent(&repo);
     assert_refused_before_reservation(&repo, 1, &["--no-hardlinks"]);
-    let error = plan_validation::validate_supervisor_plan_in_repo(
-        writable_plan(),
-        metadata_for(&writable_plan()),
-        Some(&repo),
-    )
-    .expect_err("offline validation refuses object hardlinks");
+    let error = command_refusal(&repo);
     assert!(supervisor_plan_error_envelope(&error)
         .causes
         .iter()
@@ -180,13 +283,9 @@ fn object_hardlink_refuses_before_dispatch_and_reservation() {
 fn group_world_writable_directory_refuses_before_dispatch_and_reservation() {
     let (_temp, repo) = init_repo(true);
     make_group_world_writable(&repo);
+    assert_shared_validation_independent(&repo);
     assert_refused_before_reservation(&repo, 1, &["group/world-writable"]);
-    let error = plan_validation::validate_supervisor_plan_in_repo(
-        writable_plan(),
-        metadata_for(&writable_plan()),
-        Some(&repo),
-    )
-    .expect_err("offline validation refuses group/world-writable directories");
+    let error = command_refusal(&repo);
     assert!(supervisor_plan_error_envelope(&error)
         .causes
         .iter()
@@ -207,12 +306,8 @@ fn stale_retained_private_config_refuses_before_dispatch_and_reservation() {
             "maco-private-git-v1",
         ],
     );
-    let error = plan_validation::validate_supervisor_plan_in_repo(
-        writable_plan(),
-        metadata_for(&writable_plan()),
-        Some(&repo),
-    )
-    .expect_err("offline validation refuses stale retained private config");
+    assert_shared_validation_independent(&repo);
+    let error = command_refusal(&repo);
     let causes = supervisor_plan_error_envelope(&error).causes;
     assert!(causes.iter().any(|cause| {
         cause.contains("changed from its fixed policy")
@@ -230,11 +325,13 @@ fn clean_repository_passes_static_conditions() {
     assert!(findings.is_empty(), "{findings:?}");
     let plan = writable_plan();
     plan_validation::validate_supervisor_plan_in_repo(
-        plan,
-        metadata_for(&writable_plan()),
+        plan.clone(),
+        metadata_for(&plan),
         Some(&repo),
     )
-    .expect("clean writable plan passes offline validation");
+    .expect("clean writable plan passes shared validation");
+    refuse_writable_plan_static_repository_conditions(&plan, &repo)
+        .expect("clean repository passes the supervise plan command check");
 
     let calls = AtomicUsize::new(0);
     let root = tempfile::tempdir().expect("options root");
@@ -262,26 +359,26 @@ fn clean_repository_passes_static_conditions() {
 }
 
 #[cfg(unix)]
-#[test]
-fn read_only_plan_skips_identity_check() {
+fn assert_plan_skips_identity_check(plan: SupervisorPlan) {
     let (_temp, repo) = init_repo(false);
-    let plan = read_only_plan();
     assert!(!plan_validation::plan_has_writable_worker_or_assignment(
         &plan
     ));
     plan_validation::validate_supervisor_plan_in_repo(
-        plan,
-        metadata_for(&read_only_plan()),
+        plan.clone(),
+        metadata_for(&plan),
         Some(&repo),
     )
-    .expect("read-only plan skips repository-local identity");
+    .expect("read-only plan passes shared validation without local identity");
+    refuse_writable_plan_static_repository_conditions(&plan, &repo)
+        .expect("read-only plan skips static repository conditions");
 
     let calls = AtomicUsize::new(0);
     let root = tempfile::tempdir().expect("options root");
     let mut options = injected_options(&repo, root.path(), "static-repository-readonly");
     options.runtime = SupervisorRuntime::Fake;
     let result = run_supervisor_plan_with_runner(
-        read_only_plan(),
+        plan,
         SupervisorConsultantPlan::default(),
         options,
         SupervisorExecutionRuntime::NonpublishableSimulation,
@@ -306,8 +403,91 @@ fn read_only_plan_skips_identity_check() {
 
 #[cfg(unix)]
 #[test]
+fn read_only_plan_skips_identity_check() {
+    let planning = read_only_plan();
+    assert_eq!(planning.assignments[0].phase, AssignmentPhase::Planning);
+    assert_plan_skips_identity_check(planning);
+
+    let execution = execution_read_only_plan();
+    assert_eq!(
+        execution.assignments[0].phase,
+        AssignmentPhase::Execution,
+        "execution-phase read-only authority is a separate case from planning"
+    );
+    assert!(!execution.assignments[0]
+        .effective_role_category()
+        .may_write());
+    assert!(execution.assignments[0].worker_assignments.is_empty());
+    assert_plan_skips_identity_check(execution);
+}
+
+#[cfg(unix)]
+#[test]
 fn absent_repository_skips_static_conditions() {
     let plan = writable_plan();
     plan_validation::validate_supervisor_plan_in_repo(plan, metadata_for(&writable_plan()), None)
         .expect("validation without a repository does not inspect one");
+}
+
+#[cfg(unix)]
+#[test]
+fn hooks_path_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    set_repository_hooks_path(&repo);
+    assert_offline_and_before_preparation(
+        &repo,
+        &["core.hooksPath", "default Git hooks directory"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn refs_hardlink_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    add_refs_hardlink(&repo);
+    assert_offline_and_before_preparation(&repo, &["Git refs", "hard-link aliases"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn active_hook_hardlink_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    add_active_hook_hardlink(&repo);
+    assert_offline_and_before_preparation(
+        &repo,
+        &["Git commit-msg hook", "reinstall the repository hook"],
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn packed_refs_hardlink_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    add_packed_refs_hardlink(&repo);
+    assert_offline_and_before_preparation(&repo, &["Git packed refs", "--no-hardlinks"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn exclude_hardlink_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    add_exclude_hardlink(&repo);
+    assert_offline_and_before_preparation(&repo, &["Git exclude file", "--no-hardlinks"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn shallow_hardlink_refuses_before_dispatch_and_reservation() {
+    let (_temp, repo) = init_repo(true);
+    add_shallow_hardlink(&repo);
+    assert_offline_and_before_preparation(&repo, &["Git shallow boundary", "--no-hardlinks"]);
+}
+
+#[cfg(unix)]
+#[test]
+fn subdirectory_input_discovers_repository_root_before_refusal() {
+    let (_temp, repo) = init_repo(false);
+    let nested = repo.join("nested");
+    std::fs::create_dir(&nested).expect("worktree subdirectory");
+    assert_refused_before_reservation(&nested, 1, &["user.name", "user.email"]);
 }

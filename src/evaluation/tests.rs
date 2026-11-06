@@ -1917,14 +1917,6 @@ fn init_committed_source_repo(message: &str) -> (tempfile::TempDir, std::path::P
     let workspace = tempfile::TempDir::new().expect("source workspace");
     let repo_path = workspace.path().join("source");
     let repo = git2::Repository::init(&repo_path).expect("init source");
-    let mut local =
-        git2::Config::open(&repo.path().join("config")).expect("open source local config");
-    local
-        .set_str("user.name", "held-out-test")
-        .expect("set source user.name");
-    local
-        .set_str("user.email", "held-out-test@example.invalid")
-        .expect("set source user.email");
     std::fs::write(repo_path.join("README.md"), "held-out source baseline\n").expect("readme");
     let tree_id = {
         let mut index = repo.index().expect("index");

@@ -811,12 +811,33 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         .unwrap();
         #[cfg(target_os = "linux")]
         if case.starts_with("managed-cycle-process-") {
+            let journal_worktree = if subject.id == "worker" {
+                match case {
+                    "managed-cycle-process-isolated-journal-parent" => Some(worktree.path.clone()),
+                    "managed-cycle-process-isolated-journal-sibling" => Some(
+                        overlapping_workers
+                            .state
+                            .lock()
+                            .unwrap()
+                            .workers
+                            .iter()
+                            .find(|entry| entry.0 == "worker-two")
+                            .expect("both isolated Workers arrived")
+                            .1
+                            .clone(),
+                    ),
+                    _ => None,
+                }
+            } else {
+                None
+            };
             let run = super::managed_parent_process_tests::run(
                 case,
                 command,
                 runner_cancellation,
                 &run,
                 &captured_worker_reports,
+                journal_worktree.as_deref(),
             )
             .unwrap_or_else(|error| panic!("contained fixture failed: {error:#}"));
             if subject.id == "parent" {

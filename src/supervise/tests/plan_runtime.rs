@@ -1593,7 +1593,6 @@ fn assignment_executor_rejects_unknown_kinds_and_invalid_ssh_targets() {
 fn ssh_executor_cannot_be_erased_by_plan_only_loaders() {
     let temp = tempfile::tempdir().unwrap();
     Repository::init(temp.path()).unwrap();
-    ensure_test_repository_identity(temp.path());
     let plan_file = temp.path().join("plan.json");
     let mut document: Value = serde_json::from_slice(&bounded_loader_plan_json()).unwrap();
     document["assignments"][0]["executor"] = ssh_executor_selection_json();
@@ -2036,7 +2035,6 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
-    ensure_test_repository_identity(repo);
     fs::create_dir_all(repo.join("src")).expect("create src");
     fs::write(repo.join("src/alpha.rs"), "pub struct AlphaHandler;\n").expect("write alpha");
     fs::write(repo.join("src/beta.rs"), "pub struct BetaHandler;\n").expect("write beta");
@@ -2241,7 +2239,6 @@ fn authoritative_single_file_goal_lowers_to_one_direct_worker() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     Repository::init(repo).expect("initialize repository");
-    ensure_test_repository_identity(repo);
     fs::write(repo.join("RELEASE_NOTES.md"), "# Releases\n").expect("write release notes");
     fs::write(
         repo.join("src.rs"),
@@ -2391,7 +2388,6 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
-    ensure_test_repository_identity(&repo);
     fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
     fs::create_dir_all(repo.join(".agents/scripts")).expect("create scripts");
     fs::write(
@@ -2531,7 +2527,6 @@ fn plain_text_gitignored_policy_path_emits_workstream() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
-    ensure_test_repository_identity(&repo);
     fs::write(repo.join(".gitignore"), ".agents/\n").expect("write gitignore");
     fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
     fs::write(
@@ -4710,7 +4705,7 @@ fn configured_lens_selection_supersedes_role_effort_and_uses_exact_selector_auth
             auditor_seen = true;
             assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
             assert_eq!(command.model.as_deref(), Some(FRONTIER_PROFILE_MODEL));
-            assert_eq!(command.model_provider.as_deref(), Some("openai"));
+            assert_eq!(command.model_provider.as_deref(), None);
             assert_eq!(
                 AgentRole::Auditor.reasoning_effort_floor(),
                 Some(ReasoningEffort::Low)
@@ -4745,6 +4740,11 @@ fn configured_lens_selection_supersedes_role_effort_and_uses_exact_selector_auth
             assert!(argv
                 .windows(2)
                 .any(|arguments| { arguments == ["-c", "model_reasoning_effort=\"low\""] }));
+            assert!(
+                argv.iter()
+                    .all(|argument| !argument.contains("model_provider")),
+                "lens backend id must not be copied into model_provider argv"
+            );
             let child = injected_child_report(&assignment);
             write_injected_json(
                 &command.output_last_message,
@@ -5551,6 +5551,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-alpha".to_string(),
                 model: FRONTIER_PROFILE_MODEL.to_string(),
+                model_provider: None,
                 reasoning_effort: Some("high".to_string()),
             },
             information_scope: ReviewInformationScope::DiffOnly,
@@ -5560,6 +5561,7 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "provider-beta".to_string(),
                 model: FRONTIER_PROFILE_MODEL.to_string(),
+                model_provider: None,
                 reasoning_effort: Some("xhigh".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,
@@ -5657,20 +5659,14 @@ fn stacked_review_lenses_execute_every_configured_boundary_and_aggregate() {
     );
     assert_eq!(lens_commands.len(), 2);
     assert_ne!(lens_commands[0].cwd, lens_commands[1].cwd);
-    assert_eq!(
-        lens_commands[0].model_provider.as_deref(),
-        Some("provider-alpha")
-    );
+    assert_eq!(lens_commands[0].model_provider.as_deref(), None);
     assert_eq!(
         lens_commands[0].model.as_deref(),
         Some(FRONTIER_PROFILE_MODEL)
     );
     // Preserve each lens's exact selected effort.
     assert_eq!(lens_commands[0].reasoning_effort.as_deref(), Some("high"));
-    assert_eq!(
-        lens_commands[1].model_provider.as_deref(),
-        Some("provider-beta")
-    );
+    assert_eq!(lens_commands[1].model_provider.as_deref(), None);
     assert_eq!(
         lens_commands[1].model.as_deref(),
         Some(FRONTIER_PROFILE_MODEL)
@@ -5894,7 +5890,6 @@ fn supervisor_input_loader_accepts_direct_regular_files_and_refuses_unsafe_input
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path().join("repo");
     Repository::init(&repo).expect("initialize repository");
-    ensure_test_repository_identity(&repo);
     fs::write(repo.join("README.md"), "# test\n").expect("write readme");
 
     let plain = temp.path().join("task.txt");
@@ -6095,7 +6090,6 @@ fn heuristic_feedback_replan_lowers_remaining_work_only() {
     let temp = tempfile::tempdir().expect("tempdir");
     let repo = temp.path();
     git2::Repository::init(repo).expect("init repo");
-    ensure_test_repository_identity(repo);
     std::fs::create_dir_all(repo.join("src")).expect("src dir");
     std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").expect("alpha");
     std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").expect("beta");

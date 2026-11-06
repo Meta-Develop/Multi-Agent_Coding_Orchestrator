@@ -214,6 +214,19 @@
           "expected_error": "$.pricing_contract.price_map_sha256: pattern"
         }
       ]
+    },
+    {
+      "schema": "beta-feedback-report-v1.schema.json",
+      "valid": [
+        "beta-feedback-report-v1.valid.json",
+        "beta-feedback-report-noop-v1.valid.json"
+      ],
+      "invalid": [
+        {
+          "path": "beta-feedback-report-v1.invalid.json",
+          "expected_error": "$.created: type"
+        }
+      ]
     }
   ]
 }

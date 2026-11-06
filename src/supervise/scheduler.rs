@@ -7288,8 +7288,10 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
 ) -> Result<SupervisorFinalReport> {
     // Before run preparation, provider reservation, or the external runner.
     // Launch still rechecks these conditions on the child workspace.
+    // The evaluator opens without searching, so discover the worktree root the same way preparation does.
     if super::plan_validation::plan_has_writable_worker_or_assignment(&loaded.plan) {
-        super::plan_validation::refuse_writable_static_repository_conditions(&options.repo)?;
+        let repo = discover_repo_root(&options.repo)?;
+        super::plan_validation::refuse_writable_static_repository_conditions(&repo)?;
     }
     let PreparedSupervisorRun {
         plan,
@@ -8871,6 +8873,7 @@ mod selection_policy_tests {
             backend: ReviewLensBackendConfig::Model {
                 backend_id: "custom-provider".to_string(),
                 model: "custom-auditor".to_string(),
+                model_provider: None,
                 reasoning_effort: Some("ultra".to_string()),
             },
             information_scope: ReviewInformationScope::OutputReportOnly,

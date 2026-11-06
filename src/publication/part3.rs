@@ -554,6 +554,15 @@ fn classify_gh_operation(
             validate_external_effect_marker_argument(marker)?;
             Ok(GhOperationClass::Observation)
         }
+        ["issue", "list", "--repo", bound, "--state", "open", "--search", marker, "--limit", limit, "--json", fields]
+            if *bound == selector
+                && *limit == GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT
+                && *fields == GITHUB_ISSUE_EFFECT_FIELDS
+                && matches!(stdin, StdinMode::Null) =>
+        {
+            validate_feedback_marker(marker)?;
+            Ok(GhOperationClass::Observation)
+        }
         ["pr", "view", number, "--repo", bound, "--json", fields]
             if *bound == selector
                 && *fields == GITHUB_PR_SOURCE_FIELDS
@@ -1908,6 +1917,66 @@ fn create_github_issue(repo: &Path, title: &str, body: &str, labels: &[String]) 
     validate_github_issue_receipt_url(&receipt.url, &github_repository, number)
 }
 
+pub(crate) fn validate_feedback_marker(value: &str) -> Result<()> {
+    let hex = value
+        .strip_prefix("<!-- maco-feedback:")
+        .and_then(|rest| rest.strip_suffix(" -->"))
+        .context("feedback marker was malformed")?;
+    if hex.len() != 64 || !hex.bytes().all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f')) {
+        bail!("feedback marker fingerprint was malformed");
+    }
+    Ok(())
+}
+
+/// Search open issues for a feedback marker through the same `gh` allowlist as issue creation.
+pub(crate) fn search_open_github_issues_for_feedback_marker(
+    repo: &Path,
+    marker: &str,
+) -> Result<Option<String>> {
+    validate_feedback_marker(marker)?;
+    let repository = crate::git_repository::discover(repo)
+        .context("failed to discover the issue repository")?;
+    let remote = remote_url(&repository, "origin")
+        .context("GitHub feedback lookup requires an 'origin' remote")?;
+    let github_repository = github_repository_identity(&remote)?;
+    let selector = github_repository.selector();
+    let context = GhCommandContext::create(repo, &github_repository)?;
+    let output = context.run(
+        "gh issue feedback search",
+        [
+            "issue",
+            "list",
+            "--repo",
+            &selector,
+            "--state",
+            "open",
+            "--search",
+            marker,
+            "--limit",
+            GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT,
+            "--json",
+            GITHUB_ISSUE_EFFECT_FIELDS,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect(),
+        StdinMode::Null,
+    )?;
+    let stdout = required_command_stdout(output, "gh issue feedback search")?;
+    let value: serde_json::Value = serde_json::from_str(&stdout)
+        .context("gh issue feedback search did not return valid JSON")?;
+    let mut matches = github_issue_effect_list_from_json(&value)?
+        .into_iter()
+        .filter(|issue| issue.state == "OPEN" && issue.body.contains(marker))
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| {
+        left.number
+            .cmp(&right.number)
+            .then_with(|| left.url.cmp(&right.url))
+    });
+    Ok(matches.into_iter().next().map(|issue| issue.url))
+}
+
 fn required_command_stdout(output: merge::RequiredCommandOutput, label: &str) -> Result<String> {
     if !output.success {
         let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
@@ -2026,5 +2095,75 @@ fn summarize_text(text: &str, limit: usize) -> OutputSummary {
     OutputSummary {
         text: value,
         truncated: chars.next().is_some(),
+    }
+}
+
+#[cfg(test)]
+mod feedback_marker_allowlist {
+    use super::*;
+    use crate::process_runner::StdinMode;
+    use std::ffi::OsString;
+
+    fn repository() -> GithubRepositoryIdentity {
+        github_repository_identity_from_selector("github.com/example/repo")
+            .expect("canonical selector")
+    }
+
+    fn marker() -> String {
+        format!("<!-- maco-feedback:{} -->", "ab".repeat(32))
+    }
+
+    #[test]
+    fn open_feedback_marker_search_is_allowlisted() {
+        let repository = repository();
+        let marker = marker();
+        let args = [
+            "issue",
+            "list",
+            "--repo",
+            "github.com/example/repo",
+            "--state",
+            "open",
+            "--search",
+            marker.as_str(),
+            "--limit",
+            GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT,
+            "--json",
+            GITHUB_ISSUE_EFFECT_FIELDS,
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect::<Vec<_>>();
+        let class = classify_gh_operation(&args, &StdinMode::Null, &repository)
+            .expect("feedback marker search is on the gh allowlist");
+        assert!(matches!(class, GhOperationClass::Observation));
+    }
+
+    #[test]
+    fn feedback_search_rejects_a_short_or_unmarked_query() {
+        let repository = repository();
+        for search in ["<!-- maco-feedback:abcd -->", "open-ended query"] {
+            let args = [
+                "issue",
+                "list",
+                "--repo",
+                "github.com/example/repo",
+                "--state",
+                "open",
+                "--search",
+                search,
+                "--limit",
+                GITHUB_ISSUE_EFFECT_LOOKUP_LIMIT,
+                "--json",
+                GITHUB_ISSUE_EFFECT_FIELDS,
+            ]
+            .into_iter()
+            .map(OsString::from)
+            .collect::<Vec<_>>();
+            assert!(
+                classify_gh_operation(&args, &StdinMode::Null, &repository).is_err(),
+                "unbounded search must stay outside the allowlist: {search}"
+            );
+        }
     }
 }

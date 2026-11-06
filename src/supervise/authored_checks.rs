@@ -470,13 +470,6 @@ mod tests {
             ))?;
         }
         let repo = git2::Repository::init(root)?;
-        {
-            // Writable plans refuse before dispatch without repository-local identity.
-            let mut local = git2::Config::open(&repo.path().join("config"))
-                .context("open authored-check fixture config")?;
-            local.set_str("user.name", "maco test")?;
-            local.set_str("user.email", "maco-test@example.invalid")?;
-        }
         commit(&repo)?;
         let interpreter = ["/usr/bin/python3", "/bin/python3"]
             .iter()

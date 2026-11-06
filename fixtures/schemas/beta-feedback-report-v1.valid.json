@@ -1,0 +1,8 @@
+{
+  "created": true,
+  "url": "fake://issue/example",
+  "fingerprint": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+  "reason": null,
+  "title": "Defect: error at claim_conflict",
+  "body": "## Summary\nThe finished run did not succeed.\n"
+}

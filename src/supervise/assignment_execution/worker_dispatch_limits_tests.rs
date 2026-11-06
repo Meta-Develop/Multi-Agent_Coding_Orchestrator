@@ -138,10 +138,6 @@ fn qualification_mode(
     let temp = tempfile::tempdir()?;
     let repo = temp.path().join("repo");
     WorktreeManager::init_repository(&repo, "main")?;
-    let git = crate::git_repository::open(&repo)?;
-    let mut local = git2::Config::open(&git.commondir().join("config"))?;
-    local.set_str("user.name", "maco test")?;
-    local.set_str("user.email", "maco-test@example.invalid")?;
     let mut loaded = super::super::plan_api::parse_supervisor_plan_with_consultant_in_repo(
         include_str!("../../../examples/supervise/nested-codex-budget-qualification.json"),
         Some(&repo),

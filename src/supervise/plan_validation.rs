@@ -525,13 +525,6 @@ pub(super) fn validate_supervisor_plan_in_repo(
 
     validate_assignment_decision_refs_for_repo(&plan.assignments, repo)?;
     assignment_shape::validate_assignment_shapes(&plan, &metadata)?;
-    if let Some(repo) = repo {
-        if plan_has_writable_worker_or_assignment(&plan) {
-            // Same static conditions as the pre-dispatch preflight. Launch checks
-            // them again because the repository can change before a child starts.
-            refuse_writable_static_repository_conditions(repo)?;
-        }
-    }
     Ok((plan, metadata))
 }
 

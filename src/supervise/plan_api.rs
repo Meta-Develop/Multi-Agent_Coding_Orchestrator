@@ -186,13 +186,33 @@ pub fn supervisor_plan_document_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
 ) -> Result<Value> {
+    Ok(supervisor_plan_and_document_from_task_file(repo, task_file)?.1)
+}
+
+pub(crate) fn supervisor_plan_and_document_from_task_file(
+    repo: impl AsRef<Path>,
+    task_file: impl AsRef<Path>,
+) -> Result<(SupervisorPlan, Value)> {
     let loaded = supervisor_plan_and_consultant_from_task_file(repo, task_file)?;
-    supervisor_plan_value(
+    let document = supervisor_plan_value(
         &loaded.plan,
         &loaded.consultant,
         &loaded.assignment_metadata,
         &loaded.plan_metadata,
-    )
+    )?;
+    Ok((loaded.plan, document))
+}
+
+/// Static repository conditions for the offline `supervise plan` command.
+/// Shared parse and validation do not call this. A read-only plan is skipped.
+pub(crate) fn refuse_writable_plan_static_repository_conditions(
+    plan: &SupervisorPlan,
+    repo: &Path,
+) -> Result<()> {
+    if super::plan_validation::plan_has_writable_worker_or_assignment(plan) {
+        super::plan_validation::refuse_writable_static_repository_conditions(repo)?;
+    }
+    Ok(())
 }
 
 /// Machine-readable failure envelope for `supervise plan --json`.
@@ -892,7 +912,6 @@ mod task_routing_lowering_tests {
     }
 
     fn loaded(repo: &Path, proposal: planning::TaskDecompositionProposal) -> LoadedSupervisorPlan {
-        super::super::tests::ensure_test_repository_identity(repo);
         supervisor_plan_and_consultant_from_goal_spec_proposal(
             "Complete the assigned work",
             "Complete and verify all fragments",
@@ -1911,7 +1930,6 @@ mod task_routing_lowering_tests {
         let temp = tempfile::tempdir().unwrap();
         let repo = temp.path();
         git2::Repository::init(repo).unwrap();
-        super::super::tests::ensure_test_repository_identity(repo);
         std::fs::create_dir_all(repo.join("src")).unwrap();
         std::fs::write(repo.join("src/alpha.rs"), "pub fn alpha_task() {}\n").unwrap();
         std::fs::write(repo.join("src/beta.rs"), "pub fn beta_task() {}\n").unwrap();
@@ -7493,7 +7511,6 @@ mod diagnostics_emission_tests {
         fs::write(repo_path.join("README.md"), "hello\n").expect("readme");
         fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("lib");
         let repo = git2::Repository::init(&repo_path).expect("init");
-        super::super::tests::ensure_test_repository_identity(&repo_path);
         commit_all(&repo, "outer");
         for boundary in [
             "zeta/nested",
@@ -8028,7 +8045,6 @@ mod decision_ref_live_reparse_tests {
         fs::create_dir_all(repo.join("src")).expect("src");
         fs::write(repo.join("README.md"), "hello\n").expect("readme");
         git2::Repository::init(&repo).expect("initialize repository");
-        super::super::tests::ensure_test_repository_identity(&repo);
         (temp, repo)
     }
 
@@ -8288,7 +8304,6 @@ mod generated_design_decision_lifecycle_tests {
         fs::write(repo.join("src/server.rs"), "pub fn server_recv() {}\n").expect("server");
         fs::write(repo.join("README.md"), "hello\n").expect("readme");
         git2::Repository::init(&repo).expect("initialize repository");
-        super::super::tests::ensure_test_repository_identity(&repo);
         (temp, repo)
     }
 

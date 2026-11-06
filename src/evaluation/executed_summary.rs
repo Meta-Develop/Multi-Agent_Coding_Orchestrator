@@ -1001,6 +1001,7 @@ mod tests {
                 backend: crate::review::ReviewLensBackendConfig::Model {
                     backend_id: "openai".to_string(),
                     model: "fixture-model".to_string(),
+                    model_provider: None,
                     reasoning_effort: None,
                 },
                 information_scope: ReviewInformationScope::FullChildTranscript,
