@@ -1,4 +1,4 @@
-use super::types::MAX_SECRETS;
+use super::types::{MAX_AUDIT_EVENTS, MAX_SECRETS};
 use super::*;
 use serde_json::json;
 
@@ -281,6 +281,78 @@ fn rotation_then_report_then_finish_leaves_no_raw_material() {
     );
     let post = vault.report().expect("post-finish report");
     assert_no_placeholder(&serde_json::to_string(&post).expect("encode"));
+}
+
+#[test]
+fn finish_cleans_up_with_full_audit_capacity() {
+    assert_finish_cleanup_with_audit_slots(0);
+}
+
+#[test]
+fn finish_cleans_up_multiple_records_with_one_audit_slot() {
+    assert_finish_cleanup_with_audit_slots(1);
+}
+
+fn assert_finish_cleanup_with_audit_slots(remaining_slots: usize) {
+    let mut vault = SecretVault::at_unix_ms(1_000);
+    let mut references = Vec::new();
+    for index in 0..3 {
+        let declaration = SecretDeclaration::new(
+            format!("finish.placeholder.{index}"),
+            format!("MACO_FINISH_PLACEHOLDER_{index}"),
+            parent_scope(),
+        )
+        .expect("declaration");
+        let reference = vault.declare(declaration).expect("declare");
+        vault.bind_material(&reference, PLACEHOLDER).expect("bind");
+        references.push(
+            vault
+                .rotate_material(&reference, PLACEHOLDER_ROTATED)
+                .expect("rotate"),
+        );
+    }
+    let sample = format!("old={PLACEHOLDER} new={PLACEHOLDER_ROTATED}");
+    let before = vault.redact_text(&sample).expect("redact before finish");
+    assert_no_placeholder(&before.text);
+    assert_eq!(before.summary.total_replacements, 2);
+
+    while vault.audit_trail().events().len() < MAX_AUDIT_EVENTS - remaining_slots {
+        vault.report().expect("fill audit capacity");
+    }
+    let evidence = vault.audit_trail().events().to_vec();
+    let error = vault.finish().expect_err("teardown audit capacity");
+    assert_eq!(error, SecretLifecycleError::AuditCapacity);
+    assert_eq!(vault.audit_trail().events().len(), MAX_AUDIT_EVENTS);
+    assert_eq!(
+        &vault.audit_trail().events()[..evidence.len()],
+        evidence.as_slice()
+    );
+    for (event, reference) in vault.audit_trail().events()[evidence.len()..]
+        .iter()
+        .zip(&references)
+    {
+        assert_eq!(event.action(), SecretAuditAction::Destroy);
+        assert_eq!(event.secret(), Some(reference));
+    }
+    assert_no_placeholder(&serde_json::to_string(vault.audit_trail()).expect("encode audit"));
+    assert_no_placeholder(&format!("{vault:?} {error:?} {error}"));
+
+    let after = vault.redact_text(&sample).expect("redact after finish");
+    assert_eq!(after.summary.total_replacements, 0);
+    assert_eq!(after.text, sample);
+    for reference in references {
+        assert_eq!(
+            vault
+                .inject(&reference, &parent_scope())
+                .expect_err("finished vault cannot inject"),
+            SecretLifecycleError::AuditCapacity
+        );
+    }
+    assert_eq!(
+        vault.finish().expect_err("repeated finish audit capacity"),
+        SecretLifecycleError::AuditCapacity
+    );
+    assert_eq!(vault.audit_trail().events().len(), MAX_AUDIT_EVENTS);
 }
 
 #[test]
