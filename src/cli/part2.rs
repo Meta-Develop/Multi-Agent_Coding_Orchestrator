@@ -2340,6 +2340,14 @@ fn parse_forge_kind(value: &str) -> std::result::Result<ForgeKind, String> {
     ForgeKind::parse(value)
 }
 
+fn parse_feedback_forge(value: &str) -> std::result::Result<supervise::FeedbackForge, String> {
+    match value {
+        "fake" => Ok(supervise::FeedbackForge::Fake),
+        "github" => Ok(supervise::FeedbackForge::Github),
+        _ => Err("expected one of: fake, github".to_string()),
+    }
+}
+
 fn parse_inbox_permission_mode(value: &str) -> std::result::Result<InboxPermissionMode, String> {
     InboxPermissionMode::parse(value)
 }
@@ -2428,6 +2436,36 @@ fn print_query_report<T: Serialize + std::fmt::Debug>(report: &T, json: bool) ->
         println!("{}", serde_json::to_string_pretty(report)?);
     } else {
         println!("{report:#?}");
+    }
+    Ok(())
+}
+
+fn print_feedback_report(report: &supervise::FeedbackReport, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(report)?);
+        return Ok(());
+    }
+    if report.reason == Some(supervise::FeedbackReason::DryRun) {
+        println!("{}", report.title);
+        println!("{}", report.fingerprint);
+        if let Some(body) = &report.body {
+            println!("{body}");
+        }
+        return Ok(());
+    }
+    println!("created: {}", report.created);
+    println!("url: {}", report.url.as_deref().unwrap_or(""));
+    println!("fingerprint: {}", report.fingerprint);
+    println!(
+        "reason: {}",
+        report
+            .reason
+            .map(supervise::FeedbackReason::as_str)
+            .unwrap_or("")
+    );
+    println!("title: {}", report.title);
+    if let Some(body) = &report.body {
+        println!("{body}");
     }
     Ok(())
 }
