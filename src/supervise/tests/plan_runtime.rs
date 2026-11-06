@@ -3678,13 +3678,13 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
         assert!(!command.codex_managed_worker_requests_enabled());
         assert!(command.assignment_messaging_launch().is_none());
         let final_turn = json!({
-            "version": 1,
+            "version": 2,
             "run_id": run_id.as_str(),
             "parent_id": assignment.id,
             "source_parent_attempt": 1,
             "parent_attempt": 2,
             "completed_worker_ids": [worker_report.id.clone()],
-            "turn": {"outcome": "final_report", "report": &child_report}
+            "turn": assignment_execution::parent_continuation_response::final_turn_for_test(command, &child_report)
         });
         write_injected_json(&command.output_last_message, &final_turn);
         write_injected_usage(command, 8, 3);

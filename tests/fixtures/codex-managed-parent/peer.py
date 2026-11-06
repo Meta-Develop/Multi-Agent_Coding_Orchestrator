@@ -99,6 +99,8 @@ elif payload["mode"] == "worker":
     path = report["assigned_paths"][0]
     code = ("from pathlib import Path; p=Path(" + repr(path) + "); "
             "p.write_text(p.read_text() + " + repr(payload["edit"]) + ")")
+    if payload["case"] == "isolated-long-output":
+        code += "; print('captured Worker output\\n' * 768, end='')"
     argv = [sys.executable, "-c", code]
     item = {"id": "edit", "type": "commandExecution", "command": shlex.join(argv),
             "cwd": str(workspace), "status": "inProgress", "exitCode": None}
@@ -126,7 +128,8 @@ elif payload["mode"] == "worker":
             journal.flush()
             os.fsync(journal.fileno())
     begin = time.monotonic()
-    result = subprocess.run(argv, cwd=workspace, check=True)
+    result = subprocess.run(argv, cwd=workspace, check=True, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE)
     if payload["case"] == "isolated-overlap":
         other = "src/other.rs" if path == "src/lib.rs" else "src/lib.rs"
         (workspace / other).write_text("overlapping candidate edit\n")
@@ -147,7 +150,8 @@ elif payload["mode"] == "worker":
         os.fsync(journal.fileno())
     report["commands_run"] = [{"command": argv, "cwd": journal_cwd,
         "exit_code": result.returncode, "status": "succeeded", "timeout_seconds": 10,
-        "duration_ms": elapsed, "timed_out": False}]
+        "duration_ms": elapsed, "timed_out": False,
+        "stdout": result.stdout.decode(), "stderr": result.stderr.decode()}]
     report["files_changed"] = [path]
     report["validation_results"] = [{"name": "actual edit", "status": "succeeded",
         "command": argv, "message": "completed by the contained process"}]

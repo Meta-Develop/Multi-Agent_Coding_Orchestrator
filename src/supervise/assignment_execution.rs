@@ -25,7 +25,7 @@ mod isolated_worker_evidence;
 #[allow(dead_code)]
 mod managed_parent_controller;
 #[allow(dead_code)]
-mod parent_continuation_response;
+pub(super) mod parent_continuation_response;
 mod review_handoff;
 mod worker_completion;
 
@@ -2356,10 +2356,8 @@ pub(super) fn bind_worker_journal_artifacts(
     Ok(command)
 }
 
-/// A staged launch input, not a final-report or resumed-execution authority.
-/// Production construction is unavailable: even a BoundParentTurnYield cannot
-/// bind completed Worker evidence to its authenticated inbox request/turn yet.
-/// Only an explicitly unbound test fixture exercises this staged preparation.
+/// A launch input borrowing authenticated Worker captures and live resources;
+/// never deserialized as final-report or resumed-execution authority.
 pub(super) struct ParentContinuationLaunch<'evidence> {
     run_id: String,
     assignment: OrchestratorAssignment,
@@ -2371,7 +2369,7 @@ pub(super) struct ParentContinuationLaunch<'evidence> {
     semantic_token: Option<u64>,
     ordered_worker_ids: Vec<String>,
     summaries: String,
-    _held_workers: Vec<&'evidence nested_worker_executor::NestedWorkerAttemptEvidence>,
+    held_workers: Vec<&'evidence nested_worker_executor::NestedWorkerAttemptEvidence>,
 }
 
 #[cfg(test)]
@@ -2521,7 +2519,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
             semantic_token: preflight.semantic_token,
             ordered_worker_ids,
             summaries: serde_json::to_string(&summaries)?,
-            _held_workers: held_workers,
+            held_workers,
         };
         contract.revalidate(context, preflight, attempt)?;
         Ok(contract)
@@ -2595,6 +2593,53 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
     }
     pub(super) fn summaries(&self) -> &str {
         &self.summaries
+    }
+
+    fn authored_worker_captures(
+        &self,
+    ) -> Result<Vec<&'evidence nested_worker_executor::NestedWorkerAttemptEvidence>> {
+        let mut by_id = BTreeMap::new();
+        for evidence in &self.held_workers {
+            if by_id
+                .insert(evidence.report().id.as_str(), *evidence)
+                .is_some()
+            {
+                bail!("continuation duplicates a held Worker capture");
+            }
+        }
+        let ordered = self
+            .assignment
+            .worker_assignments
+            .iter()
+            .map(|worker| {
+                by_id
+                    .remove(worker.id.as_str())
+                    .context("continuation is missing an authored Worker capture")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        if !by_id.is_empty() {
+            bail!("continuation includes an unauthored Worker capture");
+        }
+        Ok(ordered)
+    }
+
+    pub(super) fn worker_report_references(
+        &self,
+    ) -> Result<Vec<parent_continuation_response::WorkerReportReference>> {
+        self.authored_worker_captures()?
+            .into_iter()
+            .map(|evidence| {
+                Ok(
+                    parent_continuation_response::WorkerReportReference::from_capture(
+                        &evidence.report().id,
+                        evidence
+                            .run()
+                            .output_last_message()
+                            .context("continuation lost its held Worker capture")?,
+                    ),
+                )
+            })
+            .collect()
     }
 }
 
@@ -5367,7 +5412,16 @@ fn require_exact_completed_worker_reports(
         bail!("managed parent final report worker_reports differ from completed worker evidence");
     }
     let mut ids = BTreeSet::new();
-    for (supplied, worker) in parsed.report.worker_reports.iter().zip(workers) {
+    for (supplied, authored) in parsed
+        .report
+        .worker_reports
+        .iter()
+        .zip(&assignment.worker_assignments)
+    {
+        let worker = workers
+            .iter()
+            .find(|worker| worker.evidence().report().id == authored.id)
+            .context("managed parent final report is missing an authored Worker capture")?;
         if supplied != worker.evidence().report() || !ids.insert(supplied.id.as_str()) {
             bail!(
                 "managed parent final report worker_reports differ from completed worker evidence"

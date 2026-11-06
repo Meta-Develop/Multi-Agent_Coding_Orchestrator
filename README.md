@@ -3891,6 +3891,32 @@ conditional keywords and supervisor-owned authority fields, including the
 review-lens aggregate. The parent still validates every collected final message
 against the full local contract and computes its own review evidence before
 acceptance.
+For supervisor-managed authored Workers, the fresh final parent uses a version-2
+continuation envelope. Its `turn` has `outcome="final_report"`, the parent's
+`report`, and `worker_report_refs`: one `{assignment_id, capture_sha256}` entry
+per Worker in authored order. The prompt supplies these references and the held
+Worker results for technical review. `capture_sha256` hashes the exact captured
+final-message bytes, including whitespace, rather than reserialized report JSON.
+The parent must omit `report.worker_reports`; both generated continuation output
+schemas exclude that payload. Wrong digests, missing, extra, duplicate or
+reordered references, and parent-supplied Worker payloads refuse collection.
+The supervisor verifies references against its descriptor-held authenticated
+captures and fills `worker_reports` before the existing full report, journal,
+worktree, candidate, and independent review checks. Normalized reports and final
+reports still contain the complete Worker evidence, including long command output.
+
+This contract applies to isolated siblings and the serial shared-worktree managed
+continuation. Serial execution keeps its authenticated frozen request order;
+final references and filled reports use authored order. Direct terminal Worker
+and unmanaged child-report contracts remain unchanged. Existing stored plans
+need no migration. Resume reads authenticated normalized checkpoints/final reports
+and only finalizes artifacts; it never replays raw parent responses or relaunches
+an interrupted continuation. Unsupported or uncertain lifecycle states still
+refuse resume. A version-1 echo envelope presented to live continuation collection
+is explicitly refused: reconcile the old attempt and start a new run. Historical
+normalized reports and evidence-only re-audits retain their existing format.
+The continuation payload and prompt byte ceilings are unchanged.
+
 Worker prompts also include a structured execution journal path under
 `incoming/worker-journals/<worker-id>.jsonl`. Terminal workers append JSONL
 records with `command`, `cwd`, `start_timestamp`, `end_timestamp`, and

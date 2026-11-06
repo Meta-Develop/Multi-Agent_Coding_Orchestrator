@@ -234,10 +234,10 @@ fn handoff(case: &str) -> Result<()> {
             write_injected_json(
                 &command.output_last_message,
                 &json!({
-                    "version":1, "run_id":run_id.as_str(), "parent_id":parent.id,
+                    "version":2, "run_id":run_id.as_str(), "parent_id":parent.id,
                     "source_parent_attempt":1, "parent_attempt":2,
                     "completed_worker_ids":[parent.worker_assignments[0].id],
-                    "turn":{"outcome":"final_report", "report":child}
+                    "turn":assignment_execution::parent_continuation_response::final_turn_for_test(command, &child)
                 }),
             );
         }

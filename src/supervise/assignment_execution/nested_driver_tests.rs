@@ -1012,24 +1012,27 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                     };
                     report.audit_reports.clear();
                     report.review_lens_aggregate = None;
+                    let mut turn =
+                        super::parent_continuation_response::final_turn_for_test(command, &report);
                     if case == "managed-cycle-isolated-final-acceptance-forgery" {
                         assert!(report.worker_reports[0].accepted);
                         report.worker_reports[0].accepted = false;
+                        turn["report"]["worker_reports"] = json!(report.worker_reports);
                     }
                     if case == "managed-cycle-final-forgery"
                         || case == "managed-cycle-isolated-final-forgery"
                     {
-                        report.worker_reports[0].id = "forged".into();
+                        turn["worker_report_refs"][0]["assignment_id"] = json!("forged");
                     }
                     run.output_last_message = Some(
                         serde_json::to_vec(&json!({
-                            "version":1,
+                            "version":2,
                             "run_id":run_id.as_str(),
                             "parent_id":"parent",
                             "source_parent_attempt":1,
                             "parent_attempt":2,
                             "completed_worker_ids": completed_worker_ids,
-                            "turn": {"outcome":"final_report", "report": report}
+                            "turn": turn
                         }))
                         .unwrap(),
                     );
@@ -1958,17 +1961,37 @@ fn exercise_fixture_continuation(
         assert!(prompt.contains("Source is read-only"));
         assert!(prompt.contains("do not edit, stage, commit, reset"));
         contract.revalidate(context, preflight, 2)?;
+        assert_eq!(
+            contract
+                .worker_report_references()?
+                .iter()
+                .map(|reference| reference.assignment_id.as_str())
+                .collect::<Vec<_>>(),
+            ["worker", "worker-two"],
+            "final references must follow authorship even when frozen execution order differs"
+        );
         let schema_path = prepared.command.output_schema.as_ref().unwrap();
         assert!(schema_path.ends_with("parent-continuation-2.codex-output.schema.json"));
         let codex_schema: serde_json::Value = serde_json::from_slice(&fs::read(schema_path)?)?;
         let schema = super::super::schema_artifacts::parent_continuation_schema_value(&contract);
         assert_eq!(codex_schema["title"], "ParentContinuationTurn");
-        let instance = json!({"version":1, "run_id":run_id.as_str(), "parent_id":"parent",
+        let instance = json!({"version":2, "run_id":run_id.as_str(), "parent_id":"parent",
             "source_parent_attempt":1, "parent_attempt":2,
             "completed_worker_ids":["worker-two", "worker"],
             "turn":{"outcome":"yield_workers", "requests":[{"request_id":"next", "worker_id":"unresolved"}]}});
         for schema in [schema, codex_schema] {
             let authoritative = schema["properties"]["turn"].get("oneOf").is_some();
+            let variants = schema["properties"]["turn"]
+                .get("oneOf")
+                .or_else(|| schema["properties"]["turn"].get("anyOf"))
+                .unwrap();
+            let final_schema = &variants[1]["properties"];
+            assert!(final_schema["report"]["properties"]
+                .get("worker_reports")
+                .is_none());
+            assert!(final_schema["worker_report_refs"]["items"]["properties"]
+                .get("capture_sha256")
+                .is_some());
             let mut compiler = boon::Compiler::new();
             compiler.set_default_draft(boon::Draft::V2020_12);
             compiler
@@ -1983,11 +2006,16 @@ fn exercise_fixture_continuation(
                 .expect("valid yield envelope");
             if authoritative {
                 let mut final_turn = instance.clone();
-                final_turn["turn"] =
-                    json!({"outcome":"final_report", "report":collected.attempt_report});
+                final_turn["turn"] = super::parent_continuation_response::final_turn_for_test(
+                    &prepared.command,
+                    &collected.attempt_report,
+                );
                 schemas
                     .validate(&final_turn, index)
                     .expect("valid final report envelope");
+                let mut echo = final_turn.clone();
+                echo["turn"]["report"]["worker_reports"] = json!([]);
+                assert!(schemas.validate(&echo, index).is_err());
                 final_turn["turn"]["requests"] = instance["turn"]["requests"].clone();
                 assert!(schemas.validate(&final_turn, index).is_err());
             }
