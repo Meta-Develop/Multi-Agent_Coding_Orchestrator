@@ -222,6 +222,58 @@ fn worker_journal_wrapped_edit_observes_paths_without_declaration() {
     verify_worker_journal_identity(&fs::metadata(path).unwrap(), &identity).unwrap();
 }
 
+fn assert_journal_git_index_owner_only_under_group_umask() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    // Rewrite only the index. A worktree edit before launch is an unobserved
+    // change and the journal refuses to start the command.
+    let record = observed_entry(&worktree, &["git", "read-tree", "HEAD"]);
+    run_worker_execution_journal_command(&path, &identity, &record, false)
+        .expect("journal git read-tree");
+    let index = worktree.join(".git/index");
+    let metadata = fs::symlink_metadata(&index).unwrap();
+    let mode = metadata.permissions().mode() & 0o777;
+    assert_eq!(metadata.nlink(), 1);
+    // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+    assert_eq!(metadata.uid(), unsafe { libc::geteuid() });
+    assert_eq!(mode, 0o600, "git index mode {mode:o}");
+}
+
+#[test]
+fn worker_journal_child_git_rewrite_keeps_index_owner_only() {
+    const CHILD: &str = "MACO_JOURNAL_INDEX_UMASK_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        assert_journal_git_index_owner_only_under_group_umask();
+        return;
+    }
+    use std::os::unix::process::CommandExt;
+    let mut child = std::process::Command::new(std::env::current_exe().expect("test executable"));
+    child
+        .args([
+            "--exact",
+            "supervise::reporting::tests::worker_journal_child_git_rewrite_keeps_index_owner_only",
+            "--nocapture",
+        ])
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_COUNT", "0")
+        .env(CHILD, "1");
+    // SAFETY: pre_exec runs in the forked child. umask is async-signal-safe
+    // and applies only to this fresh test process.
+    unsafe {
+        child.pre_exec(|| {
+            libc::umask(0o002);
+            Ok(())
+        });
+    }
+    let output = child.output().expect("re-exec journal umask test");
+    assert!(
+        output.status.success(),
+        "journal git child failed\nstdout:\n{}\nstderr:\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn worker_journal_declared_mismatch_is_preserved_and_rejected() {
     let (_temp, worktree, path, identity) = observed_fixture();
