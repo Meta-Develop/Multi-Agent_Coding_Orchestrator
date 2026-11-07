@@ -642,6 +642,7 @@ where
         RuntimeAdapterConfig::defaults(RuntimeId::Devin),
     )
     .with_devin_reviewed_workspace(&inputs.reviewed_workspace);
+    let command = command.with_read_only_input_file(writer.run_dir().join(SCHEMA_ARTIFACT));
     let command = command.with_environment_requirements(vec![
         EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalDevin),
         EnvironmentRequirement::network(EnvironmentNetworkAccess::Enabled),
