@@ -14,7 +14,7 @@ const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 #[test]
 fn devin_consult_missing_or_malformed_native_credentials_refuses_before_fixture_spawn() -> Result<()>
 {
-    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::{fs::PermissionsExt, process::ExitStatusExt};
     let temp = TempDir::new()?;
     let repo = fs::canonicalize(create_committed_repo(temp.path())?)?;
     let home = temp.path().join("synthetic-home");
@@ -65,21 +65,60 @@ fn devin_consult_missing_or_malformed_native_credentials_refuses_before_fixture_
                 "--json",
             ])
             .output()?;
-        assert!(!output.status.success());
-        let report: Value = serde_json::from_slice(&output.stdout)?;
-        assert_eq!(report["runtime"], "devin");
-        assert_eq!(report["success"], false);
-        assert!(report["exit_info"]["error"]
-            .as_str()
-            .context("preflight error")?
-            .contains("Devin preflight refused"));
         assert!(!marker.exists());
         let combined = format!(
             "{}{}",
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(!combined.contains("synthetic-invalid-secret"));
+        assert!(
+            !combined.contains("synthetic-invalid-secret"),
+            "child output must redact the synthetic credential"
+        );
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout).with_context(|| {
+            let stderr = multi_agent_coding_orchestrator::llm::Redactor::new()
+                .with_private_value("synthetic-secret", "synthetic-invalid-secret")
+                .with_private_value("local-path", temp.path().to_string_lossy())
+                .with_private_value("local-path", home.to_string_lossy())
+                .with_private_value("local-path", repo.to_string_lossy())
+                .redact(&String::from_utf8_lossy(&output.stderr))
+                .text;
+            let excerpt: String = stderr
+                .split_whitespace()
+                .map(|word| {
+                    if word.contains('/') || word.contains('\\') {
+                        "<redacted:local-path>"
+                    } else {
+                        word
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
+                .chars()
+                .take(1024)
+                .collect();
+            let escaped = format!("{excerpt:?}");
+            let mut end = escaped.len().min(4096);
+            while !escaped.is_char_boundary(end) {
+                end -= 1;
+            }
+            let excerpt = &escaped[..end];
+            format!(
+                "{run_id}: invalid consult JSON; status={}; signal={:?}; stdout_bytes={}; \
+                 stderr_bytes={}; redacted_stderr={excerpt}",
+                output.status,
+                output.status.signal(),
+                output.stdout.len(),
+                output.stderr.len(),
+            )
+        })?;
+        assert_eq!(report["runtime"], "devin");
+        assert_eq!(report["success"], false);
+        assert!(report["exit_info"]["error"]
+            .as_str()
+            .context("preflight error")?
+            .contains("Devin preflight refused"));
     }
     Ok(())
 }

@@ -56,9 +56,7 @@ fn devin_builder_declares_config_parent_before_its_mandatory_read_only_mount() {
         assert!(args.contains(&OsStr::new(expected)), "missing {expected}");
     }
     let projected = runtime.join(".config/devin/config.json");
-    assert!(args.contains(
-        &systemd_path_property("ReadOnlyPaths=", &projected, false).as_os_str()
-    ));
+    assert!(args.contains(&systemd_path_property("ReadOnlyPaths=", &projected, false).as_os_str()));
     assert!(args
         .windows(2)
         .any(|pair| pair[0] == OsStr::new("--config") && pair[1] == projected.as_os_str()));
@@ -92,9 +90,13 @@ fn devin_builder_declares_config_parent_before_its_mandatory_read_only_mount() {
         StrictOfflineWorkspaceProfile::read_only(&workspace),
     ));
     let mut unchanged = systemd_unit_fixture(&runtime, None);
-    let command = unchanged.build_command(&ordinary).expect("ordinary builder");
+    let command = unchanged
+        .build_command(&ordinary)
+        .expect("ordinary builder");
     let args = command.get_args().collect::<Vec<_>>();
-    assert!(args.contains(&OsStr::new("--property=RuntimeDirectory=maco-process-123-1")));
+    assert!(args.contains(&OsStr::new(
+        "--property=RuntimeDirectory=maco-process-123-1"
+    )));
     assert!(!args.contains(&read_only_parent.as_os_str()));
     assert!(!unchanged.launcher_spawned);
 }
@@ -164,7 +166,12 @@ fn runtime_directory_config_child_is_exclusive_to_devin() {
             "unchanged runtime directory declaration for {kind:?}"
         );
     }
-    for unsafe_name in ["runtime extra", "runtime:alias", "runtime%specifier", ".config"] {
+    for unsafe_name in [
+        "runtime extra",
+        "runtime:alias",
+        "runtime%specifier",
+        ".config",
+    ] {
         assert!(systemd_runtime_directory_names(
             &Path::new("/run/user/1000").join(unsafe_name),
             SideEffectConfinementProfileKind::ExternalDevin,

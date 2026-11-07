@@ -1642,7 +1642,10 @@ mod tests {
         let native = tempfile::tempdir_in(temp.path())?;
         let credentials = native.path().join("credentials.toml");
         let config = native.path().join("config.json");
-        fs::write(&credentials, b"token='synthetic-fixture-token-0123456789'\n")?;
+        fs::write(
+            &credentials,
+            b"token='synthetic-fixture-token-0123456789'\n",
+        )?;
         fs::write(
             &config,
             serde_json::to_vec(&crate::runtime_adapter::devin::pinned_user_config())?,
@@ -1703,7 +1706,10 @@ mod tests {
             )));
             for source in [&config, &credentials] {
                 assert!(properties.iter().any(|value| {
-                    value.starts_with(&format!("--property=BindReadOnlyPaths={}:", source.display()))
+                    value.starts_with(&format!(
+                        "--property=BindReadOnlyPaths={}:",
+                        source.display()
+                    ))
                 }));
             }
             assert!(!properties.iter().any(|value| {
@@ -1716,8 +1722,9 @@ mod tests {
             let old_schema = command
                 .clone()
                 .with_read_only_input_file(run_dir.join(SCHEMA_ARTIFACT));
-            let error = crate::external_agent::devin_consult_protected_profile_for_test(&old_schema)
-                .expect_err("protected schema must not be registered as an external input");
+            let error =
+                crate::external_agent::devin_consult_protected_profile_for_test(&old_schema)
+                    .expect_err("protected schema must not be registered as an external input");
             assert!(error
                 .to_string()
                 .contains("exact read-only input file overlaps"));
@@ -1725,8 +1732,9 @@ mod tests {
             old_output.output_last_message = run_dir
                 .join(EXTERNAL_INCOMING_SCRATCH)
                 .join("consultant-report.json");
-            let error = crate::external_agent::devin_consult_protected_profile_for_test(&old_output)
-                .expect_err("Devin must not receive the protected incoming exception");
+            let error =
+                crate::external_agent::devin_consult_protected_profile_for_test(&old_output)
+                    .expect_err("Devin must not receive the protected incoming exception");
             assert!(error.to_string().contains("output parent overlaps"));
             capture_parent = Some(parent);
             let bytes = sample_report_json("untrusted-run").into_bytes();
@@ -1775,6 +1783,11 @@ mod tests {
         };
         let mut capture_path = None;
         let error = ask_consultant_with_inputs(options, None, Some(inputs), |command| {
+            let parent = fs::canonicalize(command.output_last_message.parent().unwrap()).unwrap();
+            assert!(
+                !parent.starts_with(&repo),
+                "private capture parent must be outside the canonical repository"
+            );
             fs::write(&command.output_last_message, b"retained parent capture").unwrap();
             capture_path = Some(command.output_last_message.clone());
             let mut run = failed_test_external_run(command, "synthetic unknown process custody");
@@ -1787,7 +1800,9 @@ mod tests {
             ));
             run
         })
-        .expect_err("unknown target custody must retain the private capture and refuse finalization");
+        .expect_err(
+            "unknown target custody must retain the private capture and refuse finalization",
+        );
         assert!(error.to_string().contains("scratch quiescence unverified"));
         let capture_path = capture_path.expect("synthetic runner reached");
         assert_eq!(fs::read(&capture_path)?, b"retained parent capture");
