@@ -2181,6 +2181,7 @@ impl ConsultCommand {
                     args.json,
                 )?;
                 let gemini = args.gemini_inputs()?;
+                let devin = args.devin_inputs()?;
                 let options = ConsultAskOptions {
                     repo: resolved.repo,
                     run_id: resolved.run_id,
@@ -2190,9 +2191,10 @@ impl ConsultCommand {
                     context_paths: args.context_path,
                     timeout_seconds: args.timeout_seconds,
                 };
-                let report = match gemini {
-                    Some(inputs) => consult::ask_gemini_consultant(options, inputs)?,
-                    None => consult::ask_consultant(options)?,
+                let report = match (gemini, devin) {
+                    (Some(inputs), None) => consult::ask_gemini_consultant(options, inputs)?,
+                    (None, Some(inputs)) => consult::ask_devin_consultant(options, inputs)?,
+                    _ => consult::ask_consultant(options)?,
                 };
                 print_query_report(&report, args.json)?;
                 if !report.success {
@@ -2221,18 +2223,21 @@ struct AskConsultArgs {
     /// File containing the question text.
     #[arg(long)]
     question_file: Option<PathBuf>,
-    /// Consultant runtime to use. Real runtimes require --consultant-bin.
+    /// Consultant runtime: fake, codex, claude, gemini, devin. Real runtimes require --consultant-bin.
     #[arg(long, default_value = "fake")]
     runtime: ConsultantRuntime,
-    /// Runtime executable for real consultant runtimes.
+    /// Runtime executable for real consultants; Devin requires an absolute canonical file path.
     #[arg(long)]
     consultant_bin: Option<PathBuf>,
-    /// Explicit requested model for Gemini; never an observed model identity.
+    /// Explicit exact model for Gemini or Devin; never an observed model identity.
     #[arg(long)]
     model: Option<String>,
     /// Positive finite token ceiling required for Gemini consultation.
     #[arg(long)]
     token_budget: Option<usize>,
+    /// Explicit canonical repo reviewed for Devin's CI trust flag, inside verified read-only confinement.
+    #[arg(long)]
+    reviewed_workspace: Option<PathBuf>,
     /// Repo-relative existing path to mention as context. Contents are not inlined.
     #[arg(long = "context-path")]
     context_path: Vec<PathBuf>,
@@ -2251,6 +2256,25 @@ struct AskConsultArgs {
 }
 
 impl AskConsultArgs {
+    fn devin_inputs(&self) -> Result<Option<consult::DevinConsultOptions>> {
+        if self.runtime == ConsultantRuntime::Devin {
+            let inputs = consult::DevinConsultOptions {
+                model: self.model.clone().context("Devin requires --model")?,
+                reviewed_workspace: self
+                    .reviewed_workspace
+                    .clone()
+                    .context("Devin requires explicit --reviewed-workspace")?,
+            };
+            inputs.validate()?;
+            Ok(Some(inputs))
+        } else {
+            if self.reviewed_workspace.is_some() {
+                bail!("--reviewed-workspace requires --runtime devin");
+            }
+            Ok(None)
+        }
+    }
+
     fn gemini_inputs(&self) -> Result<Option<consult::GeminiConsultOptions>> {
         if self.runtime == ConsultantRuntime::Gemini {
             let inputs = consult::GeminiConsultOptions {
@@ -2262,8 +2286,10 @@ impl AskConsultArgs {
             inputs.validate()?;
             Ok(Some(inputs))
         } else {
-            if self.model.is_some() || self.token_budget.is_some() {
-                bail!("--model and --token-budget on consult ask require --runtime gemini");
+            if (self.model.is_some() && self.runtime != ConsultantRuntime::Devin)
+                || self.token_budget.is_some()
+            {
+                bail!("--model requires --runtime gemini or devin; --token-budget requires gemini");
             }
             Ok(None)
         }
@@ -2273,6 +2299,45 @@ impl AskConsultArgs {
 #[cfg(test)]
 mod gemini_consult_input_tests {
     use super::*;
+
+    #[test]
+    fn devin_consult_cli_requires_exact_model_and_explicit_reviewed_repo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = std::fs::canonicalize(temp.path())?;
+        let repo = repo.to_str().context("fixture path")?;
+        for flags in [
+            vec!["--runtime", "devin"],
+            vec!["--runtime", "devin", "--model", "provider/exact-model-v1"],
+            vec![
+                "--runtime",
+                "devin",
+                "--model",
+                "auto",
+                "--reviewed-workspace",
+                repo,
+            ],
+            vec!["--runtime", "fake", "--reviewed-workspace", repo],
+        ] {
+            assert!(ask(&flags)?.devin_inputs().is_err(), "{flags:?}");
+        }
+        let args = ask(&[
+            "--runtime",
+            "devin",
+            "--model",
+            "provider/exact-model-v1",
+            "--reviewed-workspace",
+            repo,
+        ])?;
+        assert!(args.gemini_inputs()?.is_none());
+        assert_eq!(
+            args.devin_inputs()?.unwrap().model,
+            "provider/exact-model-v1"
+        );
+        assert!(ask(&["--runtime", "devin", "--token-budget", "10"])?
+            .gemini_inputs()
+            .is_err());
+        Ok(())
+    }
 
     fn ask(flags: &[&str]) -> Result<AskConsultArgs> {
         let argv = [

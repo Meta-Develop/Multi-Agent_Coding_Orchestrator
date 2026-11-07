@@ -4977,7 +4977,7 @@ fn squashed_import_commit_bytes(
     let buffer = repo
         .commit_create_buffer(&signature, &signature, &message, &tree, &[base_commit])
         .context("failed to build deterministic branch publication import commit")?;
-    Ok(buffer.as_ref().to_vec())
+    Ok(buffer.to_vec())
 }
 
 fn deterministic_publication_signature() -> Result<Signature<'static>> {

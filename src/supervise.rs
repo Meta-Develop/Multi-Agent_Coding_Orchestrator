@@ -1371,7 +1371,8 @@ pub(crate) fn admit_production_supervisor_catalog_preflight_grant(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => Ok(None),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Devin => Ok(None),
     }
 }
 
@@ -1428,7 +1429,8 @@ impl RuntimeModelCatalog {
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
-            | SupervisorRuntime::DeepSeek => Ok(Self::OperatorDeclared),
+            | SupervisorRuntime::DeepSeek
+            | SupervisorRuntime::Devin => Ok(Self::OperatorDeclared),
         }
     }
 

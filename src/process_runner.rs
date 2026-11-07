@@ -888,6 +888,7 @@ pub enum SideEffectConfinementProfileKind {
     ExternalClaude,
     ExternalGrok,
     ExternalCursor,
+    ExternalDevin,
     TrustedCompatibility,
 }
 
@@ -1077,6 +1078,12 @@ impl ExternalManagedReadOnlyFileCapability {
             ExternalManagedReadOnlyFileProjection::PrivateCursorHome => {
                 Some(runtime_dir.join(".cursor").join("auth.json"))
             }
+            ExternalManagedReadOnlyFileProjection::DevinUserConfig => {
+                Some(runtime_dir.join(".config/devin/config.json"))
+            }
+            ExternalManagedReadOnlyFileProjection::DevinCredentials => {
+                Some(runtime_dir.join(".local/share/devin/credentials.toml"))
+            }
         }
     }
 
@@ -1085,6 +1092,8 @@ impl ExternalManagedReadOnlyFileCapability {
             &self.projection,
             ExternalManagedReadOnlyFileProjection::PrivateGrokHome { .. }
                 | ExternalManagedReadOnlyFileProjection::PrivateCursorHome
+                | ExternalManagedReadOnlyFileProjection::DevinUserConfig
+                | ExternalManagedReadOnlyFileProjection::DevinCredentials
         )
     }
 }
@@ -1232,6 +1241,8 @@ enum ExternalManagedReadOnlyFileProjection {
         file_name: String,
     },
     PrivateCursorHome,
+    DevinUserConfig,
+    DevinCredentials,
 }
 
 #[cfg(target_os = "linux")]
@@ -1918,6 +1929,57 @@ pub struct ExternalGrokProfile {
     config: WorkspaceSandboxConfig,
 }
 
+/// Provider-network profile for the explicit reviewed-workspace Devin consultant.
+/// Construction cannot grant workspace or artifact writes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExternalDevinProfile {
+    config: WorkspaceSandboxConfig,
+}
+
+impl ExternalDevinProfile {
+    pub(crate) fn read_only(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadOnly),
+        }
+    }
+
+    pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_root(root);
+        self
+    }
+
+    pub(crate) fn with_visible_read_only_file(mut self, file: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_visible_read_only_file(file);
+        self
+    }
+
+    pub(crate) fn with_hidden_root(mut self, root: impl Into<PathBuf>) -> Self {
+        self.config = self.config.with_hidden_root(root);
+        self
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(crate) fn with_private_file(
+        mut self,
+        path: PathBuf,
+        held_file: Arc<File>,
+        config: bool,
+    ) -> std::io::Result<Self> {
+        let projection = if config {
+            ExternalManagedReadOnlyFileProjection::DevinUserConfig
+        } else {
+            ExternalManagedReadOnlyFileProjection::DevinCredentials
+        };
+        let capability =
+            ExternalManagedReadOnlyFileCapability::new(path.clone(), held_file, projection)?;
+        self.config.visible_read_only_files.push(path);
+        self.config
+            .external_managed_read_only_file_capabilities
+            .push(capability);
+        Ok(self)
+    }
+}
+
 /// Outer Linux profile for a managed Cursor ACP runtime. The networked vendor process receives
 /// only the exact workspace and private runtime capabilities assembled by `external_agent`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2163,6 +2225,7 @@ pub enum SideEffectConfinementProfile {
     ExternalClaude(ExternalClaudeProfile),
     ExternalGrok(ExternalGrokProfile),
     ExternalCursor(ExternalCursorProfile),
+    ExternalDevin(ExternalDevinProfile),
     /// Explicit legacy compatibility. Results are never publishable.
     TrustedCompatibility,
 }
@@ -2183,6 +2246,7 @@ impl SideEffectConfinementProfile {
             Self::ExternalClaude(_) => SideEffectConfinementProfileKind::ExternalClaude,
             Self::ExternalGrok(_) => SideEffectConfinementProfileKind::ExternalGrok,
             Self::ExternalCursor(_) => SideEffectConfinementProfileKind::ExternalCursor,
+            Self::ExternalDevin(_) => SideEffectConfinementProfileKind::ExternalDevin,
             Self::TrustedCompatibility => SideEffectConfinementProfileKind::TrustedCompatibility,
         }
     }
@@ -2198,6 +2262,7 @@ impl SideEffectConfinementProfile {
             Self::ExternalClaude(profile) => Some(&profile.config),
             Self::ExternalGrok(profile) => Some(&profile.config),
             Self::ExternalCursor(profile) => Some(&profile.config),
+            Self::ExternalDevin(profile) => Some(&profile.config),
             Self::TrustedCompatibility => None,
         }
     }
@@ -4443,6 +4508,26 @@ fn validate_process_spec_bounds(spec: &ProcessSpec) -> std::io::Result<()> {
         if config
             .external_managed_read_only_file_capabilities
             .iter()
+            .any(|cap| {
+                matches!(
+                    cap.projection,
+                    ExternalManagedReadOnlyFileProjection::DevinUserConfig
+                        | ExternalManagedReadOnlyFileProjection::DevinCredentials
+                )
+            })
+            && (!spec.private_runtime_home
+                || spec.side_effects.kind() != SideEffectConfinementProfileKind::ExternalDevin)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "Devin projections require private HOME and ExternalDevin confinement",
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        if config
+            .external_managed_read_only_file_capabilities
+            .iter()
             .any(|capability| {
                 matches!(
                     &capability.projection,
@@ -4591,7 +4676,9 @@ fn validate_workspace_config_bounds(config: &WorkspaceSandboxConfig) -> std::io:
                         ));
                     }
                 }
-                ExternalManagedReadOnlyFileProjection::PrivateCursorHome => {}
+                ExternalManagedReadOnlyFileProjection::PrivateCursorHome
+                | ExternalManagedReadOnlyFileProjection::DevinUserConfig
+                | ExternalManagedReadOnlyFileProjection::DevinCredentials => {}
             }
         }
         if config.gemini_online_read_only_file_bindings.len() > 1 {
@@ -5694,6 +5781,34 @@ pub(crate) fn verify_cursor_providerless_offline_uds_network_for_test(
             ),
         ]),
     )
+}
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn external_devin_systemd_properties_for_test(
+    profile: ExternalDevinProfile,
+    program: &Path,
+    current_dir: &Path,
+) -> io::Result<Vec<String>> {
+    let spec = ProcessSpec::direct(
+        "Devin profile projection",
+        program,
+        std::iter::empty::<OsString>(),
+        current_dir,
+        8192,
+    )
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalDevin(profile));
+    validate_process_spec_bounds(&spec)?;
+    let mut sandbox =
+        resolve_systemd_sandbox(&spec)?.ok_or_else(|| io::Error::other("Devin profile missing"))?;
+    let runtime_dir = Path::new("/run/user/1000/maco-test-runtime");
+    sandbox.add_private_runtime_root(runtime_dir)?;
+    let mut command = Command::new("systemd-run");
+    apply_systemd_sandbox_properties(&mut command, &sandbox, runtime_dir);
+    Ok(command
+        .get_args()
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect())
 }
 
 #[cfg(all(test, target_os = "linux"))]

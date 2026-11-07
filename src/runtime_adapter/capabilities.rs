@@ -26,6 +26,7 @@ pub enum AdapterId {
     GeminiCli,
     #[serde(rename = "deepseek")]
     DeepSeek,
+    Devin,
 }
 
 impl AdapterId {
@@ -59,7 +60,7 @@ impl AdapterId {
         Ok(self.managed_parent_control_protocol())
     }
 
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Codex,
         Self::Fake,
         Self::Grok,
@@ -67,6 +68,7 @@ impl AdapterId {
         Self::ClaudeCode,
         Self::GeminiCli,
         Self::DeepSeek,
+        Self::Devin,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -78,6 +80,7 @@ impl AdapterId {
             Self::ClaudeCode => "claude-code",
             Self::GeminiCli => "gemini-cli",
             Self::DeepSeek => "deepseek",
+            Self::Devin => "devin",
         }
     }
 
@@ -90,6 +93,7 @@ impl AdapterId {
             "claude-code" | "claude" => Some(Self::ClaudeCode),
             "gemini-cli" | "gemini" => Some(Self::GeminiCli),
             "deepseek" | "dsh" => Some(Self::DeepSeek),
+            "devin" => Some(Self::Devin),
             _ => None,
         }
     }
@@ -104,6 +108,7 @@ impl AdapterId {
             Self::GeminiCli => "gemini",
             // Resolution refuses this bare name. Launch requires absolute MACO_DSH_BIN.
             Self::DeepSeek => "dsh",
+            Self::Devin => "devin",
         }
     }
 
@@ -114,6 +119,7 @@ impl AdapterId {
             Self::ClaudeCode => Some("MACO_CLAUDE"),
             Self::GeminiCli => Some("MACO_GEMINI"),
             Self::DeepSeek => Some("MACO_DSH"),
+            Self::Devin => Some("MACO_DEVIN"),
             Self::Codex | Self::Fake => None,
         }
     }
@@ -131,6 +137,7 @@ impl AdapterId {
             RuntimeId::ClaudeCode => Self::ClaudeCode,
             RuntimeId::GeminiCli => Self::GeminiCli,
             RuntimeId::DeepSeek => Self::DeepSeek,
+            RuntimeId::Devin => Self::Devin,
         }
     }
 
@@ -143,6 +150,7 @@ impl AdapterId {
             Self::ClaudeCode => Some(RuntimeId::ClaudeCode),
             Self::GeminiCli => Some(RuntimeId::GeminiCli),
             Self::DeepSeek => Some(RuntimeId::DeepSeek),
+            Self::Devin => Some(RuntimeId::Devin),
         }
     }
 
@@ -172,6 +180,7 @@ impl AdapterId {
             Self::ClaudeCode => RuntimeCapabilities::CLAUDE_CODE,
             Self::GeminiCli => RuntimeCapabilities::GEMINI_CLI,
             Self::DeepSeek => RuntimeCapabilities::DEEPSEEK,
+            Self::Devin => RuntimeCapabilities::DEVIN,
         }
     }
 
@@ -180,9 +189,12 @@ impl AdapterId {
         match self {
             Self::Codex => AdapterTrustClass::TrustedSystem,
             Self::Fake => AdapterTrustClass::LocalDeterministic,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek => {
-                AdapterTrustClass::ExplicitCustom
-            }
+            Self::Grok
+            | Self::Cursor
+            | Self::ClaudeCode
+            | Self::GeminiCli
+            | Self::DeepSeek
+            | Self::Devin => AdapterTrustClass::ExplicitCustom,
         }
     }
 
@@ -215,7 +227,8 @@ impl AdapterId {
                 env_var: "DSH_HOME",
                 relative_path: ".dsh",
             }),
-            Self::Fake => None,
+            // Devin has no verified state-home environment override in MACO.
+            Self::Devin | Self::Fake => None,
         }
     }
 }
@@ -501,6 +514,18 @@ impl RuntimeCapabilities {
         writable_workspace: WorkspaceWritability::Unsupported,
         session_resume: SessionResume::Unsupported,
         ..Self::DEEPSEEK
+    };
+
+    /// Static registration grants no launch authority. The exact read-only
+    /// consultant verifies its own ExternalDevin profile; managed/writable
+    /// admission, usage, catalog discovery and resume remain unqualified.
+    pub const DEVIN: Self = Self {
+        blocking_pre_action_callback: BlockingPreActionCallback::None,
+        writable_workspace: WorkspaceWritability::Partial,
+        side_effect_confinement: SideEffectConfinement::Unverified,
+        model_catalog: ModelCatalogSource::OperatorDeclared,
+        usage_reporting: UsageReporting::None,
+        session_resume: SessionResume::Unsupported,
     };
 
     pub const fn matrix_cells(self) -> [(&'static str, MatrixStatus); 6] {

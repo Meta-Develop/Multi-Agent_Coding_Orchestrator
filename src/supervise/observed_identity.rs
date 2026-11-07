@@ -94,6 +94,7 @@ impl RuntimeIdentityObservation {
                     // The private bridge observes modelVersion, but no served thinking effort.
                 }
             }
+            SupervisorRuntime::Devin => {}
             SupervisorRuntime::DeepSeek => {
                 let model_ok =
                     crate::runtime_adapter::deepseek::validate_model(command.model.as_deref())

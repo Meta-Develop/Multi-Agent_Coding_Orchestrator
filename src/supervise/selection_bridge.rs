@@ -2012,7 +2012,9 @@ pub(super) fn frozen_review_account_binding(
                 .map(|binding| binding.to_selected_binding()),
             SupervisorRuntime::Cursor => authority::cursor_run_account_binding(run)
                 .map(|binding| binding.to_selected_binding()),
-            SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
+            SupervisorRuntime::DeepSeek | SupervisorRuntime::Devin | SupervisorRuntime::Fake => {
+                None
+            }
         };
     binding
         .map(Some)

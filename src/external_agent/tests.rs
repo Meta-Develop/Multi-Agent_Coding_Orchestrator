@@ -13188,6 +13188,21 @@ fn assignment_process_launch_fixture(
         .with_workspace_access(WorkspaceAccess::ReadOnly)
         .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
         .with_model_selection(model.map(str::to_string), None),
+        AssignmentProcessLaunchKind::ConsultDevin => ExternalAgentCommand::codex(
+            &agent,
+            &workspace,
+            &prompt,
+            incoming.join("events.jsonl"),
+            incoming.join("last-message.txt"),
+            Duration::from_secs(5),
+        )
+        .with_runtime_adapter(
+            RuntimeId::Devin,
+            RuntimeAdapterConfig::defaults(RuntimeId::Devin),
+        )
+        .with_workspace_access(WorkspaceAccess::ReadOnly)
+        .with_agent_lifecycle(&workspace, "researcher", run_id, subject)
+        .with_model_selection(model.map(str::to_string), None),
         AssignmentProcessLaunchKind::AssignmentChild
         | AssignmentProcessLaunchKind::ParentAuditor
         | AssignmentProcessLaunchKind::InboxIndependentAuditor => ExternalAgentCommand::codex(

@@ -148,6 +148,9 @@ pub(crate) fn selected_runtime_program(
     launch_runtime: SupervisorRuntime,
     options: &SupervisorRunOptions,
 ) -> Result<PathBuf> {
+    if launch_runtime == SupervisorRuntime::Devin {
+        bail!("Devin is supported only through the explicit read-only consultant");
+    }
     if launch_runtime == SupervisorRuntime::DeepSeek {
         let frozen = super::runtime_executables::selected_program(launch_runtime, options)?;
         let program = frozen
@@ -180,6 +183,7 @@ pub(crate) fn selected_runtime_program(
         SupervisorRuntime::Codex | SupervisorRuntime::Fake => {
             Ok(PathBuf::from(launch_runtime.default_binary()))
         }
+        SupervisorRuntime::Devin => bail!("Devin managed assignment launch is unsupported"),
         SupervisorRuntime::DeepSeek => {
             unreachable!("DeepSeek executable is resolved before this match")
         }
@@ -200,7 +204,8 @@ fn bind_runtime_output_schema(
         SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => None,
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Devin => None,
     };
     Ok(command)
 }
@@ -4192,6 +4197,9 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
                 }
             }
         }
+        (false, SupervisorRuntime::Devin) => {
+            bail!("Devin managed assignment launch is unsupported")
+        }
         (false, SupervisorRuntime::Codex) => {
             let review_context = if requires_hosted_pre_action_review(&command) {
                 pre_action_review_context.as_ref()
@@ -7417,6 +7425,7 @@ fn dispatch_and_collect_parent_auditor(
             record_dispatch_checkpoint(artifacts, true, false, &auditor_id, auditor_attempt)?;
             Ok(external_runner(&auditor_command, cancellation, None))
         }
+        SupervisorRuntime::Devin => bail!("Devin managed auditor launch is unsupported"),
         SupervisorRuntime::DeepSeek => {
             bail!("DeepSeek headless is admitted only as a read-only Researcher");
         }

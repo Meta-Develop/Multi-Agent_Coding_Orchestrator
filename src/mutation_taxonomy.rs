@@ -1000,6 +1000,7 @@ pub(crate) enum AssignmentProcessLaunchKind {
     ConsultCodex,
     ConsultClaude,
     ConsultGemini,
+    ConsultDevin,
     MergeArbiter,
 }
 
@@ -1018,6 +1019,7 @@ impl AssignmentProcessLaunchKind {
             | Self::MergeArbiter => TRUSTED_ASSIGNMENT_PROCESS_CODEX_PROGRAM,
             Self::ConsultClaude => TRUSTED_CONSULT_CLAUDE_PROGRAM,
             Self::ConsultGemini => "gemini",
+            Self::ConsultDevin => "devin",
         }
     }
 }
@@ -1895,6 +1897,26 @@ pub(crate) fn admit_consult_gemini_process_intent(
         subject,
         attempt,
         AssignmentProcessLaunchKind::ConsultGemini,
+        expected_program,
+        model,
+        duty,
+    )
+}
+
+/// Devin-only consultant intent; no other caller kind acquires this spelling.
+pub(crate) fn admit_consult_devin_process_intent(
+    run_id: &str,
+    subject: &str,
+    attempt: usize,
+    expected_program: &Path,
+    model: Option<&str>,
+    duty: &str,
+) -> Result<AssignmentProcessLaunchGrant, AssignmentProcessLaunchGrantError> {
+    AssignmentProcessLaunchGrant::admit(
+        run_id,
+        subject,
+        attempt,
+        AssignmentProcessLaunchKind::ConsultDevin,
         expected_program,
         model,
         duty,

@@ -7,7 +7,8 @@ use crate::{
     llm::Redactor,
     mutation_taxonomy::{
         admit_consult_claude_process_intent, admit_consult_codex_process_intent,
-        admit_consult_gemini_process_intent, AssignmentProcessLaunchKind, CONSULTANT_PROCESS_DUTY,
+        admit_consult_devin_process_intent, admit_consult_gemini_process_intent,
+        AssignmentProcessLaunchKind, CONSULTANT_PROCESS_DUTY,
     },
     orchestrator::RunId,
     process_runner::resolve_existing_path_without_symlinks,
@@ -62,6 +63,7 @@ pub enum ConsultantRuntime {
     Codex,
     Claude,
     Gemini,
+    Devin,
 }
 
 impl ConsultantRuntime {
@@ -71,6 +73,7 @@ impl ConsultantRuntime {
             Self::Codex => "codex",
             Self::Claude => "claude",
             Self::Gemini => "gemini",
+            Self::Devin => "devin",
         }
     }
 }
@@ -84,7 +87,8 @@ impl FromStr for ConsultantRuntime {
             "codex" => Ok(Self::Codex),
             "claude" => Ok(Self::Claude),
             "gemini" => Ok(Self::Gemini),
-            _ => Err("runtime must be one of: fake, codex, claude, gemini".to_string()),
+            "devin" => Ok(Self::Devin),
+            _ => Err("runtime must be one of: fake, codex, claude, gemini, devin".to_string()),
         }
     }
 }
@@ -199,7 +203,36 @@ pub fn ask_gemini_consultant(
     if options.runtime != ConsultantRuntime::Gemini {
         bail!("Gemini consultation inputs cannot bind another runtime");
     }
-    ask_consultant_with_inputs(options, Some(gemini), run_external_agent)
+    ask_consultant_with_inputs(options, Some(gemini), None, run_external_agent)
+}
+
+/// Explicit operator inputs; the reviewed path authorizes Devin's documented CI trust flag.
+#[derive(Debug, Clone)]
+pub struct DevinConsultOptions {
+    pub model: String,
+    pub reviewed_workspace: PathBuf,
+}
+
+impl DevinConsultOptions {
+    pub(crate) fn validate(&self) -> Result<()> {
+        crate::runtime_adapter::devin::validate_model(Some(&self.model))?;
+        if !self.reviewed_workspace.is_absolute()
+            || std::fs::canonicalize(&self.reviewed_workspace)? != self.reviewed_workspace
+        {
+            bail!("Devin requires an absolute canonical --reviewed-workspace path");
+        }
+        Ok(())
+    }
+}
+
+pub fn ask_devin_consultant(
+    options: ConsultAskOptions,
+    devin: DevinConsultOptions,
+) -> Result<ConsultantReport> {
+    if options.runtime != ConsultantRuntime::Devin {
+        bail!("Devin consultation inputs cannot bind another runtime");
+    }
+    ask_consultant_with_inputs(options, None, Some(devin), run_external_agent)
 }
 
 fn ask_consultant_with_runner<F>(
@@ -209,12 +242,13 @@ fn ask_consultant_with_runner<F>(
 where
     F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
 {
-    ask_consultant_with_inputs(options, None, external_runner)
+    ask_consultant_with_inputs(options, None, None, external_runner)
 }
 
 fn ask_consultant_with_inputs<F>(
     options: ConsultAskOptions,
     gemini: Option<GeminiConsultOptions>,
+    devin: Option<DevinConsultOptions>,
     mut external_runner: F,
 ) -> Result<ConsultantReport>
 where
@@ -227,6 +261,16 @@ where
             .validate()?;
     }
     let repo = artifacts::discover_repo_root(&options.repo)?;
+    if options.runtime == ConsultantRuntime::Devin {
+        let inputs = devin
+            .as_ref()
+            .context("Devin requires explicit model and reviewed workspace inputs")?;
+        inputs.validate()?;
+        if inputs.reviewed_workspace != repo {
+            bail!("Devin reviewed workspace must equal the canonical consultation repo");
+        }
+    }
+
     let mut writer = ArtifactRunWriter::reserve(
         &repo,
         RunArtifactFamily::Consult,
@@ -314,6 +358,17 @@ where
             )?;
             (outcome.report, outcome.raw_evidence)
         }
+        ConsultantRuntime::Devin => {
+            let outcome = run_devin_consultant(
+                &repo,
+                &options,
+                &prepared,
+                &mut writer,
+                devin.as_ref().context("missing explicit Devin inputs")?,
+                &mut external_runner,
+            )?;
+            (outcome.report, outcome.raw_evidence)
+        }
         ConsultantRuntime::Gemini => {
             let outcome = run_gemini_consultant(
                 &repo,
@@ -359,7 +414,7 @@ Return ConsultantReport JSON as the final response, matching this JSON schema:
 The final ConsultantReport JSON must include:
 - "no_further_delegation": true
 - "read_only": true
-- "runtime": "fake", "codex", "claude", or "gemini"
+- "runtime": "fake", "codex", "claude", "gemini", or "devin"
 - "confidence": "low", "medium", or "high"
 
 Repository context paths are listed only; their contents are not inlined here:
@@ -420,14 +475,15 @@ fn prepare_consultation(options: &ConsultAskOptions, repo: &Path) -> Result<Prep
     let context_paths = validate_context_paths(repo, &options.context_paths)?;
     let consultant_bin = match options.runtime {
         ConsultantRuntime::Fake => None,
-        ConsultantRuntime::Codex | ConsultantRuntime::Claude | ConsultantRuntime::Gemini => {
-            Some(options.consultant_bin.clone().with_context(|| {
-                format!(
-                    "--consultant-bin is required when --runtime {} is selected",
-                    options.runtime.as_str()
-                )
-            })?)
-        }
+        ConsultantRuntime::Codex
+        | ConsultantRuntime::Claude
+        | ConsultantRuntime::Gemini
+        | ConsultantRuntime::Devin => Some(options.consultant_bin.clone().with_context(|| {
+            format!(
+                "--consultant-bin is required when --runtime {} is selected",
+                options.runtime.as_str()
+            )
+        })?),
     };
     Ok(PreparedConsultation {
         question,
@@ -535,6 +591,109 @@ where
     }
     let raw_evidence = finish_external_scratches(
         raw_evidence,
+        writer.discard_scratch(&capture),
+        writer.discard_scratch(&incoming),
+    )?;
+    Ok(ExternalConsultOutcome {
+        report,
+        raw_evidence,
+    })
+}
+
+fn run_devin_consultant<F>(
+    repo: &Path,
+    options: &ConsultAskOptions,
+    prepared: &PreparedConsultation,
+    writer: &mut ArtifactRunWriter,
+    inputs: &DevinConsultOptions,
+    external_runner: &mut F,
+) -> Result<ExternalConsultOutcome>
+where
+    F: FnMut(&ExternalAgentCommand) -> ExternalAgentRun,
+{
+    use crate::{
+        external_agent::{
+            EnvironmentNetworkAccess, EnvironmentRequirement, EnvironmentSandboxCapability,
+        },
+        process_runner::WorkspaceAccess,
+        runtime_adapter::{RuntimeAdapterConfig, RuntimeId},
+    };
+    let (incoming, capture) = create_external_scratches(writer)?;
+    let mut report_scratch = tempfile::Builder::new()
+        .prefix("maco-devin-consult-output-")
+        .tempdir()?;
+    let report_root = crate::secure_output::SecureOutputRoot::open_private(report_scratch.path())?;
+    report_root.reject_inside(repo)?;
+    let command = ExternalAgentCommand::codex(
+        prepared
+            .consultant_bin
+            .as_ref()
+            .context("prepared Devin executable missing")?,
+        repo,
+        writer.run_dir().join(QUESTION_ARTIFACT),
+        capture.path().join("raw.log"),
+        report_scratch.path().join("consultant-report.json"),
+        Duration::from_secs(options.timeout_seconds),
+    )
+    .with_workspace_access(WorkspaceAccess::ReadOnly)
+    .with_model_selection(Some(inputs.model.clone()), None)
+    .with_runtime_adapter(
+        RuntimeId::Devin,
+        RuntimeAdapterConfig::defaults(RuntimeId::Devin),
+    )
+    .with_devin_reviewed_workspace(&inputs.reviewed_workspace);
+    let command = command.with_environment_requirements(vec![
+        EnvironmentRequirement::sandbox(EnvironmentSandboxCapability::VerifiedExternalDevin),
+        EnvironmentRequirement::network(EnvironmentNetworkAccess::Enabled),
+    ]);
+    let command = attach_consult_process_launch(
+        command,
+        repo,
+        &options.run_id,
+        AssignmentProcessLaunchKind::ConsultDevin,
+    )?;
+    // The parent captures stdout here; the child receives no writable artifact grant.
+    // Preserve this private root even on unwinding until every launched process is quiescent.
+    report_scratch.disable_cleanup(true);
+    let external_run = external_runner(&command);
+    let report = match external_run.output_last_message() {
+        Some(contents) => match std::str::from_utf8(contents) {
+            Ok(text) => report_from_external_text(
+                ConsultantRuntime::Devin,
+                &options.run_id,
+                &prepared.question.summary,
+                &external_run,
+                text,
+            ),
+            Err(_) => failed_report_from_external(
+                ConsultantRuntime::Devin,
+                &options.run_id,
+                &prepared.question.summary,
+                &external_run,
+                "",
+                "Devin report was not UTF-8".into(),
+            ),
+        },
+        None => failed_report_from_external(
+            ConsultantRuntime::Devin,
+            &options.run_id,
+            &prepared.question.summary,
+            &external_run,
+            "",
+            "Devin did not return a bounded report".into(),
+        ),
+    };
+    let raw = external_run.stdout_bytes().to_vec();
+    drop(command);
+    if !external_run.scratch_quiescence_verified() {
+        bail!("Devin scratch quiescence unverified; retaining private artifacts");
+    }
+    report_root.verify_path_identity()?;
+    report_scratch
+        .close()
+        .context("failed to discard quiescent Devin report capture")?;
+    let raw_evidence = finish_external_scratches(
+        raw,
         writer.discard_scratch(&capture),
         writer.discard_scratch(&incoming),
     )?;
@@ -869,6 +1028,14 @@ fn attach_consult_process_launch(
             command.model.as_deref(),
             CONSULTANT_PROCESS_DUTY,
         ),
+        AssignmentProcessLaunchKind::ConsultDevin => admit_consult_devin_process_intent(
+            run_id.as_str(),
+            run_id.as_str(),
+            CONSULT_PROCESS_LAUNCH_ATTEMPT,
+            expected_program,
+            command.model.as_deref(),
+            CONSULTANT_PROCESS_DUTY,
+        ),
         AssignmentProcessLaunchKind::ConsultGemini => admit_consult_gemini_process_intent(
             run_id.as_str(),
             run_id.as_str(),
@@ -963,6 +1130,21 @@ fn normalize_report(
         external_run
             .gemini_bridge_evidence()
             .is_some_and(|e| e.read_only_completion_valid(external_run))
+    } else if runtime == ConsultantRuntime::Devin {
+        external_run.exit_code == Some(0)
+            && !external_run.timed_out
+            && external_run.error.is_none()
+            && external_run.publishable
+            && !external_run.environment_blocked()
+            && external_run
+                .process_tree
+                .is_some_and(crate::process_runner::ProcessTreeEvidence::is_verified_empty)
+            && external_run.side_effects
+                == Some(
+                    crate::process_runner::SideEffectConfinementEvidence::Verified(
+                        crate::process_runner::SideEffectConfinementProfileKind::ExternalDevin,
+                    ),
+                )
     } else {
         external_run.succeeded()
     };
@@ -1283,7 +1465,7 @@ fn write_consultant_schema(writer: &mut ArtifactRunWriter) -> Result<()> {
             "properties": {
                 "version": {"type": "integer"},
                 "run_id": {"type": "string"},
-                "runtime": {"type": "string", "enum": ["fake", "codex", "claude", "gemini"]},
+                "runtime": {"type": "string", "enum": ["fake", "codex", "claude", "gemini", "devin"]},
                 "question_summary": {"type": "string"},
                 "answer": {"type": "string"},
                 "confidence": {"type": "string", "enum": ["low", "medium", "high"]},
@@ -1448,6 +1630,289 @@ fn default_true() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn devin_consult_command_passes_shared_protected_control_preparation() -> Result<()> {
+        use std::{os::unix::fs::PermissionsExt, sync::Arc};
+
+        let temp = tempfile::tempdir()?;
+        let repo = fs::canonicalize(create_test_repo(temp.path())?)?;
+        let program = write_test_external_program(temp.path(), "exit 0\n")?;
+        let native = tempfile::tempdir_in(temp.path())?;
+        let credentials = native.path().join("credentials.toml");
+        let config = native.path().join("config.json");
+        fs::write(&credentials, b"token='synthetic-fixture-token-0123456789'\n")?;
+        fs::write(
+            &config,
+            serde_json::to_vec(&crate::runtime_adapter::devin::pinned_user_config())?,
+        )?;
+        for path in [&credentials, &config] {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+        }
+        let run_id = RunId::new("devin-shared-protected-preparation")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Devin,
+            consultant_bin: Some(program),
+            question: "Inspect the declared context".into(),
+            context_paths: vec!["README.md".into()],
+            timeout_seconds: 5,
+        };
+        let inputs = DevinConsultOptions {
+            model: "provider/exact-model-v1".into(),
+            reviewed_workspace: repo.clone(),
+        };
+        let mut capture_parent = None;
+        let report = ask_consultant_with_inputs(options, None, Some(inputs), |command| {
+            // Exercise the actual assembled command before any test-only substitutions.
+            let profile = crate::external_agent::devin_consult_protected_profile_for_test(command)
+                .expect("assembled Devin command must pass actual shared protected preparation");
+            let parent = command.output_last_message.parent().unwrap().to_path_buf();
+            assert!(!parent.starts_with(&repo));
+            assert_ne!(parent, temp.path());
+            assert_eq!(
+                fs::metadata(&parent).unwrap().permissions().mode() & 0o777,
+                0o700
+            );
+            assert!(command.worker_journal_artifacts.is_empty());
+            let profile = profile
+                .with_hidden_root(native.path())
+                .with_private_file(
+                    config.clone(),
+                    Arc::new(fs::File::open(&config).unwrap()),
+                    true,
+                )
+                .unwrap()
+                .with_private_file(
+                    credentials.clone(),
+                    Arc::new(fs::File::open(&credentials).unwrap()),
+                    false,
+                )
+                .unwrap();
+            let properties = crate::process_runner::external_devin_systemd_properties_for_test(
+                profile,
+                &command.program,
+                &repo,
+            )
+            .expect("synthetic credential projections must render without launching a process");
+            assert!(properties.contains(&format!(
+                "--property=ReadOnlyPaths={}",
+                repo.join(".maco").display()
+            )));
+            for source in [&config, &credentials] {
+                assert!(properties.iter().any(|value| {
+                    value.starts_with(&format!("--property=BindReadOnlyPaths={}:", source.display()))
+                }));
+            }
+            assert!(!properties.iter().any(|value| {
+                value.starts_with("--property=ReadWritePaths=")
+                    || value.starts_with("--property=BindPaths=")
+            }));
+
+            // Both historical transports must still be refused by the generic validators.
+            let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+            let old_schema = command
+                .clone()
+                .with_read_only_input_file(run_dir.join(SCHEMA_ARTIFACT));
+            let error = crate::external_agent::devin_consult_protected_profile_for_test(&old_schema)
+                .expect_err("protected schema must not be registered as an external input");
+            assert!(error
+                .to_string()
+                .contains("exact read-only input file overlaps"));
+            let mut old_output = command.clone();
+            old_output.output_last_message = run_dir
+                .join(EXTERNAL_INCOMING_SCRATCH)
+                .join("consultant-report.json");
+            let error = crate::external_agent::devin_consult_protected_profile_for_test(&old_output)
+                .expect_err("Devin must not receive the protected incoming exception");
+            assert!(error.to_string().contains("output parent overlaps"));
+            capture_parent = Some(parent);
+            let bytes = sample_report_json("untrusted-run").into_bytes();
+            fs::write(&command.output_last_message, &bytes).unwrap();
+            let mut run =
+                failed_test_external_run(command, "synthetic completion after shared preparation");
+            run.error = None;
+            run.exit_code = Some(0);
+            run.publishable = true;
+            run.stdout.target_launch_attempted = true;
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalDevin,
+            ));
+            run.output_last_message = Some(bytes);
+            run
+        })?;
+        assert!(report.success);
+        assert!(!capture_parent
+            .expect("assembled command reached shared preparation")
+            .exists());
+        artifacts::ArtifactRunReader::open(&repo, RunArtifactFamily::Consult, &run_id)?;
+        Ok(())
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn devin_consult_unknown_quiescence_retains_private_capture() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = fs::canonicalize(create_test_repo(temp.path())?)?;
+        let run_id = RunId::new("devin-retained-private-capture")?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: run_id.clone(),
+            runtime: ConsultantRuntime::Devin,
+            consultant_bin: Some("devin".into()),
+            question: "Inspect the declared context".into(),
+            context_paths: Vec::new(),
+            timeout_seconds: 5,
+        };
+        let inputs = DevinConsultOptions {
+            model: "provider/exact-model-v1".into(),
+            reviewed_workspace: repo.clone(),
+        };
+        let mut capture_path = None;
+        let error = ask_consultant_with_inputs(options, None, Some(inputs), |command| {
+            fs::write(&command.output_last_message, b"retained parent capture").unwrap();
+            capture_path = Some(command.output_last_message.clone());
+            let mut run = failed_test_external_run(command, "synthetic unknown process custody");
+            run.stdout.target_launch_attempted = true;
+            run.process_tree = Some(ProcessTreeEvidence::Unverified(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalDevin,
+            ));
+            run
+        })
+        .expect_err("unknown target custody must retain the private capture and refuse finalization");
+        assert!(error.to_string().contains("scratch quiescence unverified"));
+        let capture_path = capture_path.expect("synthetic runner reached");
+        assert_eq!(fs::read(&capture_path)?, b"retained parent capture");
+        let run_dir = repo.join(".maco/consult/runs").join(run_id.as_str());
+        assert!(run_dir.join(EXTERNAL_INCOMING_SCRATCH).exists());
+        assert!(run_dir.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        assert!(!run_dir.join(RAW_LOG_ARTIFACT).exists());
+        assert!(!run_dir.join(".maco-artifact-final.json").exists());
+        // No process was launched by this fixture; keep its retained state under fixture custody.
+        fs::rename(
+            capture_path.parent().unwrap(),
+            temp.path().join("retained-capture"),
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn devin_consultant_requires_explicit_inputs_and_normalizes_plain_report() -> Result<()> {
+        use crate::{
+            external_agent::ExternalAgentInvocation,
+            process_runner::{
+                ContainmentBackend, ProcessTreeEvidence, SideEffectConfinementEvidence,
+                SideEffectConfinementProfileKind,
+            },
+        };
+        let temp = tempfile::tempdir()?;
+        let repo = fs::canonicalize(create_test_repo(temp.path())?)?;
+        let options = ConsultAskOptions {
+            repo: repo.clone(),
+            run_id: RunId::new("devin-synthetic-report")?,
+            runtime: ConsultantRuntime::Devin,
+            consultant_bin: Some("devin".into()),
+            question: "Why does this fail?".into(),
+            context_paths: vec!["README.md".into()],
+            timeout_seconds: 5,
+        };
+        assert!(
+            ask_consultant_with_inputs(options.clone(), None, None, |_| panic!(
+                "missing inputs must not reach runner"
+            ))
+            .is_err()
+        );
+        let inputs = DevinConsultOptions {
+            model: "provider/exact-model-v1".into(),
+            reviewed_workspace: repo.clone(),
+        };
+        let mut wrong = inputs.clone();
+        wrong.reviewed_workspace = temp.path().to_path_buf();
+        assert!(
+            ask_consultant_with_inputs(options.clone(), None, Some(wrong), |_| panic!(
+                "wrong repo must not reach runner"
+            ))
+            .is_err()
+        );
+        let run_id = options.run_id.clone();
+        let report = ask_consultant_with_inputs(options, None, Some(inputs), |command| {
+            assert_eq!(command.invocation, ExternalAgentInvocation::Devin);
+            assert_eq!(
+                command.workspace_access,
+                crate::process_runner::WorkspaceAccess::ReadOnly
+            );
+            assert_eq!(command.model.as_deref(), Some("provider/exact-model-v1"));
+            assert!(command.reasoning_effort.is_none());
+            assert_eq!(
+                command.assignment_process_launch_kind,
+                Some(AssignmentProcessLaunchKind::ConsultDevin)
+            );
+            let grant = command.assignment_process_launch_grant.as_ref().unwrap();
+            assert_eq!(grant.kind(), AssignmentProcessLaunchKind::ConsultDevin);
+            assert_eq!(grant.model(), Some("provider/exact-model-v1"));
+            assert!(command.worker_journal_artifacts.is_empty());
+            let mut run = failed_test_external_run(command, "synthetic");
+            run.error = None;
+            run.exit_code = Some(0);
+            run.duration_ms = 42;
+            run.publishable = true;
+            run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+                ContainmentBackend::SystemdUserService,
+            ));
+            run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+                SideEffectConfinementProfileKind::ExternalDevin,
+            ));
+            run.output_last_message = Some(sample_report_json("untrusted-run").into_bytes());
+            run
+        })?;
+        assert!(report.success);
+        assert_eq!(report.runtime, ConsultantRuntime::Devin);
+        assert_eq!(report.run_id, run_id);
+        assert_eq!(report.duration_ms, 42);
+        assert_eq!(report.answer, "because");
+        assert!(report.read_only && report.no_further_delegation);
+        let path = repo.join(".maco/consult/runs").join(run_id.as_str());
+        let stored: ConsultantReport =
+            serde_json::from_slice(&fs::read(path.join(FINAL_REPORT_ARTIFACT))?)?;
+        assert_eq!(stored, report);
+        assert!(!path.join(EXTERNAL_INCOMING_SCRATCH).exists());
+        assert!(!path.join(EXTERNAL_CAPTURE_SCRATCH).exists());
+        let command = ExternalAgentCommand::codex(
+            "devin",
+            &repo,
+            "prompt",
+            "log",
+            "out",
+            Duration::from_secs(1),
+        );
+        let mut wrong_profile = failed_test_external_run(&command, "synthetic");
+        wrong_profile.error = None;
+        wrong_profile.exit_code = Some(0);
+        wrong_profile.publishable = true;
+        wrong_profile.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        wrong_profile.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCursor,
+        ));
+        let refused = report_from_external_text(
+            ConsultantRuntime::Devin,
+            &run_id,
+            "why",
+            &wrong_profile,
+            &sample_report_json("untrusted"),
+        );
+        assert!(!refused.success);
+        Ok(())
+    }
     #[test]
     fn gemini_consult_explicit_inputs_and_intent_refuse_cross_runtime_or_missing_values(
     ) -> Result<()> {

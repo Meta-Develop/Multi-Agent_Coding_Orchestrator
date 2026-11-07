@@ -1261,6 +1261,32 @@ cargo run -- consult ask \
   --json
 ```
 
+Official Cognition Devin CLI is available as an explicit-model read-only consultant
+on Linux with a delegated systemd user manager and cgroup v2. Install and log in
+with the official CLI separately. Review the exact repository first, then pass
+its canonical path to authorize Devin's documented CI workspace-trust flag:
+
+```bash
+repo=$(pwd -P)
+devin_executable="$(readlink -f "$(command -v devin)")"
+maco consult ask --repo "$repo" --runtime devin --consultant-bin "$devin_executable" \
+  --model provider/exact-model-v1 --reviewed-workspace "$repo" \
+  --question "Which source explains this failure?" --context-path README.md --json
+```
+
+Replace the illustrative model with an exact model slug available to your account.
+`--reviewed-workspace` is an explicit operator trust decision for that repository;
+MACO refuses missing or different bindings. It enables
+`--respect-workspace-trust=false` only inside MACO's verified `ExternalDevin`
+read-only profile. The adapter's default argv keeps native workspace trust enabled.
+The child receives immutable user settings, a private HOME and one read-only native
+credential file; repository `.devin` overrides and hooks are hidden. MACO parses
+the prompt-requested ConsultantReport from bounded plain stdout and supplies fresh
+run metadata. This is not a native JSON or usage protocol. Writable assignments,
+managed parents, primary writes, resume and token usage are unsupported. Real
+Devin binary/account qualification has not been run; see the
+[Devin consultant contract](docs/qualification/devin-consultant.md).
+
 For execution-phase Codex launches in a managed linked worktree, MACO grants
 read-write access only to that worktree's own per-worktree Git directory.
 Planning-phase launches bind that same directory read-only. The common Git

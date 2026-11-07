@@ -12,6 +12,8 @@ pub mod cursor;
 #[path = "cursor/managed_parent.rs"]
 pub(crate) mod cursor_managed_parent;
 pub mod deepseek;
+pub mod devin;
+pub use devin::DevinAdapter;
 pub mod gemini;
 pub mod grok;
 pub(crate) mod grok_acp;
@@ -122,6 +124,7 @@ pub enum RuntimeId {
     #[serde(rename = "deepseek")]
     #[value(name = "deepseek", alias = "dsh")]
     DeepSeek,
+    Devin,
 }
 
 /// Common launch boundary implemented by every subprocess runtime adapter.
@@ -350,6 +353,7 @@ pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
         AdapterId::ClaudeCode => Box::new(ClaudeCodeAdapter::from_environment()),
         AdapterId::GeminiCli => Box::new(GeminiAdapter::from_environment()),
         AdapterId::DeepSeek => Box::new(DeepSeekAdapter::from_environment()),
+        AdapterId::Devin => Box::new(DevinAdapter::from_environment()),
     }
 }
 
@@ -636,6 +640,11 @@ impl RuntimeAdapterConfig {
                 OutputCaptureMode::Stdout,
                 true,
             ),
+            AdapterId::Devin => (
+                devin::immutable_argument_template(),
+                OutputCaptureMode::Stdout,
+                false,
+            ),
             AdapterId::Codex | AdapterId::Fake => (Vec::new(), OutputCaptureMode::default(), false),
         };
         let binary = if adapter == AdapterId::ClaudeCode {
@@ -695,6 +704,7 @@ impl RuntimeAdapterConfig {
             }
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
             AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
+            AdapterId::Devin => config.restore_immutable_devin_descriptor(),
             _ => {}
         }
         Ok(config)
@@ -737,9 +747,19 @@ impl RuntimeAdapterConfig {
             AdapterId::Grok => config.restore_immutable_grok_descriptor(),
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
             AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
+            AdapterId::Devin => config.restore_immutable_devin_descriptor(),
             _ => {}
         }
         config
+    }
+
+    fn restore_immutable_devin_descriptor(&mut self) {
+        self.argument_template = devin::immutable_argument_template();
+        self.env_passthrough.clear();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = false;
+        self.grok_interaction_protocol = GrokInteractionProtocol::default();
     }
 
     fn restore_immutable_deepseek_descriptor(&mut self) {
@@ -753,7 +773,7 @@ impl RuntimeAdapterConfig {
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
         if matches!(
             adapter,
-            AdapterId::Grok | AdapterId::ClaudeCode | AdapterId::DeepSeek
+            AdapterId::Grok | AdapterId::ClaudeCode | AdapterId::DeepSeek | AdapterId::Devin
         ) {
             return;
         }
@@ -952,6 +972,13 @@ impl RuntimeAdapterConfig {
     }
 
     pub fn render(&self, context: &LaunchContext<'_>) -> Result<LaunchSpec> {
+        if self
+            .argument_template
+            .iter()
+            .any(|token| token == "{devin_prompt}")
+        {
+            return devin::render(self, context, None);
+        }
         let binary = self.binary_path();
         if binary.as_os_str().is_empty() {
             bail!("runtime adapter binary is not configured")
@@ -1125,6 +1152,13 @@ impl RuntimeAdapterConfig {
 
     /// Small scripted-transport seam used by adapter conformance tests and diagnostics.
     pub fn execute(&self, context: &LaunchContext<'_>) -> Result<AdapterRun> {
+        if self
+            .argument_template
+            .iter()
+            .any(|token| token == "{devin_prompt}")
+        {
+            bail!("Devin direct execution requires a qualified containment runner; launch rendering alone does not establish confinement");
+        }
         let launch = self.render(context)?;
         let resolved = resolve_binary(&launch.program)?;
         if launch
@@ -2860,6 +2894,19 @@ mod tests {
                 AdapterId::parse(adapter.as_str()).unwrap().capabilities()
             );
             if adapter == AdapterId::GeminiCli {
+                continue;
+            }
+            if adapter == AdapterId::Devin {
+                // Devin has no documented effort flag; its focused suite covers argv.
+                assert!(config
+                    .render(&launch_context(
+                        Path::new("/tmp/prompt.txt"),
+                        Some("exact-model"),
+                        Some("high"),
+                        Path::new("/tmp/work"),
+                        Path::new("/tmp/out.txt"),
+                    ))
+                    .is_err());
                 continue;
             }
             let spec = config.render(&launch_context(

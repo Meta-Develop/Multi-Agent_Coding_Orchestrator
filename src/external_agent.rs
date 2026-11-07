@@ -27,9 +27,9 @@ use crate::process_runner::{
     read_bounded_regular_file_nofollow, run_process_cancellable,
     run_process_cancellable_with_filesystem_evidence, run_process_interactive, CapturedBytes,
     ClaudeContainmentOwnerBinding, ContainmentBackend, EnvironmentMode, ExternalClaudeProfile,
-    ExternalCodexProfile, ExternalCursorProfile, ExternalGrokProfile, InteractiveProcessOutput,
-    ProcessCancellation, ProcessCommand, ProcessOutput, ProcessRunError, ProcessSpec,
-    ProcessTreeEvidence, ReadOnlyFilesystemEvidence, SideEffectConfinementEvidence,
+    ExternalCodexProfile, ExternalCursorProfile, ExternalDevinProfile, ExternalGrokProfile,
+    InteractiveProcessOutput, ProcessCancellation, ProcessCommand, ProcessOutput, ProcessRunError,
+    ProcessSpec, ProcessTreeEvidence, ReadOnlyFilesystemEvidence, SideEffectConfinementEvidence,
     SideEffectConfinementProfile, SideEffectConfinementProfileKind, StdinMode, StreamCapture,
     StrictOfflineWorkspaceProfile, WorkspaceAccess,
 };
@@ -88,6 +88,8 @@ use std::{
 pub(crate) mod codex_app_server;
 mod codex_parent_evidence;
 mod deepseek_capture;
+#[cfg(target_os = "linux")]
+mod devin;
 #[allow(dead_code, unused_imports)]
 #[doc(hidden)]
 pub mod executor;
@@ -352,6 +354,8 @@ pub struct ExternalAgentCommand {
     /// directory. Absence keeps the legacy path as an attributed cooperative bypass.
     pub machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     pub runtime_adapter: Option<RuntimeAdapterConfig>,
+    devin_reviewed_workspace: Option<PathBuf>,
+    devin_config: Option<PathBuf>,
     /// Isolated child worktree vs primary checkout. Default constructors use a
     /// managed child worktree; primary-target launch stays fail-closed.
     pub writable_launch_target: WritableLaunchTarget,
@@ -2990,13 +2994,19 @@ pub enum ExternalAgentInvocation {
     ClaudeCode,
     GeminiCli,
     DeepSeek,
+    Devin,
 }
 
 impl ExternalAgentInvocation {
     pub const fn is_adapter_subprocess(self) -> bool {
         matches!(
             self,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek
+            Self::Grok
+                | Self::Cursor
+                | Self::ClaudeCode
+                | Self::GeminiCli
+                | Self::DeepSeek
+                | Self::Devin
         )
     }
 
@@ -3008,6 +3018,7 @@ impl ExternalAgentInvocation {
             Self::Cursor => Some(AdapterId::Cursor),
             Self::GeminiCli => Some(AdapterId::GeminiCli),
             Self::DeepSeek => Some(AdapterId::DeepSeek),
+            Self::Devin => Some(AdapterId::Devin),
         }
     }
 }
@@ -3247,6 +3258,7 @@ pub enum EnvironmentSandboxCapability {
     VerifiedExternalClaude,
     VerifiedExternalGrok,
     VerifiedExternalCursor,
+    VerifiedExternalDevin,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
@@ -3657,6 +3669,8 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            devin_reviewed_workspace: None,
+            devin_config: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
@@ -3679,6 +3693,12 @@ impl ExternalAgentCommand {
             gemini_run_account_binding: None,
             cursor_run_account_binding: None,
         }
+    }
+
+    /// Explicit operator authorization of this exact canonical repo for Devin's CI trust flag.
+    pub fn with_devin_reviewed_workspace(mut self, repo: impl Into<PathBuf>) -> Self {
+        self.devin_reviewed_workspace = Some(repo.into());
+        self
     }
 
     pub fn codex_read_only_consultant(
@@ -3712,6 +3732,8 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            devin_reviewed_workspace: None,
+            devin_config: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
@@ -3767,6 +3789,8 @@ impl ExternalAgentCommand {
             environment_requirements: Vec::new(),
             machine_global_retention: None,
             runtime_adapter: None,
+            devin_reviewed_workspace: None,
+            devin_config: None,
             writable_launch_target: WritableLaunchTarget::ManagedChildWorktree,
             writable_runtime_selection: None,
             live_token_grant: None,
@@ -3896,6 +3920,7 @@ impl ExternalAgentCommand {
                 RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
                 RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
                 RuntimeId::DeepSeek => ExternalAgentInvocation::DeepSeek,
+                RuntimeId::Devin => ExternalAgentInvocation::Devin,
                 RuntimeId::Codex | RuntimeId::Fake => {
                     return self;
                 }
@@ -7133,7 +7158,9 @@ fn consult_consultant_invocation_requires_process_grant(
 ) -> bool {
     matches!(
         invocation,
-        ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
+        ExternalAgentInvocation::CodexConsultant
+            | ExternalAgentInvocation::ClaudeConsultant
+            | ExternalAgentInvocation::Devin
     )
 }
 
@@ -7147,6 +7174,14 @@ fn assignment_process_launch_kind_allowed_for_invocation(
         }
         AssignmentProcessLaunchKind::ConsultClaude => {
             matches!(spec.invocation, ExternalAgentInvocation::ClaudeConsultant)
+        }
+        AssignmentProcessLaunchKind::ConsultDevin => {
+            spec.invocation == ExternalAgentInvocation::Devin
+                && spec.workspace_access == WorkspaceAccess::ReadOnly
+                && spec
+                    .agent_lifecycle
+                    .as_ref()
+                    .is_some_and(|identity| identity.role == "researcher")
         }
         AssignmentProcessLaunchKind::ConsultGemini => {
             spec.uses_gemini_bridge()
@@ -7169,7 +7204,8 @@ fn assignment_process_launch_kind_allowed_for_invocation(
             | ExternalAgentInvocation::GeminiCli
             | ExternalAgentInvocation::DeepSeek => true,
             ExternalAgentInvocation::CodexConsultant
-            | ExternalAgentInvocation::ClaudeConsultant => false,
+            | ExternalAgentInvocation::ClaudeConsultant
+            | ExternalAgentInvocation::Devin => false,
         },
         AssignmentProcessLaunchKind::MergeArbiter => {
             if spec.selected_merge_arbiter.is_some() {
@@ -7603,6 +7639,33 @@ fn run_external_agent_runtime_inner(
             );
         }
     }
+    if spec.invocation == ExternalAgentInvocation::Devin
+        && (runtime != ExternalExecutionRuntime::Verified
+            || spec.workspace_access != WorkspaceAccess::ReadOnly)
+    {
+        return failed_external_run(spec, started, command_display(&spec.program, &[]), false,
+            "Devin requires verified read-only confinement; writable and compatibility routes are unsupported".into());
+    }
+    #[cfg(not(target_os = "linux"))]
+    if spec.invocation == ExternalAgentInvocation::Devin {
+        return failed_external_run(
+            spec,
+            started,
+            command_display(&spec.program, &[]),
+            false,
+            "Devin requires the reviewed Linux systemd profile".into(),
+        );
+    }
+    #[cfg(target_os = "linux")]
+    let devin_session = if spec.invocation == ExternalAgentInvocation::Devin {
+        match devin::DevinSession::prepare(spec) {
+            Ok(session) => Some(session),
+            Err(_) => return failed_external_run(spec, started, command_display(&spec.program, &[]), false,
+                "Devin preflight refused: require canonical reviewed workspace, pinned settings and safe native credentials.toml".into()),
+        }
+    } else {
+        None
+    };
     let selected_program = match resolve_external_program(&spec.program, &spec.cwd) {
         Ok(program) => program,
         Err(error) => {
@@ -7795,6 +7858,10 @@ fn run_external_agent_runtime_inner(
             }
         };
     let mut target_spec = spec.clone();
+    #[cfg(target_os = "linux")]
+    if let Some(session) = &devin_session {
+        target_spec.devin_config = Some(session.config_path().to_path_buf());
+    }
     target_spec.output_last_message = match output_staging.path() {
         Ok(path) => path.to_path_buf(),
         Err(error) => {
@@ -8475,6 +8542,33 @@ fn run_external_agent_runtime_inner(
         (prompt, profile, binding)
     };
     let mut bound_grok_credentials = None;
+    #[cfg(target_os = "linux")]
+    let side_effect_profile = match (devin_session.as_ref(), side_effect_profile) {
+        (Some(session), Some(SideEffectConfinementProfile::ExternalDevin(profile))) => {
+            match session.bind(profile) {
+                Ok(profile) => Some(SideEffectConfinementProfile::ExternalDevin(profile)),
+                Err(_) => {
+                    return failed_external_run(
+                        spec,
+                        started,
+                        command_display(&spec.program, &[]),
+                        false,
+                        "Devin immutable private file projections refused".into(),
+                    )
+                }
+            }
+        }
+        (Some(_), _) => {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                "Devin profile identity missing".into(),
+            )
+        }
+        (None, profile) => profile,
+    };
     let side_effect_profile = match (grok_credentials.as_ref(), side_effect_profile) {
         (Some(credentials), Some(SideEffectConfinementProfile::ExternalGrok(profile))) => {
             match BoundGrokCredentials::new(credentials, profile) {
@@ -8712,7 +8806,8 @@ fn run_external_agent_runtime_inner(
     };
     #[cfg(not(target_os = "linux"))]
     let claude_oauth_redaction: Option<&[u8]> = None;
-    let credential_redactor = match CredentialRedactor::from_runtime(
+    #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+    let mut credential_redactor = match CredentialRedactor::from_runtime(
         &external_environment,
         codex_auth.as_ref(),
         claude_oauth_redaction,
@@ -8727,6 +8822,18 @@ fn run_external_agent_runtime_inner(
             return report;
         }
     };
+    #[cfg(target_os = "linux")]
+    if let Some(session) = &devin_session {
+        if session.extend_redactor(&mut credential_redactor).is_err() {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                "Devin credential redaction refused".into(),
+            );
+        }
+    }
     if runtime == ExternalExecutionRuntime::Verified
         && spec.uses_live_claude_managed_worker_budget()
         && claude_session.is_none()
@@ -8742,6 +8849,32 @@ fn run_external_agent_runtime_inner(
                 .to_string(),
         );
         return report;
+    }
+    #[cfg(target_os = "linux")]
+    if spec.invocation == ExternalAgentInvocation::Devin {
+        let mut preflight = devin::preflight(
+            &target_spec,
+            spec.timeout.saturating_sub(started.elapsed()),
+            cancellation,
+            &external_environment,
+            side_effect_profile
+                .as_ref()
+                .expect("Devin profile admitted"),
+            agent_lifecycle.as_ref(),
+            &credential_redactor,
+        );
+        for failure in &mut preflight.failures {
+            failure.summary = credential_redactor.redact_string(&failure.summary);
+        }
+        report.timed_out = preflight.timed_out;
+        report.stdout.run_metadata.environment_preflight_results = preflight.results;
+        report.stdout.run_metadata.environment_failures = preflight.failures;
+        retain_environment_preflight_process_evidence(&mut report, &preflight.process_evidence);
+        if report.environment_blocked() {
+            report.duration_ms = duration_millis(started.elapsed());
+            report.error = Some(environment_blocked_message(report.environment_failures()));
+            return report;
+        }
     }
     if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
@@ -12003,7 +12136,10 @@ fn record_completed_target(
         Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
             // DeepSeek reports are JSON text nested inside the event stream. Keep the
             // parent's intermediate report staging free of launch credentials too.
-            let captured = if context.spec.invocation == ExternalAgentInvocation::DeepSeek {
+            let captured = if matches!(
+                context.spec.invocation,
+                ExternalAgentInvocation::DeepSeek | ExternalAgentInvocation::Devin
+            ) {
                 credential_redactor.redact_bytes(&captured)
             } else {
                 captured
@@ -13422,6 +13558,12 @@ fn evaluate_environment_requirement(
                     side_effect_profile,
                     SideEffectConfinementProfile::ExternalCursor(_)
                 );
+            let verified_networked_devin = verified_confinement
+                == Some(SideEffectConfinementProfileKind::ExternalDevin)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalDevin(_)
+                );
             if *access == EnvironmentNetworkAccess::Disabled && enforced_offline {
                 (
                     EnvironmentPreflightResult {
@@ -13437,7 +13579,8 @@ fn evaluate_environment_requirement(
             } else if *access == EnvironmentNetworkAccess::Enabled
                 && (verified_networked_grok
                     || verified_parent_relayed_claude
-                    || verified_networked_cursor)
+                    || verified_networked_cursor
+                    || verified_networked_devin)
             {
                 (
                     EnvironmentPreflightResult {
@@ -13496,6 +13639,9 @@ fn evaluate_environment_requirement(
                 EnvironmentSandboxCapability::VerifiedExternalGrok => {
                     SideEffectConfinementProfileKind::ExternalGrok
                 }
+                EnvironmentSandboxCapability::VerifiedExternalDevin => {
+                    SideEffectConfinementProfileKind::ExternalDevin
+                }
                 EnvironmentSandboxCapability::VerifiedExternalCursor => {
                     SideEffectConfinementProfileKind::ExternalCursor
                 }
@@ -13536,6 +13682,22 @@ fn evaluate_environment_requirement(
 }
 
 include!("external_agent/part2.rs");
+
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn devin_consult_protected_profile_for_test(
+    spec: &ExternalAgentCommand,
+) -> Result<ExternalDevinProfile> {
+    let controls = protected_worktree_controls(spec)?;
+    match external_side_effect_profile(
+        spec,
+        &spec.program,
+        ExternalProgramTrust::ExplicitCustom,
+        &controls,
+    )? {
+        SideEffectConfinementProfile::ExternalDevin(profile) => Ok(profile),
+        _ => bail!("expected Devin consultant profile"),
+    }
+}
 
 #[cfg(test)]
 mod preflight_quiescence_regression {

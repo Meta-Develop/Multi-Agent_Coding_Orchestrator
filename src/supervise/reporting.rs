@@ -1052,7 +1052,8 @@ fn external_process_quiescent_for_scratch(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => run.scratch_quiescence_verified(),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Devin => run.scratch_quiescence_verified(),
     }
 }
 
@@ -2222,6 +2223,8 @@ pub(super) fn deterministic_fake_run(
 
 pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: SupervisorRuntime) -> bool {
     match runtime {
+        SupervisorRuntime::Devin => false, // Only consult verifies Devin completion.
+
         SupervisorRuntime::Codex => {
             run.process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)

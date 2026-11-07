@@ -149,6 +149,40 @@ fn verify_effective_namespace_restriction(
 }
 
 #[cfg(target_os = "linux")]
+fn systemd_runtime_directory_names(
+    runtime_dir: &Path,
+    kind: SideEffectConfinementProfileKind,
+) -> std::io::Result<Vec<String>> {
+    let runtime_name = runtime_dir
+        .file_name()
+        .and_then(OsStr::to_str)
+        .ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "systemd containment runtime directory name is not valid UTF-8",
+            )
+        })?;
+    let mut names = vec![runtime_name.to_string()];
+    if kind == SideEffectConfinementProfileKind::ExternalDevin {
+        // prepare() generates this component from the runner PID and sequence. Keep
+        // the nested declaration confined to that single owned runtime directory.
+        if !runtime_name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "Devin runtime directory name is not a safe single component",
+            ));
+        }
+        // systemd creates RuntimeDirectory entries before preparing mount namespaces.
+        // The mandatory read-only .config mount must already have a source directory.
+        names.push(format!("{runtime_name}/.config"));
+    }
+    Ok(names)
+}
+
+#[cfg(target_os = "linux")]
 fn systemd_path_property(name: &str, path: &Path, optional: bool) -> OsString {
     use std::os::unix::ffi::{OsStrExt, OsStringExt};
 
@@ -732,16 +766,8 @@ impl SystemdUnit {
             .as_ref()
             .map(|sandbox| sandbox.current_dir.clone())
             .unwrap_or_else(|| spec.current_dir.clone());
-        let runtime_name = self
-            .runtime_dir
-            .file_name()
-            .and_then(OsStr::to_str)
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "systemd containment runtime directory name is not valid UTF-8",
-                )
-            })?;
+        let runtime_directories =
+            systemd_runtime_directory_names(&self.runtime_dir, spec.side_effects.kind())?;
         let runtime_max = systemd_runtime_max(spec.timeout)?;
         let mut command = Command::new(&self.systemd_run);
         command
@@ -764,7 +790,10 @@ impl SystemdUnit {
                 "--property=RuntimeDirectoryPreserve=no",
                 "--property=RuntimeDirectoryMode=0700",
             ])
-            .arg(format!("--property=RuntimeDirectory={runtime_name}"))
+            .arg(format!(
+                "--property=RuntimeDirectory={}",
+                runtime_directories.join(" ")
+            ))
             .arg(format!(
                 "--property=RuntimeMaxSec={}ms",
                 runtime_max.as_millis()
@@ -841,6 +870,7 @@ impl SystemdUnit {
                             "rw-mountpoint"
                         }
                         SandboxMountAccess::ReadOnly => "ro",
+                        SandboxMountAccess::PrivateDevinConfigRoot => "ro-mountpoint",
                         SandboxMountAccess::ReadWrite => "rw",
                         SandboxMountAccess::PrivateRuntime => "rw",
                         SandboxMountAccess::Inaccessible if check.optional => {
@@ -901,7 +931,46 @@ impl SystemdUnit {
                     }
                 },
                 ProcessCommand::Direct { program, args } => {
-                    command.arg(program).args(args);
+                    command.arg(program);
+                    if spec.side_effects.kind() == SideEffectConfinementProfileKind::ExternalDevin
+                        && args.iter().any(|arg| arg == "--config")
+                    {
+                        let sandbox = self
+                            .sandbox
+                            .as_ref()
+                            .ok_or_else(|| std::io::Error::other("Devin sandbox missing"))?;
+                        let config = sandbox
+                            .external_managed_read_only_file_capabilities
+                            .iter()
+                            .find(|cap| {
+                                matches!(
+                                    cap.projection,
+                                    ExternalManagedReadOnlyFileProjection::DevinUserConfig
+                                )
+                            })
+                            .ok_or_else(|| {
+                                std::io::Error::other("Devin immutable user config missing")
+                            })?;
+                        let mut rewritten = args.clone();
+                        let index = rewritten
+                            .iter()
+                            .position(|arg| arg == "--config")
+                            .ok_or_else(|| std::io::Error::other("Devin --config missing"))?;
+                        if rewritten.get(index + 1).map(OsString::as_os_str)
+                            != Some(config.path.as_os_str())
+                        {
+                            return Err(std::io::Error::other("Devin config binding changed"));
+                        }
+                        rewritten[index + 1] = config
+                            .private_home_target(&self.runtime_dir)
+                            .ok_or_else(|| {
+                                std::io::Error::other("Devin private config target missing")
+                            })?
+                            .into_os_string();
+                        command.args(rewritten);
+                    } else {
+                        command.args(args);
+                    }
                 }
             }
         }
@@ -954,7 +1023,15 @@ impl SystemdUnit {
         cancellation: &ProcessCancellation,
     ) -> std::io::Result<()> {
         let now = Instant::now();
-        let mut timings = PhaseTimings::new(now, operation_deadline, operation_deadline.map(|d| d.saturating_duration_since(now)).unwrap_or(SYSTEMD_OPERATION_GRACE), Duration::ZERO, "attachment");
+        let mut timings = PhaseTimings::new(
+            now,
+            operation_deadline,
+            operation_deadline
+                .map(|d| d.saturating_duration_since(now))
+                .unwrap_or(SYSTEMD_OPERATION_GRACE),
+            Duration::ZERO,
+            "attachment",
+        );
         self.confirm_attached_timed(child, operation_deadline, cancellation, &mut timings)
     }
 
@@ -970,19 +1047,35 @@ impl SystemdUnit {
         let now = attach_now();
         timings.enter("ownership_observation", now);
         let deadline = systemd_attach_deadline(now, operation_deadline);
-        let allowance = deadline.as_ref().map(|d| d.saturating_duration_since(now).as_millis()).unwrap_or(0);
+        let allowance = deadline
+            .as_ref()
+            .map(|d| d.saturating_duration_since(now).as_millis())
+            .unwrap_or(0);
         let result = if cancellation.is_cancelled() {
             check_attach_budget(now, cancellation)
-        } else { match deadline {
-            Ok(deadline) => self.confirm_attached_inner(child, deadline, cancellation, timings),
-            Err(source) => Err(source),
-        }};
+        } else {
+            match deadline {
+                Ok(deadline) => self.confirm_attached_inner(child, deadline, cancellation, timings),
+                Err(source) => Err(source),
+            }
+        };
         // Freeze timings before diagnostics and attach() rollback remove the gate evidence.
         let observed = attach_now();
-        let summary = format!("{} attach_allowance_ms={} operation_remaining_ms={}", timings.snapshot(observed), allowance, operation_deadline.map(|d| d.saturating_duration_since(observed).as_millis()).unwrap_or(u128::MAX));
+        let summary = format!(
+            "{} attach_allowance_ms={} operation_remaining_ms={}",
+            timings.snapshot(observed),
+            allowance,
+            operation_deadline
+                .map(|d| d.saturating_duration_since(observed).as_millis())
+                .unwrap_or(u128::MAX)
+        );
         tracing::debug!(timings = %summary, completed = result.is_ok(), "systemd attachment finished before cleanup");
         result.map_err(|source| {
-            let diagnostics = format!("systemd transient unit {}; {}", self.name, self.start_gate_diagnostics(child));
+            let diagnostics = format!(
+                "systemd transient unit {}; {}",
+                self.name,
+                self.start_gate_diagnostics(child)
+            );
             with_phase_diagnostics(source, format!("{summary}; {diagnostics}"))
         })
     }
@@ -1119,7 +1212,14 @@ impl SystemdUnit {
                     ],
                 )?;
                 self.fifos_prepared = true;
-                timings.enter(if self.observed_owned { "owner_channel" } else { "ownership_observation" }, Instant::now());
+                timings.enter(
+                    if self.observed_owned {
+                        "owner_channel"
+                    } else {
+                        "ownership_observation"
+                    },
+                    Instant::now(),
+                );
             }
             if self.observed_owned && self.owner_channel.is_none() && self.owner_fifo_path.exists()
             {
@@ -1257,7 +1357,11 @@ impl SystemdUnit {
         }
     }
 
-    fn verify_effective_sandbox(&self, deadline: Instant, cancellation: &ProcessCancellation) -> std::io::Result<()> {
+    fn verify_effective_sandbox(
+        &self,
+        deadline: Instant,
+        cancellation: &ProcessCancellation,
+    ) -> std::io::Result<()> {
         check_attach_budget(deadline, cancellation)?;
         let sandbox = self.sandbox.as_ref().ok_or_else(|| {
             std::io::Error::other("strict sandbox verification omitted requested profile")
@@ -1265,11 +1369,19 @@ impl SystemdUnit {
         sandbox.verify_path_identities()?;
         verify_sandbox_mount_report(&self.sandbox_report_path, &sandbox.mount_checks)?;
         attach_checkpoint("before_sandbox_property_probe", deadline, cancellation)?;
+        let mut property_names = SYSTEMD_SANDBOX_SHOW_PROPERTIES.to_vec();
+        if sandbox.kind == SideEffectConfinementProfileKind::ExternalDevin {
+            property_names.extend([
+                "RuntimeDirectory",
+                "RuntimeDirectoryMode",
+                "RuntimeDirectoryPreserve",
+            ]);
+        }
         let properties = systemd_show_properties(
             &self.systemctl,
             &self.client_runtime,
             &self.name,
-            SYSTEMD_SANDBOX_SHOW_PROPERTIES,
+            &property_names,
             deadline,
             cancellation,
         )?;
@@ -1765,7 +1877,14 @@ fn run_control_command_capture_bounded(
     label: &str,
     client_runtime: &Path,
 ) -> std::io::Result<(ExitStatus, CapturedBytes, CapturedBytes)> {
-    run_control_command_capture_bounded_until(program, args, label, client_runtime, None, &ProcessCancellation::new())
+    run_control_command_capture_bounded_until(
+        program,
+        args,
+        label,
+        client_runtime,
+        None,
+        &ProcessCancellation::new(),
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -1780,7 +1899,10 @@ fn run_control_command_capture_bounded_until(
     use std::os::unix::process::CommandExt;
 
     if cancellation.is_cancelled() {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "systemd sandbox property probe was cancelled"));
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "systemd sandbox property probe was cancelled",
+        ));
     }
     let deadline = bounded_operation_deadline(SYSTEMD_OPERATION_GRACE, operation_deadline)?;
     check_attach_budget(deadline, cancellation)?;
@@ -1821,9 +1943,8 @@ fn run_control_command_capture_bounded_until(
             let cleanup = terminate_unix_process_group(&mut child, false, label);
             let status = wait_for_exit_until(&mut child, Instant::now() + SYSTEMD_OPERATION_GRACE)?
                 .unwrap_or_else(|| fail_closed_stuck_owner(label));
-            let detail = cleanup.unwrap_or_else(|| {
-                format!("{label} control rollback completed with {status}")
-            });
+            let detail = cleanup
+                .unwrap_or_else(|| format!("{label} control rollback completed with {status}"));
             let _ = finish_output_drainers_after_exit(&mut drainers, EXIT_AND_DRAIN_GRACE);
             let _ = drainers.cancel_incomplete(label);
             return Err(with_phase_diagnostics(error, detail));
@@ -2371,10 +2492,21 @@ fn enforce_total_operation_deadline(operation_deadline: Option<Instant>) -> std:
 }
 
 #[cfg(target_os = "linux")]
-fn systemd_attach_deadline(now: Instant, operation_deadline: Option<Instant>) -> io::Result<Instant> {
+fn systemd_attach_deadline(
+    now: Instant,
+    operation_deadline: Option<Instant>,
+) -> io::Result<Instant> {
     let allowance = match operation_deadline {
         Some(deadline) => {
-            let remaining = deadline.checked_duration_since(now).filter(|r| !r.is_zero()).ok_or_else(|| io::Error::new(io::ErrorKind::TimedOut, "systemd attachment operation deadline is exhausted"))?;
+            let remaining = deadline
+                .checked_duration_since(now)
+                .filter(|r| !r.is_zero())
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        "systemd attachment operation deadline is exhausted",
+                    )
+                })?;
             remaining.min(SYSTEMD_OPERATION_GRACE.max(SYSTEMD_ATTACH_CEILING.min(remaining / 2)))
         }
         None => SYSTEMD_OPERATION_GRACE,
@@ -2385,10 +2517,16 @@ fn systemd_attach_deadline(now: Instant, operation_deadline: Option<Instant>) ->
 #[cfg(target_os = "linux")]
 fn check_attach_budget(deadline: Instant, cancellation: &ProcessCancellation) -> io::Result<()> {
     if cancellation.is_cancelled() {
-        return Err(io::Error::new(io::ErrorKind::Interrupted, "systemd containment attachment was cancelled"));
+        return Err(io::Error::new(
+            io::ErrorKind::Interrupted,
+            "systemd containment attachment was cancelled",
+        ));
     }
     if attach_now() >= deadline {
-        return Err(io::Error::new(io::ErrorKind::TimedOut, "systemd transient unit did not reach its start gate before the bounded setup deadline"));
+        return Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "systemd transient unit did not reach its start gate before the bounded setup deadline",
+        ));
     }
     Ok(())
 }
@@ -2403,7 +2541,11 @@ fn attach_now() -> Instant {
 }
 
 #[cfg(target_os = "linux")]
-fn attach_checkpoint(phase: &'static str, deadline: Instant, cancellation: &ProcessCancellation) -> io::Result<()> {
+fn attach_checkpoint(
+    phase: &'static str,
+    deadline: Instant,
+    cancellation: &ProcessCancellation,
+) -> io::Result<()> {
     #[cfg(test)]
     run_attach_test_hook(phase);
     let _ = phase;
@@ -3283,7 +3425,8 @@ impl ContainedProcessSession<'_> {
         self.output_drainers.drain_ready();
         #[cfg(target_os = "linux")]
         if self.private_target_state() == PrivateTargetState::Exited {
-            return self.fail_io("contained private-channel target exited before protocol completion");
+            return self
+                .fail_io("contained private-channel target exited before protocol completion");
         }
         Ok(())
     }
@@ -4237,11 +4380,22 @@ mod start_gate_deadline_phase_tests {
             }
         }
         for expired in [now, now - Duration::from_nanos(1)] {
-            assert_eq!(systemd_attach_deadline(now, Some(expired)).unwrap_err().kind(), io::ErrorKind::TimedOut);
+            assert_eq!(
+                systemd_attach_deadline(now, Some(expired))
+                    .unwrap_err()
+                    .kind(),
+                io::ErrorKind::TimedOut
+            );
         }
-        assert_eq!(systemd_attach_deadline(now, None).unwrap(), now + SYSTEMD_OPERATION_GRACE);
+        assert_eq!(
+            systemd_attach_deadline(now, None).unwrap(),
+            now + SYSTEMD_OPERATION_GRACE
+        );
         if let Some(large) = now.checked_add(Duration::from_secs(u32::MAX as u64)) {
-            assert_eq!(systemd_attach_deadline(large, Some(large + Duration::from_secs(12))).unwrap(), large + Duration::from_secs(6));
+            assert_eq!(
+                systemd_attach_deadline(large, Some(large + Duration::from_secs(12))).unwrap(),
+                large + Duration::from_secs(6)
+            );
         }
     }
 

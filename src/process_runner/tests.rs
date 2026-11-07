@@ -1,6 +1,304 @@
 use super::*;
 
 #[cfg(target_os = "linux")]
+#[test]
+fn devin_builder_declares_config_parent_before_its_mandatory_read_only_mount() {
+    let temp = tempfile::tempdir_in("/tmp").expect("private fixture");
+    let workspace = temp.path().join("workspace");
+    fs::create_dir(&workspace).expect("workspace");
+    let config = temp.path().join("config.json");
+    fs::write(&config, b"immutable-config-fixture").expect("synthetic config");
+    let profile = ExternalDevinProfile::read_only(&workspace)
+        .with_visible_read_only_file("/bin/true")
+        .with_private_file(
+            config.clone(),
+            Arc::new(File::open(&config).expect("held config")),
+            true,
+        )
+        .expect("private config capability");
+    let spec = ProcessSpec::direct(
+        "Devin config mount construction",
+        "/bin/true",
+        [OsString::from("--config"), config.into_os_string()],
+        &workspace,
+        128,
+    )
+    .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalDevin(profile));
+    let runtime = temp.path().join("maco-process-123-1");
+    let mut unit = systemd_unit_fixture(&runtime, None);
+    let command = unit
+        .build_command(&spec)
+        .expect("Devin launcher construction");
+    let args = command.get_args().collect::<Vec<_>>();
+    let creation = args
+        .iter()
+        .position(|arg| {
+            *arg == OsStr::new(
+                "--property=RuntimeDirectory=maco-process-123-1 maco-process-123-1/.config",
+            )
+        })
+        .expect("systemd must create the root and .config before namespace setup");
+    let read_only_parent = systemd_path_property("ReadOnlyPaths=", &runtime.join(".config"), false);
+    let mount = args
+        .iter()
+        .position(|arg| *arg == read_only_parent.as_os_str())
+        .expect("nonoptional config parent read-only mount");
+    assert!(creation < mount);
+    for expected in [
+        "--property=RuntimeDirectoryMode=0700",
+        "--property=RuntimeDirectoryPreserve=no",
+        "--property=RestrictNamespaces=yes",
+        "--property=CapabilityBoundingSet=",
+        "--property=AmbientCapabilities=",
+    ] {
+        assert!(args.contains(&OsStr::new(expected)), "missing {expected}");
+    }
+    let projected = runtime.join(".config/devin/config.json");
+    assert!(args.contains(
+        &systemd_path_property("ReadOnlyPaths=", &projected, false).as_os_str()
+    ));
+    assert!(args
+        .windows(2)
+        .any(|pair| pair[0] == OsStr::new("--config") && pair[1] == projected.as_os_str()));
+    for writable in ["BindPaths=", "ReadWritePaths="] {
+        assert!(!args.contains(
+            &systemd_path_property(writable, &runtime.join(".config"), false).as_os_str()
+        ));
+    }
+    assert!(unit
+        .sandbox
+        .as_ref()
+        .unwrap()
+        .mount_checks
+        .iter()
+        .any(|check| {
+            check.path == runtime.join(".config")
+                && check.access == SandboxMountAccess::PrivateDevinConfigRoot
+                && !check.optional
+        }));
+    assert!(!runtime.exists(), "construction leaves creation to systemd");
+    assert!(!unit.launcher_spawned);
+
+    let ordinary = ProcessSpec::direct(
+        "unchanged runtime root declaration",
+        "/bin/true",
+        Vec::<OsString>::new(),
+        &workspace,
+        128,
+    )
+    .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+        StrictOfflineWorkspaceProfile::read_only(&workspace),
+    ));
+    let mut unchanged = systemd_unit_fixture(&runtime, None);
+    let command = unchanged.build_command(&ordinary).expect("ordinary builder");
+    let args = command.get_args().collect::<Vec<_>>();
+    assert!(args.contains(&OsStr::new("--property=RuntimeDirectory=maco-process-123-1")));
+    assert!(!args.contains(&read_only_parent.as_os_str()));
+    assert!(!unchanged.launcher_spawned);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn devin_runtime_directory_properties_reject_missing_extra_and_insecure_entries() {
+    let runtime = Path::new("/run/user/1000/maco-process-123-1");
+    let properties = BTreeMap::from([
+        (
+            "RuntimeDirectory".to_string(),
+            "maco-process-123-1 maco-process-123-1/.config".to_string(),
+        ),
+        ("RuntimeDirectoryMode".to_string(), "0700".to_string()),
+        ("RuntimeDirectoryPreserve".to_string(), "no".to_string()),
+    ]);
+    verify_devin_runtime_directory_properties(&properties, runtime)
+        .expect("exact private directories");
+    for (name, value) in [
+        ("RuntimeDirectory", "maco-process-123-1"),
+        ("RuntimeDirectory", "maco-process-123-1/.config"),
+        ("RuntimeDirectory", "maco-process-123-1 other/.config"),
+        (
+            "RuntimeDirectory",
+            "maco-process-123-1 maco-process-123-1/.config extra",
+        ),
+        (
+            "RuntimeDirectory",
+            "maco-process-123-1 maco-process-123-1/.config:alias",
+        ),
+        ("RuntimeDirectoryMode", "0755"),
+        ("RuntimeDirectoryPreserve", "yes"),
+        ("RuntimeDirectoryPreserve", "restart"),
+    ] {
+        let mut drift = properties.clone();
+        drift.insert(name.to_string(), value.to_string());
+        let error = verify_devin_runtime_directory_properties(&drift, runtime)
+            .expect_err("effective directory drift must refuse launch");
+        assert!(error.to_string().contains(name), "{error}");
+    }
+    for name in properties.keys() {
+        let mut missing = properties.clone();
+        missing.remove(name);
+        assert!(verify_devin_runtime_directory_properties(&missing, runtime).is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn runtime_directory_config_child_is_exclusive_to_devin() {
+    let runtime = Path::new("/run/user/1000/maco-process-123-1");
+    for kind in [
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::ExternalCodex,
+        SideEffectConfinementProfileKind::ExternalClaude,
+        SideEffectConfinementProfileKind::ExternalGrok,
+        SideEffectConfinementProfileKind::ExternalCursor,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        assert_eq!(
+            systemd_runtime_directory_names(runtime, kind).unwrap(),
+            vec!["maco-process-123-1".to_string()],
+            "unchanged runtime directory declaration for {kind:?}"
+        );
+    }
+    for unsafe_name in ["runtime extra", "runtime:alias", "runtime%specifier", ".config"] {
+        assert!(systemd_runtime_directory_names(
+            &Path::new("/run/user/1000").join(unsafe_name),
+            SideEffectConfinementProfileKind::ExternalDevin,
+        )
+        .is_err());
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn devin_network_and_namespace_evidence_requires_its_exact_profile() {
+    let mut properties = BTreeMap::from([
+        ("PrivateNetwork".into(), "no".into()),
+        (
+            "RestrictAddressFamilies".into(),
+            "AF_UNIX AF_INET AF_INET6".into(),
+        ),
+    ]);
+    let kind = SideEffectConfinementProfileKind::ExternalDevin;
+    verify_systemd_network_properties(kind, &properties).unwrap();
+    verify_effective_namespace_restriction(kind, "yes").unwrap();
+    assert!(verify_effective_namespace_restriction(kind, "no").is_err());
+    properties.insert(
+        "RestrictAddressFamilies".into(),
+        "AF_UNIX AF_INET AF_INET6 AF_NETLINK".into(),
+    );
+    assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    properties.insert(
+        "RestrictAddressFamilies".into(),
+        "AF_UNIX AF_INET AF_INET6".into(),
+    );
+    properties.insert("PrivateNetwork".into(), "yes".into());
+    assert!(verify_systemd_network_properties(kind, &properties).is_err());
+    assert_ne!(kind, SideEffectConfinementProfileKind::ExternalCursor);
+    assert_eq!(
+        serde_json::to_string(&SideEffectConfinementEvidence::Verified(kind)).unwrap(),
+        r#"{"status":"verified","profile":"external_devin"}"#
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn devin_contained_fixture_enforces_private_config_auth_and_workspace() -> anyhow::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let temp = tempfile::tempdir_in("/tmp")?;
+    let workspace = temp.path().join("workspace");
+    let source = temp.path().join("private");
+    fs::create_dir(&workspace)?;
+    fs::create_dir(&source)?;
+    fs::create_dir(workspace.join(".devin"))?;
+    fs::write(workspace.join(".devin/config.json"), b"untrusted")?;
+    fs::write(source.join("config.json"), b"immutable-config-fixture")?;
+    fs::write(source.join("credentials.toml"), b"synthetic-token-fixture")?;
+    let program = temp.path().join("devin-fixture");
+    fs::write(
+        &program,
+        r#"#!/bin/sh
+set -eu
+[ "$1" = --config ]
+[ "$2" = "$HOME/.config/devin/config.json" ]
+[ "$(cat "$2")" = immutable-config-fixture ]
+[ "$(cat "$HOME/.local/share/devin/credentials.toml")" = synthetic-token-fixture ]
+if printf changed > "$2" 2>/dev/null; then exit 41; fi
+if chmod 600 "$2" 2>/dev/null; then exit 42; fi
+if mv "$HOME/.config" "$HOME/replaced-config" 2>/dev/null; then exit 43; fi
+if rm "$2" 2>/dev/null; then exit 44; fi
+if printf changed > "$HOME/.local/share/devin/credentials.toml" 2>/dev/null; then exit 45; fi
+if printf changed > workspace-write 2>/dev/null; then exit 46; fi
+if cat .devin/config.json >/dev/null 2>&1; then exit 47; fi
+printf 'private-config-auth-readonly-ok\n'
+"#,
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o755))?;
+    let config = source.join("config.json");
+    let credentials = source.join("credentials.toml");
+    let profile = ExternalDevinProfile::read_only(&workspace)
+        .with_visible_read_only_file(&program)
+        .with_hidden_root(&source)
+        .with_hidden_root(workspace.join(".devin"))
+        .with_private_file(config.clone(), Arc::new(File::open(&config)?), true)?
+        .with_private_file(
+            credentials.clone(),
+            Arc::new(File::open(&credentials)?),
+            false,
+        )?;
+    let spec = ProcessSpec::direct(
+        "Devin read-only synthetic fixture",
+        &program,
+        [OsString::from("--config"), config.into_os_string()],
+        &workspace,
+        8192,
+    )
+    .with_timeout(Some(Duration::from_secs(15)))
+    .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::from([(
+        "PATH".into(),
+        "/usr/bin:/bin".into(),
+    )])))
+    .with_private_runtime_home(true)
+    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalDevin(profile));
+    match run_process_cancellable(spec, &ProcessCancellation::default()) {
+        Ok(output) => {
+            assert!(
+                output.status.is_some_and(|status| status.success()),
+                "fixture failure: {output:?}"
+            );
+            assert_eq!(
+                output.stdout.as_bytes(),
+                b"private-config-auth-readonly-ok\n"
+            );
+            assert_eq!(
+                output.side_effects,
+                SideEffectConfinementEvidence::Verified(
+                    SideEffectConfinementProfileKind::ExternalDevin
+                )
+            );
+            assert_eq!(
+                output.process_tree,
+                ProcessTreeEvidence::VerifiedEmpty(ContainmentBackend::SystemdUserService)
+            );
+        }
+        Err(ProcessRunError::ContainmentUnavailable { .. }) => {
+            eprintln!("Devin synthetic live profile UNPROVEN: delegated systemd unavailable; required containment refused without fallback");
+        }
+        Err(error) if error.is_missing_delegated_user_manager() => {
+            eprintln!("Devin synthetic live profile UNPROVEN: {error}; target refused before spawn without fallback");
+        }
+        Err(error) => return Err(error.into()),
+    }
+    assert!(!workspace.join("workspace-write").exists());
+    assert_eq!(fs::read(credentials)?, b"synthetic-token-fixture");
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn program_visibility_sandbox(workspace_root: &Path) -> ResolvedSystemdSandbox {
     ResolvedSystemdSandbox {
         read_only_input_snapshots: Vec::new(),
@@ -4988,6 +5286,7 @@ fn external_codex_and_grok_admit_inner_bubblewrap_namespaces_and_mounts() {
         SideEffectConfinementProfileKind::ExternalClaude,
         SideEffectConfinementProfileKind::GeminiOnlineBridge,
         SideEffectConfinementProfileKind::ExternalCursor,
+        SideEffectConfinementProfileKind::ExternalDevin,
         SideEffectConfinementProfileKind::TrustedCompatibility,
     ] {
         let mut ordinary = program_visibility_sandbox(Path::new("/worktree"));
@@ -5034,7 +5333,8 @@ fn external_codex_and_grok_admit_inner_bubblewrap_namespaces_and_mounts() {
                 "--property=RestrictAddressFamilies=AF_INET AF_INET6"
             }
             SideEffectConfinementProfileKind::GeminiOnlineBridge
-            | SideEffectConfinementProfileKind::ExternalCursor => {
+            | SideEffectConfinementProfileKind::ExternalCursor
+            | SideEffectConfinementProfileKind::ExternalDevin => {
                 "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6"
             }
             SideEffectConfinementProfileKind::ExternalClaude => {

@@ -459,6 +459,7 @@ const fn external_sandbox_requirement(
         ExternalAgentInvocation::Grok => EnvironmentSandboxCapability::VerifiedExternalGrok,
         ExternalAgentInvocation::ClaudeCode => EnvironmentSandboxCapability::VerifiedExternalClaude,
         ExternalAgentInvocation::Cursor => EnvironmentSandboxCapability::VerifiedExternalCursor,
+        ExternalAgentInvocation::Devin => EnvironmentSandboxCapability::VerifiedExternalDevin,
         ExternalAgentInvocation::CodexSupervisor
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::ClaudeConsultant
@@ -546,6 +547,20 @@ fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, 
             key,
             "HOME" | "CURSOR_CONFIG_DIR" | "AGENT_CLI_CREDENTIAL_STORE" | "CURSOR_API_KEY"
         ),
+        ExternalAgentInvocation::Devin => {
+            !key.starts_with("DEVIN_")
+                && !matches!(
+                    key,
+                    "HOME"
+                        | "TMPDIR"
+                        | "XDG_CONFIG_HOME"
+                        | "XDG_DATA_HOME"
+                        | "XDG_STATE_HOME"
+                        | "XDG_CACHE_HOME"
+                        | "XDG_RUNTIME_DIR"
+                        | "WINDSURF_API_KEY"
+                )
+        }
         ExternalAgentInvocation::DeepSeek => !matches!(
             key,
             "HOME"
@@ -5298,6 +5313,7 @@ enum ExternalProviderProfile {
     Claude(ExternalClaudeProfile),
     Grok(ExternalGrokProfile),
     Cursor(ExternalCursorProfile),
+    Devin(ExternalDevinProfile),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -5376,6 +5392,12 @@ impl ExternalProviderProfile {
                 (ExternalAgentInvocation::Cursor, WorkspaceAccess::ReadWrite, _) => {
                     Self::Cursor(ExternalCursorProfile::read_write(&spec.cwd))
                 }
+                (ExternalAgentInvocation::Devin, WorkspaceAccess::ReadOnly, _) => {
+                    Self::Devin(ExternalDevinProfile::read_only(&spec.cwd))
+                }
+                (ExternalAgentInvocation::Devin, WorkspaceAccess::ReadWrite, _) => {
+                    bail!("Devin writable launch is not qualified")
+                }
                 (ExternalAgentInvocation::DeepSeek, WorkspaceAccess::ReadWrite, _) => {
                     let bound = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
                         crate::supervise::deepseek_qualification::operator_flag_bound(
@@ -5404,6 +5426,7 @@ impl ExternalProviderProfile {
             Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_root(root.into())),
             Self::Cursor(profile) => Self::Cursor(profile.with_visible_read_only_root(root.into())),
+            Self::Devin(profile) => Self::Devin(profile.with_visible_read_only_root(root.into())),
         }
     }
 
@@ -5413,11 +5436,13 @@ impl ExternalProviderProfile {
             Self::Claude(profile) => Self::Claude(profile.with_visible_read_only_file(file.into())),
             Self::Grok(profile) => Self::Grok(profile.with_visible_read_only_file(file.into())),
             Self::Cursor(profile) => Self::Cursor(profile.with_visible_read_only_file(file.into())),
+            Self::Devin(profile) => Self::Devin(profile.with_visible_read_only_file(file.into())),
         }
     }
 
     fn with_visible_read_write_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
+            Self::Devin(_) => unreachable!("Devin cannot receive writable capabilities"),
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_root(root.into())),
             Self::Claude(profile) => {
                 Self::Claude(profile.with_visible_read_write_root(root.into()))
@@ -5431,6 +5456,7 @@ impl ExternalProviderProfile {
 
     fn with_visible_read_write_file(self, file: impl Into<PathBuf>) -> Self {
         match self {
+            Self::Devin(_) => unreachable!("Devin cannot receive writable capabilities"),
             Self::Codex(profile) => Self::Codex(profile.with_visible_read_write_file(file.into())),
             Self::Claude(profile) => {
                 Self::Claude(profile.with_visible_read_write_file(file.into()))
@@ -5449,6 +5475,9 @@ impl ExternalProviderProfile {
         held_file: std::sync::Arc<fs::File>,
     ) -> std::io::Result<Self> {
         match self {
+            Self::Devin(_) => Err(std::io::Error::other(
+                "Devin cannot receive writable file capabilities",
+            )),
             Self::Codex(profile) => profile
                 .with_visible_read_write_file_capability(file.into(), held_file)
                 .map(Self::Codex),
@@ -5470,6 +5499,7 @@ impl ExternalProviderProfile {
             Self::Claude(profile) => Self::Claude(profile.with_writable_artifact_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile),
             Self::Cursor(profile) => Self::Cursor(profile),
+            Self::Devin(profile) => Self::Devin(profile),
         }
     }
 
@@ -5479,6 +5509,7 @@ impl ExternalProviderProfile {
             Self::Claude(profile) => Self::Claude(profile.with_hidden_root(root.into())),
             Self::Grok(profile) => Self::Grok(profile.with_hidden_root(root.into())),
             Self::Cursor(profile) => Self::Cursor(profile.with_hidden_root(root.into())),
+            Self::Devin(profile) => Self::Devin(profile.with_hidden_root(root.into())),
         }
     }
 
@@ -5488,6 +5519,7 @@ impl ExternalProviderProfile {
             Self::Claude(profile) => SideEffectConfinementProfile::ExternalClaude(profile),
             Self::Grok(profile) => SideEffectConfinementProfile::ExternalGrok(profile),
             Self::Cursor(profile) => SideEffectConfinementProfile::ExternalCursor(profile),
+            Self::Devin(profile) => SideEffectConfinementProfile::ExternalDevin(profile),
         }
     }
 }
@@ -5538,8 +5570,17 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli
-        | ExternalAgentInvocation::DeepSeek => {
+        | ExternalAgentInvocation::DeepSeek
+        | ExternalAgentInvocation::Devin => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
+            if spec.invocation == ExternalAgentInvocation::Devin
+                && (!protected_controls.read_write_roots.is_empty()
+                    || !protected_controls.read_write_files.is_empty()
+                    || !protected_controls.exact_writable_artifact_files.is_empty())
+            {
+                bail!("Devin refuses writable capabilities");
+            }
+
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
             }
@@ -5602,7 +5643,9 @@ fn external_side_effect_profile_with_claude_relay(
             let canonical_workspace = fs::canonicalize(&spec.cwd)?;
             if matches!(
                 spec.invocation,
-                ExternalAgentInvocation::Grok | ExternalAgentInvocation::DeepSeek
+                ExternalAgentInvocation::Grok
+                    | ExternalAgentInvocation::DeepSeek
+                    | ExternalAgentInvocation::Devin
             ) {
                 // ProtectHome hides custom installations. Expose the executable itself,
                 // not adjacent home files, and keep it read-only even inside the workspace.
@@ -5625,6 +5668,11 @@ fn external_side_effect_profile_with_claude_relay(
                 // runner still owns prompt validation; expose only that exact held input to the
                 // contained child instead of its parent directory.
                 profile = profile.with_visible_read_only_file(&spec.prompt);
+            }
+            if spec.invocation == ExternalAgentInvocation::Devin {
+                profile = profile
+                    .with_visible_read_only_file(&spec.prompt)
+                    .with_hidden_root(spec.cwd.join(".devin"));
             }
             if spec.invocation == ExternalAgentInvocation::DeepSeek {
                 profile = profile.with_visible_read_only_file(
@@ -5671,7 +5719,9 @@ fn external_side_effect_profile_with_claude_relay(
             // must never receive the incoming publication directory as a writable root.
             if !matches!(
                 spec.invocation,
-                ExternalAgentInvocation::Grok | ExternalAgentInvocation::Cursor
+                ExternalAgentInvocation::Grok
+                    | ExternalAgentInvocation::Cursor
+                    | ExternalAgentInvocation::Devin
             ) {
                 profile = profile.with_writable_artifact_root(artifact_root);
             }
@@ -6501,9 +6551,7 @@ fn add_credential_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8]) -> Result<(
     if value.len() > MAX_CREDENTIAL_BYTES {
         bail!("credential form exceeds the safe redaction byte bound");
     }
-    if value.len() < MIN_CREDENTIAL_BYTES
-        || patterns.iter().any(|existing| existing == value)
-    {
+    if value.len() < MIN_CREDENTIAL_BYTES || patterns.iter().any(|existing| existing == value) {
         return Ok(());
     }
     let aggregate_bytes = patterns
@@ -6674,7 +6722,8 @@ fn command_argv_with_controls_and_service_tier_input(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli
-        | ExternalAgentInvocation::DeepSeek => runtime_adapter_argv(spec),
+        | ExternalAgentInvocation::DeepSeek
+        | ExternalAgentInvocation::Devin => runtime_adapter_argv(spec),
     }
 }
 
@@ -6715,6 +6764,7 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
             ExternalAgentInvocation::ClaudeCode => RuntimeId::ClaudeCode,
             ExternalAgentInvocation::GeminiCli => RuntimeId::GeminiCli,
             ExternalAgentInvocation::DeepSeek => RuntimeId::DeepSeek,
+            ExternalAgentInvocation::Devin => RuntimeId::Devin,
             _ => RuntimeId::Codex,
         })
     });
@@ -6725,6 +6775,27 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
         cwd: &spec.cwd,
         output: &spec.output_last_message,
     };
+    if spec.invocation == ExternalAgentInvocation::Devin {
+        if spec.workspace_access != WorkspaceAccess::ReadOnly {
+            bail!("Devin requires read-only workspace access");
+        }
+        let reviewed = spec
+            .devin_reviewed_workspace
+            .as_ref()
+            .context("Devin requires explicit reviewed workspace")?;
+        let cwd = fs::canonicalize(&spec.cwd)?;
+        if reviewed != &cwd || fs::canonicalize(reviewed)? != *reviewed {
+            bail!("Devin reviewed workspace must equal the canonical launch repo");
+        }
+        let config_path = spec
+            .devin_config
+            .as_deref()
+            .context("Devin pinned user config missing")?;
+        let launch = crate::runtime_adapter::devin::render(&config, &context, Some(config_path))?;
+        let mut argv: Vec<OsString> = launch.argv.into_iter().map(OsString::from).collect();
+        argv.push("--respect-workspace-trust=false".into());
+        return Ok(argv);
+    }
     if spec.invocation == ExternalAgentInvocation::Grok {
         let mut argv = config.render_grok_os_argv(&context, spec.output_schema.as_deref())?;
         if spec.workspace_access == WorkspaceAccess::ReadOnly

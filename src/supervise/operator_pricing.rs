@@ -198,7 +198,7 @@ fn selected_account(run_id: &str, runtime: SupervisorRuntime) -> Option<String> 
         SupervisorRuntime::GeminiCli => {
             gemini_run_account_binding(run_id).map(|binding| binding.account_id)
         }
-        SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
+        SupervisorRuntime::DeepSeek | SupervisorRuntime::Devin | SupervisorRuntime::Fake => None,
     }
 }
 

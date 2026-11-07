@@ -346,11 +346,12 @@ impl DispatchBudgetReservation<'_> {
         let identity_verified = self.ledger.observe_dispatch_identity(
             self.reservation.id,
             returned,
-            run.authenticated_app_server_evidence().and_then(|e| e.thread_id.clone()),
+            run.authenticated_app_server_evidence()
+                .and_then(|e| e.thread_id.clone()),
             commands.map(|e| e.turn_id.clone()),
         )?;
-        let usage = external_usage_for_runtime(run, command, launch_runtime)
-            .filter(|_| identity_verified);
+        let usage =
+            external_usage_for_runtime(run, command, launch_runtime).filter(|_| identity_verified);
         // One parent-owned allocation feeds both the ledger and every role/lens report.
         // A reroute notice cannot allocate cumulative turn usage between models.
         let model = match launch_runtime {
@@ -630,7 +631,8 @@ fn test_runtime_model_catalog(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => Ok(RuntimeModelCatalog::OperatorDeclared),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Devin => Ok(RuntimeModelCatalog::OperatorDeclared),
     }
 }
 

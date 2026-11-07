@@ -784,7 +784,10 @@ impl PreparedProcessTree {
                                 Err(source) => Err(containment_setup_error(
                                     label.to_string(),
                                     command.to_string(),
-                                    with_phase_diagnostics(source, timings.snapshot(Instant::now())),
+                                    with_phase_diagnostics(
+                                        source,
+                                        timings.snapshot(Instant::now()),
+                                    ),
                                 )),
                             }
                         }
@@ -904,11 +907,13 @@ impl PreparedProcessTree {
             #[cfg(target_os = "linux")]
             PreparedContainmentBackend::Systemd(mut unit) => {
                 unit.launcher_spawned = true;
-                if let Err(source) = unit.confirm_attached_timed(child, operation_deadline, cancellation, timings)
+                if let Err(source) =
+                    unit.confirm_attached_timed(child, operation_deadline, cancellation, timings)
                 {
                     // Only the wrapper's fixed phase/gate diagnostics are safe to expose.
                     // Its underlying source may contain launcher output or FIFO paths.
-                    let cancellation_diagnostics = source.get_ref()
+                    let cancellation_diagnostics = source
+                        .get_ref()
                         .and_then(|source| source.downcast_ref::<PhaseDiagnosticSource>())
                         .map(|source| source.diagnostics.clone())
                         .unwrap_or_else(|| timings.snapshot(Instant::now()));
@@ -919,8 +924,14 @@ impl PreparedProcessTree {
                         ));
                     }
                     let rollback_elapsed = rollback_started.elapsed();
-                    tracing::debug!(elapsed_ms = rollback_elapsed.as_millis(), "systemd attachment rollback verified empty");
-                    let rollback_diagnostics = format!("attachment rollback: elapsed_ms={} completed=true", rollback_elapsed.as_millis());
+                    tracing::debug!(
+                        elapsed_ms = rollback_elapsed.as_millis(),
+                        "systemd attachment rollback verified empty"
+                    );
+                    let rollback_diagnostics = format!(
+                        "attachment rollback: elapsed_ms={} completed=true",
+                        rollback_elapsed.as_millis()
+                    );
                     let source = with_phase_diagnostics(source, rollback_diagnostics.clone());
                     return if cancellation.is_cancelled() {
                         Err(ProcessRunError::Cancelled {
@@ -1345,6 +1356,7 @@ fn prepared_read_only_filesystem(
                 SandboxMountAccess::ReadOnly => 0,
                 SandboxMountAccess::ReadWrite => 1,
                 SandboxMountAccess::PrivateRuntime => 2,
+                SandboxMountAccess::PrivateDevinConfigRoot => 5,
                 SandboxMountAccess::Inaccessible => 3,
                 SandboxMountAccess::IsolatedRoot => 4,
             };
@@ -1425,6 +1437,7 @@ struct SandboxPathIdentity {
 #[cfg(target_os = "linux")]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum SandboxMountAccess {
+    PrivateDevinConfigRoot,
     ReadOnly,
     ReadWrite,
     PrivateRuntime,
@@ -1671,6 +1684,15 @@ impl ResolvedSystemdSandbox {
                     )
                 })?;
             mount_check.path = target;
+        }
+        if self.kind == SideEffectConfinementProfileKind::ExternalDevin {
+            self.mount_checks.push(SandboxMountCheck {
+                path: root.join(".config"),
+                device: 0,
+                inode: 0,
+                access: SandboxMountAccess::PrivateDevinConfigRoot,
+                optional: false,
+            });
         }
         self.mount_checks.push(SandboxMountCheck {
             path: root.to_path_buf(),
@@ -3506,11 +3528,15 @@ fn apply_systemd_sandbox_properties(
         command.arg(
             "--property=SystemCallFilter=~@clock @debug @module @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         );
-    } else if sandbox.kind == SideEffectConfinementProfileKind::ExternalCursor {
+    } else if matches!(
+        sandbox.kind,
+        SideEffectConfinementProfileKind::ExternalCursor
+            | SideEffectConfinementProfileKind::ExternalDevin
+    ) {
         command.args([
             "--property=PrivateNetwork=no",
-            // Managed Cursor uses local Unix streams during initialization and retains the
-            // namespace and mount restrictions.
+            // Direct provider clients use local Unix streams while retaining
+            // namespace and mount restrictions. Evidence keeps the selected kind.
             "--property=RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
@@ -3520,6 +3546,16 @@ fn apply_systemd_sandbox_properties(
             "--property=RestrictAddressFamilies=AF_INET AF_INET6",
             "--property=SystemCallFilter=~@clock @debug @module @mount @obsolete @raw-io @reboot @swap bpf fanotify_init fanotify_mark ipc mq_getsetattr mq_notify mq_open mq_timedreceive mq_timedreceive_time64 mq_timedsend mq_timedsend_time64 mq_unlink msgctl msgget msgrcv msgsnd open_by_handle_at process_madvise process_vm_readv process_vm_writev quotactl quotactl_fd semctl semget semop semtimedop semtimedop_time64 shmat shmctl shmdt shmget link linkat mknod mknodat",
         ]);
+    }
+
+    if sandbox.kind == SideEffectConfinementProfileKind::ExternalDevin {
+        // A file bind alone allows renaming its writable parent and recreating the
+        // default config path. Mount the config ancestor read-only as well.
+        command.arg(systemd_path_property(
+            "ReadOnlyPaths=",
+            &runtime_dir.join(".config"),
+            false,
+        ));
     }
 
     let limits = sandbox.resource_limits;
@@ -3645,12 +3681,49 @@ fn apply_systemd_sandbox_properties(
 }
 
 #[cfg(target_os = "linux")]
+fn verify_devin_runtime_directory_properties(
+    properties: &BTreeMap<String, String>,
+    runtime_dir: &Path,
+) -> std::io::Result<()> {
+    let expected = systemd_runtime_directory_names(
+        runtime_dir,
+        SideEffectConfinementProfileKind::ExternalDevin,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    let actual = parse_systemd_string_array_property(
+        "RuntimeDirectory",
+        property_value(properties, "RuntimeDirectory")?,
+    )?
+    .into_iter()
+    .collect::<BTreeSet<_>>();
+    if actual != expected {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            format!(
+                "effective RuntimeDirectory differed from the exact Devin private directory set: expected {expected:?}, observed {actual:?}"
+            ),
+        ));
+    }
+    for (name, expected) in [
+        ("RuntimeDirectoryMode", "0700"),
+        ("RuntimeDirectoryPreserve", "no"),
+    ] {
+        require_effective_property(properties, name, |value| value == expected, expected)?;
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
 fn verify_systemd_sandbox_properties(
     sandbox: &ResolvedSystemdSandbox,
     properties: &BTreeMap<String, String>,
     runtime_dir: &Path,
     isolated_root: Option<&Path>,
 ) -> std::io::Result<()> {
+    if sandbox.kind == SideEffectConfinementProfileKind::ExternalDevin {
+        verify_devin_runtime_directory_properties(properties, runtime_dir)?;
+    }
     for (name, expected) in [
         ("ProtectHome", "tmpfs"),
         ("NoNewPrivileges", "yes"),
@@ -3804,6 +3877,13 @@ fn verify_systemd_sandbox_properties(
             &binding.target,
         )?;
     }
+    if sandbox.kind == SideEffectConfinementProfileKind::ExternalDevin {
+        require_property_path(
+            "ReadOnlyPaths",
+            property_value(properties, "ReadOnlyPaths")?,
+            &runtime_dir.join(".config"),
+        )?;
+    }
     for file in &sandbox.visible_read_only_files {
         let target = sandbox
             .projected_external_managed_file_target(file, runtime_dir)
@@ -3867,6 +3947,7 @@ fn verify_exact_systemd_path_properties(
             | SideEffectConfinementProfileKind::ExternalClaude
             | SideEffectConfinementProfileKind::ExternalGrok
             | SideEffectConfinementProfileKind::ExternalCursor
+            | SideEffectConfinementProfileKind::ExternalDevin
     ) && !sandbox.isolated_host_view
     {
         return Ok(());
@@ -3902,6 +3983,10 @@ fn verify_exact_systemd_path_properties(
             .map(|binding| binding.target.clone()),
     );
     read_only.extend(sandbox.exact_writable_file_parents());
+    if sandbox.kind == SideEffectConfinementProfileKind::ExternalDevin {
+        read_only.insert(runtime_dir.join(".config"));
+    }
+
     let mut read_only_bindings = sandbox
         .visible_read_only_roots
         .iter()
@@ -4137,7 +4222,8 @@ fn verify_systemd_network_properties(
         }
         SideEffectConfinementProfileKind::ExternalClaude => BTreeSet::from(["AF_UNIX", "AF_INET"]),
         SideEffectConfinementProfileKind::ExternalGrok
-        | SideEffectConfinementProfileKind::ExternalCursor => {
+        | SideEffectConfinementProfileKind::ExternalCursor
+        | SideEffectConfinementProfileKind::ExternalDevin => {
             BTreeSet::from(["AF_UNIX", "AF_INET", "AF_INET6"])
         }
         SideEffectConfinementProfileKind::TrustedFixedNetwork
@@ -4300,6 +4386,18 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
                     ));
                 }
                 (runtime.dev(), runtime.ino())
+            } else if check.access == SandboxMountAccess::PrivateDevinConfigRoot {
+                let config = fs::symlink_metadata(&check.path)?;
+                if !config.is_dir()
+                    || config.file_type().is_symlink()
+                    || config.uid() != effective_uid
+                    || config.mode() & 0o022 != 0
+                {
+                    return Err(std::io::Error::other(
+                        "Devin config root identity or permissions unsafe",
+                    ));
+                }
+                (config.dev(), config.ino())
             } else {
                 (check.device, check.inode)
             };
@@ -4316,7 +4414,7 @@ fn verify_sandbox_mount_report(path: &Path, checks: &[SandboxMountCheck]) -> std
         }
         let options = fields[3].split(',').collect::<Vec<_>>();
         let expected = match check.access {
-            SandboxMountAccess::ReadOnly => "ro",
+            SandboxMountAccess::ReadOnly | SandboxMountAccess::PrivateDevinConfigRoot => "ro",
             SandboxMountAccess::ReadWrite => "rw",
             SandboxMountAccess::PrivateRuntime => "rw",
             SandboxMountAccess::Inaccessible => continue,

@@ -51,6 +51,8 @@ serde = { version = "1", features = ["derive"] }
 serde_json = { version = "1", features = ["raw_value"] }
 syn = { version = "3", features = ["full", "extra-traits"] }
 tempfile = "3"
+# Parse native Devin credentials without ad hoc TOML/token parsing.
+toml = "0.8"
 thiserror = "2"
 tokio = { version = "1", features = ["macros", "rt-multi-thread", "sync"] }
 tracing = "0.1"

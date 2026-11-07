@@ -4211,7 +4211,7 @@ fn cam_provider_id_for_supervisor_runtime(runtime: SupervisorRuntime) -> Option<
         SupervisorRuntime::GeminiCli => Some("gemini-cli"),
         SupervisorRuntime::ClaudeCode => Some("claude-code"),
         SupervisorRuntime::Cursor => Some("cursor"),
-        SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
+        SupervisorRuntime::DeepSeek | SupervisorRuntime::Devin | SupervisorRuntime::Fake => None,
     }
 }
 

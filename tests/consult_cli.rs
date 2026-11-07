@@ -10,6 +10,80 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
+#[cfg(target_os = "linux")]
+#[test]
+fn devin_consult_missing_or_malformed_native_credentials_refuses_before_fixture_spawn() -> Result<()>
+{
+    use std::os::unix::fs::PermissionsExt;
+    let temp = TempDir::new()?;
+    let repo = fs::canonicalize(create_committed_repo(temp.path())?)?;
+    let home = temp.path().join("synthetic-home");
+    fs::create_dir(&home)?;
+    let marker = temp.path().join("fixture-started");
+    let program = temp.path().join("devin");
+    fs::write(
+        &program,
+        format!("#!/bin/sh\ntouch '{}'\nexit 0\n", marker.display()),
+    )?;
+    fs::set_permissions(&program, fs::Permissions::from_mode(0o700))?;
+    for (run_id, malformed) in [
+        ("devin-missing-credentials", false),
+        ("devin-malformed-credentials", true),
+    ] {
+        if malformed {
+            let native = home.join(".local/share/devin");
+            fs::create_dir_all(&native)?;
+            fs::write(
+                native.join("credentials.toml"),
+                "token = 'synthetic-invalid-secret\n",
+            )?;
+            fs::set_permissions(
+                native.join("credentials.toml"),
+                fs::Permissions::from_mode(0o600),
+            )?;
+        }
+        let output = Command::new(BIN)
+            .env("HOME", &home)
+            .env_remove("XDG_DATA_HOME")
+            .args([
+                "consult",
+                "ask",
+                "--runtime",
+                "devin",
+                "--repo",
+                path_str(&repo)?,
+                "--consultant-bin",
+                path_str(&program)?,
+                "--model",
+                "provider/exact-model-v1",
+                "--reviewed-workspace",
+                path_str(&repo)?,
+                "--run-id",
+                run_id,
+                "--question",
+                "Explain the source",
+                "--json",
+            ])
+            .output()?;
+        assert!(!output.status.success());
+        let report: Value = serde_json::from_slice(&output.stdout)?;
+        assert_eq!(report["runtime"], "devin");
+        assert_eq!(report["success"], false);
+        assert!(report["exit_info"]["error"]
+            .as_str()
+            .context("preflight error")?
+            .contains("Devin preflight refused"));
+        assert!(!marker.exists());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains("synthetic-invalid-secret"));
+    }
+    Ok(())
+}
+
 #[test]
 fn consult_ask_fake_runtime_writes_report_and_artifacts() -> Result<()> {
     let temp = TempDir::new().context("tempdir")?;
