@@ -308,6 +308,70 @@ jobs:
         if: matrix.shard == 'rest'
         run: bash .github/scripts/configure-github-hosted-root-libtest-userns.sh
 
+      - name: Observe exact Devin regression bodies
+        if: ${{ success() && matrix.shard == 'rest' }}
+        run: |
+          /usr/bin/python3 - <<'PYTHON'
+          import json
+          import re
+          import subprocess
+          import sys
+
+          cases = (
+              "consult::tests::devin_consult_command_passes_shared_protected_control_preparation",
+              "consult::tests::devin_consult_unknown_quiescence_retains_private_capture",
+              "process_runner::tests::devin_contained_fixture_enforces_private_config_auth_and_workspace",
+          )
+          records = []
+          for name in cases:
+              command = [
+                  "bash", ".github/scripts/run-linux-all-tests-in-delegated-user-scope.sh",
+                  "cargo", "+1.94.1", "test", "--locked",
+                  "-p", "multi-agent-coding-orchestrator", "--lib", name,
+                  "--", "--exact", "--nocapture", "--color", "never",
+              ]
+              stdout, stderr, returncode, launch_error = b"", b"", None, None
+              try:
+                  result = subprocess.run(command, stdin=subprocess.DEVNULL, capture_output=True)
+                  stdout, stderr, returncode = result.stdout, result.stderr, result.returncode
+              except OSError as error:
+                  launch_error = str(error)
+              for stream, output, label in (
+                  (sys.stdout, stdout, "stdout"), (sys.stderr, stderr, "stderr"),
+              ):
+                  print(f"=== {name} {label} ({len(output)} bytes) ===", file=stream, flush=True)
+                  stream.buffer.write(output)
+                  stream.buffer.flush()
+                  print(f"\n=== end {label} ===", file=stream, flush=True)
+              output = stdout + b"\n" + stderr
+              bodies = re.findall(rb"^test (?!result:)(.+?) \.\.\. (.+)$", output, re.MULTILINE)
+              summaries = re.findall(rb"^test result:.*$", output, re.MULTILINE)
+              summary = re.fullmatch(
+                  rb"test result: (ok|FAILED)\. (\d+) passed; (\d+) failed; "
+                  rb"(\d+) ignored; (\d+) measured; \d+ filtered out; finished in [0-9.]+s",
+                  summaries[0],
+              ) if len(summaries) == 1 else None
+              counts = tuple(map(int, summary.groups()[1:])) if summary else None
+              named_once = len(bodies) == 1 and bodies[0][0] == name.encode() and bodies[0][1] in (b"ok", b"FAILED")
+              unproven = {"stdout": stdout.count(b"UNPROVEN"), "stderr": stderr.count(b"UNPROVEN")}
+              outcome, observation = "UNPROVEN", "unobserved_or_invalid_output"
+              if named_once and summary and not any(unproven.values()) and launch_error is None:
+                  if bodies[0][1] == b"ok" and summary[1] == b"ok" and counts == (1, 0, 0, 0) and returncode == 0:
+                      outcome, observation = "PASS", "named_body_pass"
+                  elif bodies[0][1] == b"FAILED" and summary[1] == b"FAILED" and counts == (0, 1, 0, 0) and returncode == 101:
+                      outcome, observation = "FAIL", "named_body_failure"
+              record = {
+                  "name": name, "returncode": returncode, "launch_error": launch_error,
+                  "body_records": len(bodies), "observed_one_named_body": named_once,
+                  "summary_records": len(summaries), "summary_counts": counts,
+                  "unproven": unproven, "outcome": outcome, "observation": observation,
+              }
+              records.append(record)
+              print(json.dumps(record, sort_keys=True), flush=True)
+          print(json.dumps({"devin_regression_observations": records}, sort_keys=True), flush=True)
+          raise SystemExit(0 if all(record["outcome"] == "PASS" for record in records) else 1)
+          PYTHON
+
       - name: Verify sealed native entry regressions before managed runtime checks
         if: matrix.shard == 'rest'
         run: |
