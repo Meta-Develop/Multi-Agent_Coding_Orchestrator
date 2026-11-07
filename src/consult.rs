@@ -619,9 +619,14 @@ where
         runtime_adapter::{RuntimeAdapterConfig, RuntimeId},
     };
     let (incoming, capture) = create_external_scratches(writer)?;
-    let mut report_scratch = tempfile::Builder::new()
-        .prefix("maco-devin-consult-output-")
-        .tempdir()?;
+    let mut report_builder = tempfile::Builder::new();
+    report_builder.prefix("maco-devin-consult-output-");
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        report_builder.permissions(std::fs::Permissions::from_mode(0o700));
+    }
+    let mut report_scratch = report_builder.tempdir()?;
     let report_root = crate::secure_output::SecureOutputRoot::open_private(report_scratch.path())?;
     report_root.reject_inside(repo)?;
     let command = ExternalAgentCommand::codex(
