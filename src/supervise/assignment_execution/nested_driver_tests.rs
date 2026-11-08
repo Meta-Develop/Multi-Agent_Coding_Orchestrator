@@ -569,7 +569,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             plan_metadata.clone(),
             &temp,
             policy,
-            crate::selection::ReasoningEffort::High,
+            crate::supervise::ReasoningEffort::High,
         )?;
         let admission = SupervisorAdmissionPolicyInput::resolve(
             &repo,

@@ -26,7 +26,7 @@ fn artifact_hashes(
 /// the candidate. Its deliberately rejected first report is a gate input, not
 /// evidence that the compiler failed. Independent reviewer execution still
 /// needs the separate read-only review-packet peer (not supplied by this fixture).
-pub(super) fn exercise(
+pub(in super::super) fn exercise(
     case: &str,
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
@@ -239,16 +239,28 @@ pub(super) fn exercise(
         return Ok(());
     }
     if case == "correction-native-lane" {
-        assert!(authority
+        // Native execution is Verified Codex, not a separate RuntimeId. A
+        // deterministic Fake lane must not replace this live native predecessor.
+        assert_eq!(
+            context.execution_runtime,
+            SupervisorExecutionRuntime::Verified
+        );
+        assert_eq!(authority.predecessor.runtime, SupervisorRuntime::Codex);
+        let denial = authority
             .admit(
                 context,
                 preflight,
                 outcome,
                 3,
-                SupervisorRuntime::Native,
-                &context.budget_policy
+                SupervisorRuntime::Fake,
+                &context.budget_policy,
             )
-            .is_err());
+            .err()
+            .context("native correction accepted a Fake runtime substitution")?;
+        assert_eq!(
+            denial.to_string(),
+            "managed correction cannot replay admission or change its parent runtime"
+        );
         assert_eq!(calls.lock().unwrap().len(), 4);
         return Ok(());
     }
