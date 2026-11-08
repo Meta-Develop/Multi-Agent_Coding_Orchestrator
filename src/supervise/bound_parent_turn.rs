@@ -1087,74 +1087,6 @@ fn mutate_candidate_at_handoff(before: bool, worktree: &Path) -> Result<()> {
     })
 }
 
-#[cfg(test)]
-mod isolated_request_tests {
-    use super::*;
-    use crate::supervise::messaging_bridge::worker_requests::WorkerRequestRecord;
-
-    fn fixture() -> (OrchestratorAssignment, Vec<WorkerRequestRecord>) {
-        let parent = serde_json::from_value(json!({
-            "id":"parent", "phase":"execution", "role":"child_orchestrator",
-            "assigned_paths":["src"], "worker_assignments":[
-                {"id":"first", "assigned_paths":["src/a.rs"]},
-                {"id":"second", "assigned_paths":["src/b.rs"]}
-            ]
-        }))
-        .unwrap();
-        let requests = ["first", "second"]
-            .into_iter()
-            .enumerate()
-            .map(|(index, worker)| WorkerRequestRecord {
-                request_id: format!("request-{}", index + 1),
-                worker_id: worker.into(),
-                status: WorkerRequestStatus::Queued,
-            })
-            .collect();
-        (parent, requests)
-    }
-
-    #[test]
-    fn isolated_request_scope_accepts_exact_ordered_disjoint_workers() {
-        let (parent, requests) = fixture();
-        validate_isolated_request_set(&parent, &requests).unwrap();
-    }
-
-    #[test]
-    fn isolated_request_scope_refuses_missing_duplicate_foreign_reordered_or_spent_requests() {
-        let (parent, requests) = fixture();
-        assert!(validate_isolated_request_set(&parent, &requests[..1]).is_err());
-        let mut duplicate = requests.clone();
-        duplicate[1] = duplicate[0].clone();
-        assert!(validate_isolated_request_set(&parent, &duplicate).is_err());
-        let mut foreign = requests.clone();
-        foreign[0].worker_id = "foreign".into();
-        assert!(validate_isolated_request_set(&parent, &foreign).is_err());
-        let mut reordered = requests.clone();
-        reordered.reverse();
-        assert!(validate_isolated_request_set(&parent, &reordered).is_err());
-        let mut spent = requests;
-        spent[0].status = WorkerRequestStatus::Completed;
-        assert!(validate_isolated_request_set(&parent, &spent).is_err());
-    }
-
-    #[test]
-    fn isolated_request_scope_refuses_overlap_escape_noncanonical_or_delegating_workers() {
-        let (parent, requests) = fixture();
-        let mut overlap = parent.clone();
-        overlap.worker_assignments[1].assigned_paths = vec!["src/a.rs".into()];
-        assert!(validate_isolated_request_set(&overlap, &requests).is_err());
-        let mut escape = parent.clone();
-        escape.worker_assignments[1].assigned_paths = vec!["other/b.rs".into()];
-        assert!(validate_isolated_request_set(&escape, &requests).is_err());
-        let mut noncanonical = parent.clone();
-        noncanonical.worker_assignments[1].assigned_paths = vec!["src/../other/b.rs".into()];
-        assert!(validate_isolated_request_set(&noncanonical, &requests).is_err());
-        let mut delegating = parent;
-        delegating.worker_assignments[1].role = AgentRole::ChildOrchestrator;
-        assert!(validate_isolated_request_set(&delegating, &requests).is_err());
-    }
-}
-
 /// A once-only post-review handoff, retaining every original live capture and
 /// independent lease. Retired claims cannot authorize another Worker launch.
 pub(super) struct DeferredIsolatedIntegration {
@@ -1234,5 +1166,73 @@ impl Drop for DeferredIsolatedIntegration {
                 std::mem::forget(workers);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod isolated_request_tests {
+    use super::*;
+    use crate::supervise::messaging_bridge::worker_requests::WorkerRequestRecord;
+
+    fn fixture() -> (OrchestratorAssignment, Vec<WorkerRequestRecord>) {
+        let parent = serde_json::from_value(json!({
+            "id":"parent", "phase":"execution", "role":"child_orchestrator",
+            "assigned_paths":["src"], "worker_assignments":[
+                {"id":"first", "assigned_paths":["src/a.rs"]},
+                {"id":"second", "assigned_paths":["src/b.rs"]}
+            ]
+        }))
+        .unwrap();
+        let requests = ["first", "second"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, worker)| WorkerRequestRecord {
+                request_id: format!("request-{}", index + 1),
+                worker_id: worker.into(),
+                status: WorkerRequestStatus::Queued,
+            })
+            .collect();
+        (parent, requests)
+    }
+
+    #[test]
+    fn isolated_request_scope_accepts_exact_ordered_disjoint_workers() {
+        let (parent, requests) = fixture();
+        validate_isolated_request_set(&parent, &requests).unwrap();
+    }
+
+    #[test]
+    fn isolated_request_scope_refuses_missing_duplicate_foreign_reordered_or_spent_requests() {
+        let (parent, requests) = fixture();
+        assert!(validate_isolated_request_set(&parent, &requests[..1]).is_err());
+        let mut duplicate = requests.clone();
+        duplicate[1] = duplicate[0].clone();
+        assert!(validate_isolated_request_set(&parent, &duplicate).is_err());
+        let mut foreign = requests.clone();
+        foreign[0].worker_id = "foreign".into();
+        assert!(validate_isolated_request_set(&parent, &foreign).is_err());
+        let mut reordered = requests.clone();
+        reordered.reverse();
+        assert!(validate_isolated_request_set(&parent, &reordered).is_err());
+        let mut spent = requests;
+        spent[0].status = WorkerRequestStatus::Completed;
+        assert!(validate_isolated_request_set(&parent, &spent).is_err());
+    }
+
+    #[test]
+    fn isolated_request_scope_refuses_overlap_escape_noncanonical_or_delegating_workers() {
+        let (parent, requests) = fixture();
+        let mut overlap = parent.clone();
+        overlap.worker_assignments[1].assigned_paths = vec!["src/a.rs".into()];
+        assert!(validate_isolated_request_set(&overlap, &requests).is_err());
+        let mut escape = parent.clone();
+        escape.worker_assignments[1].assigned_paths = vec!["other/b.rs".into()];
+        assert!(validate_isolated_request_set(&escape, &requests).is_err());
+        let mut noncanonical = parent.clone();
+        noncanonical.worker_assignments[1].assigned_paths = vec!["src/../other/b.rs".into()];
+        assert!(validate_isolated_request_set(&noncanonical, &requests).is_err());
+        let mut delegating = parent;
+        delegating.worker_assignments[1].role = AgentRole::ChildOrchestrator;
+        assert!(validate_isolated_request_set(&delegating, &requests).is_err());
     }
 }

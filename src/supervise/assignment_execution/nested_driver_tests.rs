@@ -1797,6 +1797,23 @@ fn prepare_and_collect_fixture_parent<'a>(
             result?;
             return Ok(None);
         }
+        // Correction owns both cycle captures. Enter it directly so the large
+        // general controller/process fixture frames do not stay on its stack.
+        #[cfg(target_os = "linux")]
+        if let Some(correction_case) = case
+            .strip_prefix("managed-cycle-process-")
+            .filter(|case| case.starts_with("correction-"))
+        {
+            super::managed_parent_correction::tests::exercise(
+                correction_case,
+                context,
+                preflight,
+                outcome,
+                prepared,
+                calls,
+            )?;
+            return Ok(None);
+        }
         super::managed_parent_controller_tests::exercise(
             case,
             context,

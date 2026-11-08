@@ -25,7 +25,6 @@ pub(super) fn defers_materialization(context: &AssignmentExecutionContext<'_, '_
 /// The old report stays failed; only a later gate can spend a fresh-cycle permit.
 /// Observation/append failures, unknown command outcomes and safety refusals do
 /// not provide a collected predecessor for correction.
-
 pub(super) fn require_worker_custody(
     worker: &WorkerReport,
     journal: &WorkerExecutionJournalEvidence,

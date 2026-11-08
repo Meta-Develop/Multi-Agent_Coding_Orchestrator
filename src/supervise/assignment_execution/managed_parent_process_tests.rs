@@ -125,11 +125,7 @@ pub(super) fn run(
             parent.commands_run.clear();
             parent.validation_results.clear();
             parent.findings.clear();
-            if parent
-                .worker_reports
-                .iter()
-                .any(|worker| report_failed(worker))
-            {
+            if parent.worker_reports.iter().any(report_failed) {
                 parent.status = ReviewStatus::Failed;
                 parent.accepted = false;
                 parent.rejected = true;
