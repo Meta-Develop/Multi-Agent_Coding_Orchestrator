@@ -531,6 +531,27 @@ fn insert_admitted_grok_home_environment(
 
 fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, key: &str) -> bool {
     match invocation {
+        ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant => {
+            // Codex's include_only matches case-insensitively. Reserve every
+            // admitted shell input for the private runtime/trusted Git producer,
+            // including case aliases that could otherwise coexist on Unix.
+            let key = key.to_ascii_uppercase();
+            !matches!(
+                key.as_str(),
+                "HOME"
+                    | "TMPDIR"
+                    | "PATH"
+                    | "GIT_ALTERNATE_OBJECT_DIRECTORIES"
+                    | "GIT_CONFIG_COUNT"
+                    | "GIT_CONFIG_GLOBAL"
+                    | "GIT_CONFIG_NOSYSTEM"
+                    | "GIT_DIR"
+                    | "GIT_OBJECT_DIRECTORY"
+                    | "GIT_TERMINAL_PROMPT"
+                    | "GIT_WORK_TREE"
+            ) && !key.starts_with("GIT_CONFIG_KEY_")
+                && !key.starts_with("GIT_CONFIG_VALUE_")
+        }
         ExternalAgentInvocation::Grok => !matches!(key, "HOME" | "GROK_HOME"),
         ExternalAgentInvocation::ClaudeCode => !matches!(
             key,
@@ -4571,11 +4592,11 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
         .context("repository has no worktree for static condition preflight")?;
     let workdir = fs::canonicalize(workdir)
         .context("repository worktree could not be resolved for static condition preflight")?;
-    let common_dir = fs::canonicalize(repository.commondir())
-        .context("repository common directory could not be resolved for static condition preflight")?;
-    let worktree_git_dir = fs::canonicalize(repository.path()).context(
-        "repository Git directory could not be resolved for static condition preflight",
+    let common_dir = fs::canonicalize(repository.commondir()).context(
+        "repository common directory could not be resolved for static condition preflight",
     )?;
+    let worktree_git_dir = fs::canonicalize(repository.path())
+        .context("repository Git directory could not be resolved for static condition preflight")?;
 
     let mut identity: Option<(String, Vec<PathBuf>)> = None;
     let mut hooks_messages = Vec::new();
@@ -4691,7 +4712,11 @@ fn unix_static_repository_conditions(repo: &Path) -> Result<Vec<StaticRepository
     }
 
     let stale = if let Some(expected_config) = expected_config.as_deref() {
-        scan_stale_retained_private_git_configs(&common_dir, expected_config, MAX_RETAINED_WORKTREES)?
+        scan_stale_retained_private_git_configs(
+            &common_dir,
+            expected_config,
+            MAX_RETAINED_WORKTREES,
+        )?
     } else {
         None
     };
@@ -4766,7 +4791,8 @@ fn scan_stale_retained_private_git_configs(
             paths: vec![worktrees],
         }));
     }
-    let entries = fs::read_dir(&worktrees).context("failed to inspect retained managed child worktrees")?;
+    let entries =
+        fs::read_dir(&worktrees).context("failed to inspect retained managed child worktrees")?;
     let mut messages = Vec::new();
     let mut paths = Vec::new();
     let mut policy_changed = false;
@@ -6827,9 +6853,7 @@ fn add_credential_pattern(patterns: &mut Vec<Vec<u8>>, value: &[u8]) -> Result<(
     if value.len() > MAX_CREDENTIAL_BYTES {
         bail!("credential form exceeds the safe redaction byte bound");
     }
-    if value.len() < MIN_CREDENTIAL_BYTES
-        || patterns.iter().any(|existing| existing == value)
-    {
+    if value.len() < MIN_CREDENTIAL_BYTES || patterns.iter().any(|existing| existing == value) {
         return Ok(());
     }
     let aggregate_bytes = patterns
@@ -7215,7 +7239,7 @@ fn codex_hardened_argv_with_service_tier(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"core\""),
+        OsString::from("shell_environment_policy.inherit=\"all\""),
         OsString::from("-c"),
         OsString::from("shell_environment_policy.ignore_default_excludes=false"),
         OsString::from("-c"),
@@ -7223,6 +7247,7 @@ fn codex_hardened_argv_with_service_tier(
         OsString::from("-c"),
         OsString::from("web_search=\"disabled\""),
     ]);
+    argv.extend(codex_managed_git_shell_key_overrides(controls));
     for feature in [
         "apps",
         "plugins",
@@ -7289,7 +7314,7 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
-        OsString::from("shell_environment_policy.inherit=\"core\""),
+        OsString::from("shell_environment_policy.inherit=\"all\""),
         OsString::from("-c"),
         OsString::from("shell_environment_policy.ignore_default_excludes=false"),
         OsString::from("-c"),
@@ -7301,6 +7326,7 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from("project_doc_max_bytes=0"),
     ];
+    argv.extend(codex_managed_git_shell_key_overrides(controls));
     for feature in [
         "apps",
         "plugins",
@@ -7341,8 +7367,13 @@ fn codex_app_server_argv(
     argv
 }
 
+// Both Codex entrypoints run through with_external_runtime_context: ClearAndSet
+// plus the runner's private runtime HOME/TMPDIR and trusted PATH. Inherit "all"
+// from that sanitized process so managed Git inputs survive Codex's core filter;
+// this exact final allowlist still withholds credentials, CODEX_HOME and arbitrary
+// launch variables. No ambient host HOME or TMPDIR is forwarded.
 fn codex_shell_environment_include_only(controls: &ProtectedWorktreeControls) -> String {
-    let mut keys = vec!["PATH".to_string()];
+    let mut keys = vec!["HOME".to_string(), "PATH".to_string(), "TMPDIR".to_string()];
     if let Some(git) = &controls.managed_git {
         keys.extend(
             [
@@ -7373,6 +7404,30 @@ fn codex_shell_environment_include_only(controls: &ProtectedWorktreeControls) ->
             .collect::<Vec<_>>()
             .join(",")
     )
+}
+
+// Codex applies its default *KEY*/*SECRET*/*TOKEN* excludes before explicit set.
+// Restore only MACO's fixed Git config names, never values from the process
+// environment. Config values and paths still come from the sanitized launcher.
+fn codex_managed_git_shell_key_overrides(controls: &ProtectedWorktreeControls) -> Vec<OsString> {
+    let Some(git) = &controls.managed_git else {
+        return Vec::new();
+    };
+    let keys = git
+        .active_commit_hook
+        .as_ref()
+        .map(|_| "core.hooksPath")
+        .into_iter()
+        .chain(["gc.auto", "maintenance.auto"]);
+    let overrides = keys
+        .enumerate()
+        .map(|(index, key)| format!("GIT_CONFIG_KEY_{index}={}", toml_basic_string(key)))
+        .collect::<Vec<_>>()
+        .join(",");
+    vec![
+        OsString::from("-c"),
+        OsString::from(format!("shell_environment_policy.set={{{overrides}}}")),
+    ]
 }
 
 fn codex_filesystem_permissions(
@@ -8457,7 +8512,7 @@ mod nixos_identity_regression_tests {
     }
 
     #[test]
-    fn codex_exec_and_app_server_argv_use_exact_path_only_legacy_shell_policy() {
+    fn codex_exec_and_app_server_argv_use_exact_private_runtime_shell_policy() {
         let command = ExternalAgentCommand::codex(
             "codex",
             "/workspace",
@@ -8469,21 +8524,29 @@ mod nixos_identity_regression_tests {
         let controls = ProtectedWorktreeControls::default();
         let expected = vec![
             OsString::from("-c"),
-            OsString::from("shell_environment_policy.inherit=\"core\""),
+            OsString::from("shell_environment_policy.inherit=\"all\""),
             OsString::from("-c"),
             OsString::from("shell_environment_policy.ignore_default_excludes=false"),
             OsString::from("-c"),
-            OsString::from("shell_environment_policy.include_only=[\"PATH\"]"),
+            OsString::from("shell_environment_policy.include_only=[\"HOME\",\"PATH\",\"TMPDIR\"]"),
         ];
 
+        let read_only = command
+            .clone()
+            .with_workspace_access(WorkspaceAccess::ReadOnly);
         for (label, argv) in [
             ("exec", codex_hardened_argv(&command, &controls)),
             ("app-server", codex_app_server_argv(&command, &controls)),
+            ("read-only exec", codex_hardened_argv(&read_only, &controls)),
+            (
+                "read-only app-server",
+                codex_app_server_argv(&read_only, &controls),
+            ),
         ] {
             let inherit_index = argv
                 .iter()
-                .position(|argument| argument == "shell_environment_policy.inherit=\"core\"")
-                .expect("path-only shell policy inherit override");
+                .position(|argument| argument == "shell_environment_policy.inherit=\"all\"")
+                .expect("private runtime shell policy inherit override");
             let policy_start = inherit_index
                 .checked_sub(1)
                 .expect("shell policy inherit override must follow -c");
@@ -8508,6 +8571,33 @@ mod nixos_identity_regression_tests {
                     .to_string_lossy()
                     .starts_with("shell_environment_policy.set=")
             }));
+            let include_only = argv
+                .iter()
+                .find_map(|argument| {
+                    argument
+                        .to_str()?
+                        .strip_prefix("shell_environment_policy.include_only=")
+                })
+                .expect("exact shell environment allowlist");
+            let included: Vec<String> = serde_json::from_str(include_only).expect("literal names");
+            for forbidden in [
+                "CODEX_HOME",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+                "CODEX_ACCESS_TOKEN",
+                "AWS_SECRET_ACCESS_KEY",
+                "SSH_AUTH_SOCK",
+                "MACO_CAM_AUTHORITY_SOCKET",
+                "NODE_OPTIONS",
+                "ARBITRARY_INPUT",
+                "GIT_CONFIG_KEY_0",
+                "GIT_CONFIG_VALUE_0",
+            ] {
+                assert!(
+                    !included.iter().any(|key| key == forbidden),
+                    "{label}: {forbidden}"
+                );
+            }
         }
     }
 }

@@ -396,7 +396,11 @@ fn consult_custom_codex_is_confined_but_never_publishable() -> Result<()> {
                 "-c",
                 "<redacted:local-path>",
                 "-c",
-                "shell_environment_policy.inherit=\"core\"",
+                "shell_environment_policy.inherit=\"all\"",
+                "-c",
+                "shell_environment_policy.ignore_default_excludes=false",
+                "-c",
+                "shell_environment_policy.include_only=[\"HOME\",\"PATH\",\"TMPDIR\"]",
             ],
         ),
         "unexpected public confinement command: {command:?}"
