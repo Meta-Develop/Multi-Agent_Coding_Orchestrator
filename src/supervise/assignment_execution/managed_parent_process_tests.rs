@@ -14,12 +14,43 @@ pub(super) fn run(
     let mode;
     let report;
     let mut payload = json!({"case":case});
+    let correction = case.starts_with("correction-");
+    let outer = case.starts_with("outer-");
+    let schema: serde_json::Value = serde_json::from_slice(&fs::read(
+        command
+            .output_schema
+            .as_ref()
+            .context("contained fixture schema")?,
+    )?)?;
+    let bound_number = |field: &str| {
+        schema
+            .pointer(&format!("/properties/{field}/const"))
+            .or_else(|| schema.pointer(&format!("/properties/{field}/enum/0")))
+            .and_then(serde_json::Value::as_u64)
+    };
+    let source_attempt = if identity.task_id == "parent" {
+        bound_number("source_parent_attempt")
+            .or_else(|| bound_number("parent_attempt"))
+            .unwrap()
+    } else {
+        command
+            .prompt
+            .components()
+            .filter_map(|part| {
+                part.as_os_str()
+                    .to_str()
+                    .and_then(|part| part.strip_prefix("attempt-"))
+                    .and_then(|part| part.parse::<u64>().ok())
+            })
+            .next_back()
+            .unwrap_or(1)
+    };
     if identity.task_id != "parent" {
         mode = "worker";
         report = serde_json::from_slice(template.output_last_message().unwrap())?;
         assert_eq!(command.worker_journal_artifacts.len(), 1);
         payload["journal"] = json!(command.worker_journal_artifacts[0].path);
-        if case.starts_with("isolated-") {
+        if case.starts_with("isolated-") || outer {
             payload["journal_head"] = json!(current_head_oid(&command.cwd)?.to_string());
             if let Some(worktree) = journal_worktree {
                 let binding = crate::safe_state::DirectoryBindingGuard::bind(worktree)?;
@@ -33,11 +64,46 @@ pub(super) fn run(
         } else {
             "pub fn second() -> u32 { crate::first() + 2 }\n"
         });
+        if outer {
+            payload["replace"] = json!(true);
+            let first = source_attempt == 1;
+            payload["edit"] = json!(if identity.task_id == "worker" {
+                let value = if first && !case.ends_with("auditor") && !case.ends_with("accepted") {
+                    39
+                } else {
+                    40
+                };
+                format!("pub mod other;\npub fn first() -> u32 {{ {value} }}\n// physical Worker turn {source_attempt}\n")
+            } else if first && case.ends_with("auditor") {
+                // The combined value check passes, but this violates the authored
+                // implementation requirement that second() calls first() + 2.
+                "pub fn second() -> u32 { 42 }\n".to_owned()
+            } else {
+                format!("pub fn second() -> u32 {{ crate::first() + 2 }}\n// physical Worker turn {source_attempt}\n")
+            });
+            payload["validate"] = json!(identity.task_id == "worker");
+            if source_attempt > 1 {
+                assert!(fs::read_to_string(&command.prompt)?
+                    .contains("Supervisor-authorized corrective Worker cycle"));
+            }
+        }
+        if correction && source_attempt > 1 {
+            payload["replace"] = json!(true);
+            payload["edit"] = json!(format!(
+                "{}// fresh correction turn {source_attempt}\n",
+                payload["edit"].as_str().unwrap()
+            ));
+            assert!(fs::read_to_string(&command.prompt)?
+                .contains("Supervisor-authorized corrective Worker cycle"));
+        }
     } else if command.codex_managed_worker_requests_enabled() {
         mode = "initial";
+        if correction || outer {
+            workers.lock().unwrap().clear();
+        }
         assert!(command.worker_journal_artifacts.is_empty());
         report = json!({"version":1,"outcome":"yield_workers","run_id":identity.run_id,
-            "parent_id":"parent","parent_attempt":1,"requests":[
+            "parent_id":"parent","parent_attempt":source_attempt,"requests":[
                 {"request_id":"r1","worker_id":"worker"},
                 {"request_id":"r2","worker_id":"worker-two"}]});
     } else {
@@ -55,6 +121,23 @@ pub(super) fn run(
         parent.remaining_risk = "offline managed process fixture".into();
         parent.audit_reports.clear();
         parent.review_lens_aggregate = None;
+        if outer {
+            parent.commands_run.clear();
+            parent.validation_results.clear();
+            parent.findings.clear();
+            if parent
+                .worker_reports
+                .iter()
+                .any(|worker| report_failed(worker))
+            {
+                parent.status = ReviewStatus::Failed;
+                parent.accepted = false;
+                parent.rejected = true;
+            }
+            payload["allow_failed_validation"] = json!(true);
+            payload["allow_implementation_defect"] =
+                json!(case.ends_with("auditor") && source_attempt == 1);
+        }
         if case.ends_with("rejected-review") {
             parent.accepted = false;
             parent.rejected = true;
@@ -72,7 +155,30 @@ pub(super) fn run(
             )?);
             assert!(!report_failed(&parent));
         }
+        // The fixture process still executes the real read-only combined check.
+        // These deliberately rejected report inputs exercise supervisor gate
+        // routing; they are not claimed as an observed failing compiler command.
+        if correction
+            && source_attempt == 1
+            && case != "correction-auditor"
+            && case != "correction-evidence-only"
+        {
+            parent.status = ReviewStatus::Failed;
+            parent.accepted = false;
+            parent.rejected = true;
+            parent.validation_results.push(ValidationResult {
+                name: "fixture-rejected validation report".into(),
+                status: ReviewStatus::Failed,
+                command: Vec::new(),
+                message: Some(
+                    "Deliberate gate input, independent of the actual combined check".into(),
+                ),
+            });
+        }
         let mut turn = super::parent_continuation_response::final_turn_for_test(command, &parent);
+        if case == "correction-structural" && source_attempt == 1 {
+            turn["report"].as_object_mut().unwrap().remove("status");
+        }
         match case {
             "forged-report" => turn["worker_report_refs"][0]["assignment_id"] = json!("foreign"),
             "isolated-wrong-digest" => {
@@ -102,7 +208,7 @@ pub(super) fn run(
             _ => {}
         }
         report = json!({"version":2,"run_id":identity.run_id,"parent_id":"parent",
-            "source_parent_attempt":1,"parent_attempt":2,"completed_worker_ids":["worker","worker-two"],
+            "source_parent_attempt":source_attempt,"parent_attempt":source_attempt+1,"completed_worker_ids":["worker","worker-two"],
             "turn":turn});
     }
     payload["mode"] = json!(mode);
@@ -182,6 +288,11 @@ pub(super) fn exercise(
     calls: &Mutex<Vec<String>>,
 ) -> Result<()> {
     let case = case.strip_prefix("managed-cycle-process-").unwrap();
+    if case.starts_with("correction-") {
+        return super::managed_parent_correction::tests::exercise(
+            case, context, preflight, outcome, prepared, calls,
+        );
+    }
     // The fixture hand-builds the parent preflight. Mirror the production
     // preflight's pending token so terminal cleanup can detect double releases.
     outcome.claim_tokens.push(preflight.claim.token);
@@ -208,6 +319,7 @@ pub(super) fn exercise(
         &schemas.join("orchestrator-review-report.schema.json"),
         &schemas.join("worker-report.schema.json"),
         &schemas.join("auditor-report.schema.json"),
+        None,
     );
     let observed = calls.lock().unwrap().clone();
     let budget = context.budget_ledger.report()?;

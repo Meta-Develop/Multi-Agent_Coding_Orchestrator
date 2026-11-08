@@ -24,6 +24,7 @@ mod isolated_parent_candidate;
 mod isolated_worker_evidence;
 #[allow(dead_code)]
 mod managed_parent_controller;
+mod managed_parent_correction;
 #[allow(dead_code)]
 pub(super) mod parent_continuation_response;
 mod review_handoff;
@@ -1133,6 +1134,7 @@ impl<'a> AssignmentExecutionPreflight<'a> {
         Ok(NestedTurnExecutionPermit {
             preflight: self,
             parent_attempt,
+            correction_context: None,
         })
     }
 
@@ -1150,6 +1152,7 @@ impl<'a> AssignmentExecutionPreflight<'a> {
 pub(super) struct NestedTurnExecutionPermit<'owner, 'resources> {
     preflight: &'owner AssignmentExecutionPreflight<'resources>,
     parent_attempt: usize,
+    correction_context: Option<String>,
 }
 
 impl NestedTurnExecutionPermit<'_, '_> {
@@ -2646,6 +2649,7 @@ impl<'evidence> ParentContinuationLaunch<'evidence> {
 enum ChildAttemptPurpose<'a, 'e> {
     Ordinary,
     ManagedParentInitial,
+    ManagedParentCorrection(&'a managed_parent_correction::ManagedCorrection),
     ManagedParentContinuation(&'a ParentContinuationLaunch<'e>),
 }
 
@@ -2653,7 +2657,9 @@ impl ChildAttemptPurpose<'_, '_> {
     fn is_managed_parent(&self) -> bool {
         matches!(
             self,
-            Self::ManagedParentInitial | Self::ManagedParentContinuation(_)
+            Self::ManagedParentInitial
+                | Self::ManagedParentCorrection(_)
+                | Self::ManagedParentContinuation(_)
         )
     }
 }
@@ -2741,8 +2747,16 @@ fn prepare_child_attempt_with_purpose<'a>(
 ) -> Result<AssignmentExecutionDisposition<Box<PreparedChildAttempt<'a>>>> {
     let continuation = match purpose {
         ChildAttemptPurpose::ManagedParentContinuation(launch) => Some(launch),
-        ChildAttemptPurpose::Ordinary | ChildAttemptPurpose::ManagedParentInitial => None,
+        ChildAttemptPurpose::Ordinary
+        | ChildAttemptPurpose::ManagedParentInitial
+        | ChildAttemptPurpose::ManagedParentCorrection(_) => None,
     };
+    if let ChildAttemptPurpose::ManagedParentCorrection(authority) = purpose {
+        authority.revalidate(context, preflight, outcome, attempt)?;
+        if retry_feedback.is_none() {
+            bail!("managed correction preparation requires authorized retry feedback");
+        }
+    }
     let managed_parent = purpose.is_managed_parent();
     let AssignmentExecutionContext {
         index,
@@ -3032,6 +3046,9 @@ fn prepare_child_attempt_with_purpose<'a>(
         }
     }
     let attempt_prompt = match retry_feedback {
+        Some(ChildAttemptCorrection::StructuralReport) if managed_parent => format!(
+            "{prompt}\n\nThe preceding final parent report failed structural validation. Recheck the authored Worker evidence and use the supplied yield schema for this read-only request turn. A separately bound final continuation will require the parent report schema.\n"
+        ),
         Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
         Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
         None => prompt,
@@ -3052,7 +3069,10 @@ fn prepare_child_attempt_with_purpose<'a>(
     };
     // The messaging verifier requires this static appendix at the exact end of
     // the manifested prompt, after source context and any retry instructions.
-    let attempt_prompt = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+    let attempt_prompt = if matches!(
+        purpose,
+        ChildAttemptPurpose::ManagedParentInitial | ChildAttemptPurpose::ManagedParentCorrection(_)
+    ) {
         crate::external_agent::render_prompt_with_managed_worker_request_tool_appendix(
             attempt_prompt,
         )?
@@ -3163,7 +3183,11 @@ fn prepare_child_attempt_with_purpose<'a>(
         managed_parent,
     );
     if managed_parent && launch_runtime == SupervisorRuntime::Codex {
-        command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
+        command = if matches!(
+            purpose,
+            ChildAttemptPurpose::ManagedParentInitial
+                | ChildAttemptPurpose::ManagedParentCorrection(_)
+        ) {
             command.with_codex_managed_worker_requests()
         } else {
             command.with_codex_managed_readonly_continuation()
@@ -3484,6 +3508,9 @@ impl CapturedChildAttempt<'_> {
 }
 
 struct CollectedChildAttempt<'a> {
+    managed_completion: Option<managed_parent_correction::ManagedCycleCompletion>,
+    live_worker_runs: BTreeMap<String, ExternalAgentRun>,
+    deferred_isolated: Option<bound_parent_turn::DeferredIsolatedIntegration>,
     attempt_report: OrchestratorReviewReport,
     report_shape_problems: Vec<String>,
     primary_changes: PrimaryIntegrityChanges,
@@ -3603,6 +3630,7 @@ impl<'turn, 'context, 'writer, 'resources>
             outcome,
             parent_attempt,
             ParentTurnObservation::from_collected(parent),
+            None,
         )
     }
 
@@ -3619,6 +3647,7 @@ impl<'turn, 'context, 'writer, 'resources>
             outcome,
             parent_attempt,
             ParentTurnObservation::from_inspected(parent),
+            None,
         )
     }
 
@@ -3628,8 +3657,15 @@ impl<'turn, 'context, 'writer, 'resources>
         outcome: &'turn mut AssignmentExecutionOutcome,
         parent_attempt: usize,
         parent: ParentTurnObservation<'turn>,
+        permit: Option<NestedTurnExecutionPermit<'turn, 'resources>>,
     ) -> Result<Self> {
-        let permit = preflight.issue_nested_turn(parent_attempt)?;
+        let permit = match permit {
+            Some(permit) => {
+                permit.revalidate(preflight, parent_attempt)?;
+                permit
+            }
+            None => preflight.issue_nested_turn(parent_attempt)?,
+        };
         if context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
@@ -5328,6 +5364,8 @@ fn inspect_attached_parent_capture<'budget, 'turn>(
 /// Trusted journals and the pre-materialization candidate are cloned or borrowed
 /// data. The completed-evidence owner stays borrowed by `expected_candidate`.
 struct ManagedParentCollection {
+    live_worker_runs: BTreeMap<String, ExternalAgentRun>,
+    report_shape_problems: Vec<String>,
     parsed: ParsedReport<OrchestratorReviewReport>,
     journals: WorkerExecutionJournalEvidenceSet,
     worker_worktree_bindings: Option<super::acceptance::WorkerJournalWorktreeBindings>,
@@ -5471,7 +5509,7 @@ fn prepare_managed_parent_final_attempt<'a>(
     source_attempt: usize,
     current: &WorkerInboxTurn<'_>,
 ) -> Result<Box<PreparedManagedParentFinal<'a>>> {
-    let (parsed, journals) = {
+    let (parsed, journals, report_shape_problems) = {
         let (_view, workers) = revalidate_managed_parent_final(
             context,
             preflight,
@@ -5481,14 +5519,16 @@ fn prepare_managed_parent_final_attempt<'a>(
             current,
         )?;
         require_managed_parent_final_capture(context, preflight, &captured)?;
-        let parsed = parent_continuation_response::read_parent_continuation_final_report(
-            captured.external_run.output_last_message(),
-            &captured.attempt_artifacts.raw_report_relative,
-            continuation,
-        )?;
+        let (parsed, report_shape_problems) =
+            parent_continuation_response::read_parent_continuation_final_report(
+                captured.external_run.output_last_message(),
+                &captured.attempt_artifacts.raw_report_relative,
+                continuation,
+                context.plan.max_child_retries > 0,
+            )?;
         require_exact_completed_worker_reports(&parsed, workers, &preflight.assignment)?;
         let journals = merge_completed_worker_journals(workers)?;
-        (parsed, journals)
+        (parsed, journals, report_shape_problems)
     };
     let (_view, workers) = revalidate_managed_parent_final(
         context,
@@ -5507,9 +5547,19 @@ fn prepare_managed_parent_final_attempt<'a>(
     Ok(Box::new(PreparedManagedParentFinal {
         captured,
         collection: ManagedParentCollection {
+            report_shape_problems,
             parsed,
             journals,
             worker_worktree_bindings: None,
+            live_worker_runs: workers
+                .iter()
+                .map(|worker| {
+                    (
+                        worker.evidence().report().id.clone(),
+                        worker.evidence().run().clone(),
+                    )
+                })
+                .collect(),
             expected_candidate,
             authorizes_materialization: true,
         },
@@ -5529,11 +5579,13 @@ fn prepare_managed_parent_isolated_final_attempt<'a>(
     continuation.revalidate(context, preflight, continuation.binding().3)?;
     let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
     require_managed_parent_final_capture(context, preflight, &captured)?;
-    let parsed = parent_continuation_response::read_parent_continuation_final_report(
-        captured.external_run.output_last_message(),
-        &captured.attempt_artifacts.raw_report_relative,
-        continuation,
-    )?;
+    let (parsed, report_shape_problems) =
+        parent_continuation_response::read_parent_continuation_final_report(
+            captured.external_run.output_last_message(),
+            &captured.attempt_artifacts.raw_report_relative,
+            continuation,
+            context.plan.max_child_retries > 0,
+        )?;
     if !parsed.report.audit_reports.is_empty()
         || parsed.report.review_lens_aggregate.is_some()
         || parsed.report.worker_reports.len() != workers.len()
@@ -5579,9 +5631,14 @@ fn prepare_managed_parent_isolated_final_attempt<'a>(
     Ok(Box::new(PreparedManagedParentFinal {
         captured,
         collection: ManagedParentCollection {
+            report_shape_problems,
             parsed,
             journals,
             worker_worktree_bindings: Some(worker_worktree_bindings),
+            live_worker_runs: workers
+                .iter()
+                .map(|worker| (worker.report().id.clone(), worker.run().clone()))
+                .collect(),
             expected_candidate: completed.parent_candidate().clone(),
             authorizes_materialization: false,
         },
@@ -5602,7 +5659,9 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
 ) -> Result<CollectedChildAttempt<'a>> {
     require_managed_parent_final_capture(context, preflight, &prepared.captured)?;
     completed.revalidate(context, preflight, source_attempt, current)?;
-    if report_failed(&prepared.collection.parsed.report) {
+    if report_failed(&prepared.collection.parsed.report)
+        && !managed_parent_correction::defers_materialization(context)
+    {
         bail!("isolated parent rejected its Worker set; integration is not authorized");
     }
     let expected_candidate = prepared.collection.expected_candidate.clone();
@@ -5643,6 +5702,37 @@ fn integrate_accepted_isolated_workers(
     accepted_paths: &[PathBuf],
 ) -> Result<()> {
     let (_view, workers) = completed.revalidate(context, preflight, source_attempt, current)?;
+    integrate_isolated_worker_candidates(
+        context,
+        preflight,
+        workers,
+        completed.review_candidate()?,
+        expected_candidate,
+        accepted_paths,
+        || {
+            completed.revalidate(context, preflight, source_attempt, current)?;
+            completed.release_completed_claims(
+                context,
+                preflight,
+                source_attempt,
+                current,
+                outcome,
+            )?;
+            completed.begin_worker_materialization()
+        },
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn integrate_isolated_worker_candidates(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    workers: &[bound_parent_turn::IsolatedWorkerAttemptEvidence],
+    review_candidate: &isolated_parent_candidate::IsolatedParentCandidate,
+    expected_candidate: &PrimaryWorktreeSnapshot,
+    accepted_paths: &[PathBuf],
+    handoff: impl FnOnce() -> Result<()>,
+) -> Result<()> {
     if context.cancellation.is_cancelled()
         || primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
             != *expected_candidate
@@ -5652,7 +5742,6 @@ fn integrate_accepted_isolated_workers(
     let source_head = preflight.child_base_head;
     let primary_head = current_head_oid(context.repo)?;
     let mut candidates = Vec::new();
-    let review_candidate = completed.review_candidate()?;
     // Acceptance replaces self-reported paths with supervisor-inspected paths.
     // Check that corrected set before releasing claims or advancing private refs.
     if review_candidate.paths != accepted_paths
@@ -5712,13 +5801,9 @@ fn integrate_accepted_isolated_workers(
         }
         candidates.push((worker, captured));
     }
-    completed.revalidate(context, preflight, source_attempt, current)?;
-    // This is the sole terminal handoff; durable spent grants forbid replay.
-    // The parent union still covers every child scope while all leases stay held.
-    completed.release_completed_claims(context, preflight, source_attempt, current, outcome)?;
-    // From the first possible private Git mutation onward, every refusal (also
-    // the ordinary parent's rejected Ok import) must preserve the held owner.
-    completed.begin_worker_materialization()?;
+    // The caller retains the exact leases and revalidates its once-only handoff
+    // immediately before the first private Git mutation.
+    handoff()?;
     let primary = crate::git_repository::open(context.repo)?;
     let base = primary.find_commit(source_head)?.tree()?;
     let mut aggregate_oid = base.id();
@@ -5862,6 +5947,8 @@ fn collect_captured_child_attempt<'a>(
         worker_worktree_bindings,
         expected_candidate,
         authorizes_materialization,
+        managed_shape_problems,
+        live_worker_runs,
     ) = match managed_parent {
         Some(managed) => (
             Some(managed.parsed),
@@ -5869,8 +5956,10 @@ fn collect_captured_child_attempt<'a>(
             managed.worker_worktree_bindings,
             Some(managed.expected_candidate),
             managed.authorizes_materialization,
+            managed.report_shape_problems,
+            managed.live_worker_runs,
         ),
-        None => (None, None, None, None, false),
+        None => (None, None, None, None, false, Vec::new(), BTreeMap::new()),
     };
     let attempt_artifacts = captured.attempt_artifacts;
     let corrective_retry_used = captured.corrective_retry_used;
@@ -5886,7 +5975,7 @@ fn collect_captured_child_attempt<'a>(
     let environment_blocked = captured.environment_blocked;
     let attempt_containment_verified = captured.attempt_containment_verified;
     let raw_report_validated = if parsed.is_some() {
-        true
+        managed_shape_problems.is_empty()
     } else {
         direct_assignment_report_is_valid(
             assignment_attempt_report_role(
@@ -5982,7 +6071,7 @@ fn collect_captured_child_attempt<'a>(
         evidence_only_source: context.evidence_only_reaudit.map(|source| &source.report),
         observed_changed_paths: observed_primary_scope_changes.as_deref(),
     };
-    let (mut attempt_report, report_shape_problems) = if let Some(parsed) = parsed {
+    let (mut attempt_report, mut report_shape_problems) = if let Some(parsed) = parsed {
         super::acceptance::collect_managed_parent_report_for_runtime(
             report_collection,
             launch_runtime,
@@ -5992,6 +6081,7 @@ fn collect_captured_child_attempt<'a>(
     } else {
         collect_child_report_for_runtime(report_collection, launch_runtime)
     };
+    report_shape_problems.extend(managed_shape_problems);
     let materialization_gate = ManagedChildMaterializationGate {
         bound_managed_git_boundary:
             crate::external_agent::bind_existing_managed_child_git_boundary(&worktree.path).is_ok(),
@@ -6019,65 +6109,73 @@ fn collect_captured_child_attempt<'a>(
         bail!("isolated parent failed ordinary materialization eligibility");
     }
     let managed_child_git_import = if materialization_gate.eligible() {
-        if let Some(integrate) = before_materialization {
-            integrate(outcome, &attempt_report.files_changed)?;
-        }
-        let captured_primary_head = if context.worktree_creation.expected_source_head().is_some() {
-            primary_before
-                .head
-                .target
-                .context("source-rooted child omitted its pre-invocation primary HEAD")?
+        if authorizes_materialization && managed_parent_correction::defers_materialization(context)
+        {
+            None
         } else {
-            // Preserve ordinary managed-child admission: its primary and
-            // child must still share the captured execution base.
-            preflight.child_base_head
-        };
-        let write_lease = preflight
-            .worktree_write_lease
-            .as_ref()
-            .context("verified managed child Git materialization has no write lease")?;
-        Some((|| {
-            if let Some(expected) = expected_candidate {
-                let observed = primary_worktree_snapshot(&worktree.path, *execution_runtime)
-                    .context(
-                        "failed to inspect the managed parent worktree before materialization",
-                    )?;
-                if observed.inspection_problem().is_some() || observed != expected {
-                    bail!("managed worktree snapshot differs from the completed worker candidate");
-                }
+            if let Some(integrate) = before_materialization {
+                integrate(outcome, &attempt_report.files_changed)?;
             }
-            let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
-                repo,
-                assignment,
-                write_lease,
-                context.worktree_creation.expected_source_head(),
-                "the pre-materialization managed child candidate",
-            )?;
-            crate::external_agent::materialize_managed_child_git_commit(
-                repo,
-                &worktree.path,
-                captured_primary_head,
-                preflight.child_base_head,
-                &assignment.assigned_paths,
-                &candidate_paths,
-                candidate_tree,
-            )?;
-            let imported = collect_and_import_managed_child_git_commit(
-                repo,
-                &worktree.path,
-                captured_primary_head,
-                preflight.child_base_head,
-                &assignment.assigned_paths,
-            )?;
-            verify_imported_managed_child_candidate(
-                repo,
-                assignment,
-                write_lease,
-                context.worktree_creation.expected_source_head(),
-                &imported,
-            )?;
-            Ok::<_, anyhow::Error>(imported)
-        })())
+            let captured_primary_head =
+                if context.worktree_creation.expected_source_head().is_some() {
+                    primary_before
+                        .head
+                        .target
+                        .context("source-rooted child omitted its pre-invocation primary HEAD")?
+                } else {
+                    // Preserve ordinary managed-child admission: its primary and
+                    // child must still share the captured execution base.
+                    preflight.child_base_head
+                };
+            let write_lease = preflight
+                .worktree_write_lease
+                .as_ref()
+                .context("verified managed child Git materialization has no write lease")?;
+            Some((|| {
+                if let Some(expected) = expected_candidate {
+                    let observed = primary_worktree_snapshot(&worktree.path, *execution_runtime)
+                        .context(
+                            "failed to inspect the managed parent worktree before materialization",
+                        )?;
+                    if observed.inspection_problem().is_some() || observed != expected {
+                        bail!(
+                            "managed worktree snapshot differs from the completed worker candidate"
+                        );
+                    }
+                }
+                let (candidate_paths, candidate_tree) = capture_managed_child_candidate(
+                    repo,
+                    assignment,
+                    write_lease,
+                    context.worktree_creation.expected_source_head(),
+                    "the pre-materialization managed child candidate",
+                )?;
+                crate::external_agent::materialize_managed_child_git_commit(
+                    repo,
+                    &worktree.path,
+                    captured_primary_head,
+                    preflight.child_base_head,
+                    &assignment.assigned_paths,
+                    &candidate_paths,
+                    candidate_tree,
+                )?;
+                let imported = collect_and_import_managed_child_git_commit(
+                    repo,
+                    &worktree.path,
+                    captured_primary_head,
+                    preflight.child_base_head,
+                    &assignment.assigned_paths,
+                )?;
+                verify_imported_managed_child_candidate(
+                    repo,
+                    assignment,
+                    write_lease,
+                    context.worktree_creation.expected_source_head(),
+                    &imported,
+                )?;
+                Ok::<_, anyhow::Error>(imported)
+            })())
+        }
     } else {
         None
     };
@@ -6126,6 +6224,9 @@ fn collect_captured_child_attempt<'a>(
         });
     }
     Ok(CollectedChildAttempt {
+        managed_completion: None,
+        live_worker_runs,
+        deferred_isolated: None,
         attempt_report,
         report_shape_problems,
         primary_changes,
@@ -6333,6 +6434,9 @@ fn decide_child_attempt(
     let assignment = &preflight.assignment;
     let assignment_journal_role = direct_assignment_orchestration_role(assignment.role)?;
     let CollectedChildAttempt {
+        managed_completion: _,
+        live_worker_runs: _,
+        deferred_isolated: _,
         mut attempt_report,
         report_shape_problems,
         primary_changes,
@@ -8390,6 +8494,9 @@ fn execute_supervisor_assignment_inner(
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
 
         let mut retry_feedback: Option<ChildAttemptCorrection> = None;
+        let mut managed_completion: Option<managed_parent_correction::ManagedCycleCompletion> =
+            None;
+        let mut managed_correction: Option<managed_parent_correction::ManagedCorrection> = None;
         let mut active_budget_policy = context.budget_policy.clone();
         let mut attempt_history = Vec::new();
         let mut review_worker_journals = WorkerExecutionJournalEvidenceSet::new();
@@ -8403,7 +8510,7 @@ fn execute_supervisor_assignment_inner(
         let mut completed_parent_review_cycles = initial_completed_parent_review_cycles(context)?;
         let (
             child_report,
-            completed_candidate_inspection,
+            mut completed_candidate_inspection,
             completed_assignment_containment,
             completed_launch_model_provenance,
         ) = 'gate_controller: loop {
@@ -8411,10 +8518,15 @@ fn execute_supervisor_assignment_inner(
             let mut child_containment_verified = false;
             let mut child_gate_terminal = false;
             let first_attempt = next_attempt;
-            for attempt in first_attempt..=max_attempts {
-                next_attempt = attempt.saturating_add(1);
-                if attempt > 1 {
-                    let retry_count = u32::try_from(attempt.saturating_sub(1))
+            for cycle in first_attempt..=max_attempts {
+                next_attempt = cycle.saturating_add(1);
+                let attempt = if managed_parent_cycle {
+                    managed_parent_correction::physical_turn(cycle)?
+                } else {
+                    cycle
+                };
+                if cycle > 1 {
+                    let retry_count = u32::try_from(cycle.saturating_sub(1))
                         .context("assignment retry count does not fit selector input")?;
                     let decisions = active_budget_policy.reselect(
                         options.runtime,
@@ -8431,7 +8543,25 @@ fn execute_supervisor_assignment_inner(
                     )?;
                     outcome.selection_decisions.extend(decisions);
                 }
-                let prepared = match if managed_parent_cycle {
+                let prepared = match if managed_parent_cycle && cycle > 1 {
+                    let authority = managed_correction
+                        .as_ref()
+                        .context("managed retry has no fresh supervisor correction authority")?;
+                    prepare_child_attempt_with_purpose(
+                        context,
+                        outcome,
+                        &active_budget_policy,
+                        &preflight,
+                        journal_parent_id,
+                        attempt,
+                        max_attempts,
+                        &retry_feedback,
+                        &schema_path,
+                        &worker_schema_path,
+                        &auditor_schema_path,
+                        ChildAttemptPurpose::ManagedParentCorrection(authority),
+                    )
+                } else if managed_parent_cycle {
                     prepare_managed_parent_initial_attempt(
                         context,
                         outcome,
@@ -8471,7 +8601,7 @@ fn execute_supervisor_assignment_inner(
                 );
                 let requested_effort = prepared.command.reasoning_effort.clone();
                 let account_observe = active_budget_policy.account_observe_environment_decision();
-                let collected = match if managed_parent_cycle {
+                let mut collected = match if managed_parent_cycle {
                     managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
                         context,
                         outcome,
@@ -8484,6 +8614,7 @@ fn execute_supervisor_assignment_inner(
                         &schema_path,
                         &worker_schema_path,
                         &auditor_schema_path,
+                        managed_correction.as_ref(),
                     )
                 } else {
                     dispatch_and_collect_child_attempt(
@@ -8522,6 +8653,10 @@ fn execute_supervisor_assignment_inner(
                         return Err(error);
                     }
                 };
+                if managed_parent_cycle {
+                    managed_completion = collected.managed_completion.take();
+                    managed_correction = None;
+                }
                 let attempted_launch_model_provenance = collected.model_provenance.clone();
                 let attempt_external_run = collected.external_run.clone();
                 review_worker_journals.clone_from(&collected._worker_journal_evidence);
@@ -8588,6 +8723,24 @@ fn execute_supervisor_assignment_inner(
                 )?;
                 match disposition {
                     ChildAttemptDisposition::Retry => {
+                        if managed_parent_cycle {
+                            managed_correction = Some(
+                                managed_completion
+                                    .take()
+                                    .context("managed retry lost its live completion")?
+                                    .authorize(
+                                        context,
+                                        &preflight,
+                                        outcome,
+                                        retry_feedback
+                                            .as_ref()
+                                            .context("managed retry lost its correction")?,
+                                        structural_attempt,
+                                        next_attempt,
+                                        max_attempts,
+                                    )?,
+                            );
+                        }
                         persist_proven_worker_attempt_bypassed_parent_review(
                             artifacts,
                             &mut recorded_attempt,
@@ -8626,7 +8779,7 @@ fn execute_supervisor_assignment_inner(
                 );
                 return Ok(());
             };
-            if plan.max_child_retries > 0 {
+            if plan.max_child_retries > 0 || (managed_parent_cycle && attempt_history.len() > 1) {
                 append_child_attempt_history(&mut child_report, &attempt_history);
             }
             // A rejected report with no candidate consumer can finalize without
@@ -9053,6 +9206,24 @@ fn execute_supervisor_assignment_inner(
                 &mut retry_feedback,
             )? {
                 ParentAuditorGateDisposition::Retry => {
+                    if managed_parent_cycle {
+                        managed_correction = Some(
+                            managed_completion
+                                .take()
+                                .context("auditor repair lost its live managed completion")?
+                                .authorize(
+                                    context,
+                                    &preflight,
+                                    outcome,
+                                    retry_feedback
+                                        .as_ref()
+                                        .context("auditor repair lost its correction")?,
+                                    structural_attempt,
+                                    next_attempt,
+                                    max_attempts,
+                                )?,
+                        );
+                    }
                     record_parent_auditor_retry(artifacts, &terminal_attempt_outcome)?;
                     warning_streak = None;
                     continue 'gate_controller;
@@ -9086,6 +9257,22 @@ fn execute_supervisor_assignment_inner(
                 }
             }
         };
+        if managed_parent_cycle
+            && managed_parent_correction::defers_materialization(context)
+            && !report_failed(&child_report)
+        {
+            completed_candidate_inspection = Some(managed_parent_correction::materialize_accepted(
+                context,
+                &preflight,
+                outcome,
+                managed_completion
+                    .as_ref()
+                    .context("accepted managed parent lost its completion")?,
+                completed_candidate_inspection
+                    .as_ref()
+                    .context("accepted managed parent lost its reviewed candidate")?,
+            )?);
+        }
         publish_assignment_report(
             context,
             outcome,
@@ -19022,6 +19209,8 @@ mod isolated_worker_evidence_tests;
 #[path = "assignment_execution/managed_parent_controller_tests.rs"]
 mod managed_parent_controller_tests;
 
+#[cfg(all(test, target_os = "linux"))]
+mod managed_parent_outer_tests;
 #[cfg(all(test, target_os = "linux"))]
 #[path = "assignment_execution/managed_parent_process_tests.rs"]
 mod managed_parent_process_tests;

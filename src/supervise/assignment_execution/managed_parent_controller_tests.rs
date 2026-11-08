@@ -96,6 +96,7 @@ pub(super) fn exercise(
         &schemas.join("orchestrator-review-report.schema.json"),
         &schemas.join("worker-report.schema.json"),
         &schemas.join("auditor-report.schema.json"),
+        None,
     );
     overlapping_workers.check()?;
     let observed = calls.lock().unwrap().clone();
@@ -727,6 +728,7 @@ fn exercise_retained_failure(
         &schemas.join("orchestrator-review-report.schema.json"),
         &schemas.join("worker-report.schema.json"),
         &schemas.join("auditor-report.schema.json"),
+        None,
     );
     let error = match result {
         Err(error) => error,

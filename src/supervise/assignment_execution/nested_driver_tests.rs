@@ -220,7 +220,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             None,
         )
     });
-    let isolated = case.starts_with("managed-cycle-isolated-")
+    let outer = case.starts_with("managed-cycle-process-outer-");
+    let isolated = case.starts_with("managed-cycle-process-outer-isolated")
+        || case.starts_with("managed-cycle-isolated-")
         || case.starts_with("managed-cycle-process-isolated-");
     let managed_process = case.starts_with("managed-cycle-process-");
     let interrupted_worker = case.starts_with("managed-cycle-isolated-interrupted-");
@@ -273,6 +275,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         }
         parent.worker_assignments.push(second);
     }
+    if outer {
+        parent.assigned_paths = vec!["src/lib.rs".into(), "src/other.rs".into()];
+    }
     if managed_process {
         parent.task =
             Some("Implement first() returning 40 and other::second() returning first() + 2".into());
@@ -308,6 +313,10 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
     if scheduler.is_some() {
         plan.semantic_coordination = SemanticCoordinationMode::Block;
     }
+    if case.starts_with("managed-cycle-process-correction-") || outer {
+        plan.max_gate_corrections = 1;
+        plan.max_child_retries = 1;
+    }
     if managed_process {
         plan.max_depth = 3;
         plan.max_child_assignments = 3;
@@ -337,7 +346,12 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             RunId::new("nested-driver-test")?
         };
     #[cfg(target_os = "linux")]
-    if case.starts_with("managed-cycle-") || attached_capture || bound_parent || unbound_parent {
+    if !outer
+        && (case.starts_with("managed-cycle-")
+            || attached_capture
+            || bound_parent
+            || unbound_parent)
+    {
         crate::account_authority::record_observed_codex_selection(
             Some(run_id.as_str()),
             crate::account_authority::CODEX_CLI_PROVIDER_ID,
@@ -526,7 +540,78 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(["gpt-6.1-sol"])?);
     // This fixture exercises the actual loaded selector and controller path.
     // Its policy preferences are test inputs, not product effort defaults.
-    let _routing_policy = if isolated {
+    let _outer_prior = if outer {
+        Some(super::managed_parent_outer_tests::bind_fixture_prior(
+            &repo, &plan,
+        )?)
+    } else {
+        None
+    };
+    let mut outer_policy = AssignmentBudgetPolicy::default();
+    let _outer_selection = if outer {
+        let RuntimeModelCatalog::Codex(inner_catalog) = &catalog else {
+            unreachable!()
+        };
+        let mut plan_metadata = SupervisorPlanMetadata {
+            assignment_schedule: schedule.clone(),
+            ..Default::default()
+        };
+        let policy = super::managed_parent_outer_tests::bind_fixture_policy(
+            &repo,
+            &plan,
+            &mut plan_metadata,
+            isolated,
+        )?;
+        let fixture = super::super::scheduler::install_selected_nested_review_fixture(
+            &plan,
+            &options,
+            inner_catalog,
+            plan_metadata.clone(),
+            &temp,
+            policy,
+            crate::selection::ReasoningEffort::High,
+        )?;
+        let admission = SupervisorAdmissionPolicyInput::resolve(
+            &repo,
+            2,
+            plan_metadata.admission,
+            options.admission_overrides,
+        )?;
+        let acquisition = Ok(catalog.clone());
+        let resolution =
+            super::super::scheduler::initialize_supervisor_selection_from_prepared_metadata(
+                &mut plan,
+                &mut plan_metadata,
+                super::super::scheduler::PreparedSupervisorSelectionRequest {
+                    assignment_shapes: None,
+                    repo: &repo,
+                    current_run: Some(&run_id),
+                    runtime: options.runtime,
+                    execution_runtime: SupervisorExecutionRuntime::Verified,
+                    runtime_model_catalog: &acquisition,
+                    admission_policy_input: &admission,
+                    quota: Default::default(),
+                },
+            )?;
+        assert!(
+            resolution.selection_preflight_failure.is_none(),
+            "{resolution:?}"
+        );
+        for decision in &resolution.decisions {
+            if decision.provenance.status == crate::selection::DecisionStatus::Selected {
+                crate::selection::routing_policy::seal_selected_candidate(
+                    decision.role.as_str(),
+                    &decision.provenance,
+                )?;
+            }
+        }
+        outer_policy.initial_selector_decisions = resolution.decisions;
+        outer_policy.worker_dispatch_limit = if isolated { 2 } else { 1 };
+        Some(fixture)
+    } else {
+        None
+    };
+    let _routing_policy = if isolated && !outer {
         use crate::selection::routing_policy::{bind_routing_policy, load_routing_policy};
         let mut frozen = load_routing_policy(&repo)?;
         frozen.policy.objective.effort_distance_weight = 1_000_000_000_000;
@@ -623,9 +708,22 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
     let captured_worker_reports = Mutex::new(Vec::<WorkerReport>::new());
     let captured_worker_claims = Mutex::new(Vec::new());
     let overlapping_workers = WorkerRendezvous::default();
+    let outer_fixture =
+        super::managed_parent_outer_tests::Fixture::new(case, &run_dir, &repo, &worktree.path);
     let run_fixture = |command: &ExternalAgentCommand,
                        runner_cancellation: &ProcessCancellation,
                        _: Option<ExternalPreActionReviewRuntime<'_>>| {
+        if outer {
+            return outer_fixture
+                .run(
+                    command,
+                    runner_cancellation,
+                    &parent,
+                    &metadata,
+                    &sync_store,
+                )
+                .unwrap_or_else(|error| panic!("native outer-loop fixture: {error:#}"));
+        }
         let subject = if command.agent_lifecycle.as_ref().unwrap().task_id == "parent" {
             assert!(!parent_running.swap(true, Ordering::SeqCst));
             &parent
@@ -1180,7 +1278,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                   runner_cancellation: &ProcessCancellation,
                   review: Option<ExternalPreActionReviewRuntime<'_>>| {
         let identity = command.agent_lifecycle.as_ref().unwrap();
-        if isolated && identity.task_id != "parent" {
+        if isolated && !outer && identity.task_id != "parent" {
             overlapping_workers.run(&identity.task_id, || {
                 run_fixture(command, runner_cancellation, review)
             })
@@ -1224,7 +1322,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         semantic_block_gate: None,
         artifacts: &artifacts,
         budget_ledger: &ledger,
-        budget_policy: {
+        budget_policy: if outer {
+            outer_policy
+        } else {
             let mut policy = AssignmentBudgetPolicy::default();
             policy.worker_dispatch_limit = if isolated && !interrupted_worker {
                 2
@@ -1238,6 +1338,12 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         cancellation: cancellation.clone(),
         external_runner: &runner,
     };
+    if outer {
+        let base = preflight.child_base_head;
+        drop(preflight);
+        sync_store.release(claim.token)?;
+        return outer_fixture.exercise(&context, base, isolated);
+    }
     if let Some((width, release_per_assignment)) = scheduler {
         // The controller fixture's hand-built resources are discarded first.
         // The actual scheduler must prepare its own lease, claim, semantic

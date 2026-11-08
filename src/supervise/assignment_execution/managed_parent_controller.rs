@@ -40,21 +40,85 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
     schema_path: &Path,
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
+    correction: Option<&super::managed_parent_correction::ManagedCorrection>,
 ) -> Result<CollectedChildAttempt<'budget>> {
-    require_managed_parent_input(context, preflight, source_attempt, &prepared)?;
+    let (binding, permit) = if let Some(correction) = correction {
+        require_read_only_native_off(&prepared, "managed corrective parent")?;
+        let (binding, permit) = correction.admit(
+            context,
+            preflight,
+            outcome,
+            source_attempt,
+            prepared.launch_runtime,
+            budget_policy,
+        )?;
+        (binding, Some(permit))
+    } else {
+        require_managed_parent_input(context, preflight, source_attempt, &prepared)?;
+        let binding = with_supervisor_messaging_session(context.run_dir, |factory| {
+            factory.claim_fresh_worker_request_binding(
+                &context.options.run_id,
+                &preflight.assignment,
+                source_attempt,
+                prepared.launch_runtime,
+            )
+        })?;
+        (binding, None)
+    };
+    let mut collected = collect_managed_cycle(
+        context,
+        outcome,
+        preflight,
+        journal_parent_id,
+        source_attempt,
+        prepared,
+        budget_policy,
+        max_attempts,
+        schema_path,
+        worker_schema_path,
+        auditor_schema_path,
+        &binding,
+        permit,
+    )?;
+    // The inner controller has returned: its endpoint has been joined/revoked,
+    // all native captures collected and imported, and no nested owner is live.
+    if super::managed_parent_correction::defers_materialization(context) {
+        collected.managed_completion = Some(
+            super::managed_parent_correction::ManagedCycleCompletion::seal(
+                context,
+                preflight,
+                outcome,
+                source_attempt,
+                &binding,
+                &mut collected,
+                budget_policy,
+            )?,
+        );
+    }
+    Ok(collected)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_managed_cycle<'budget, 'resources>(
+    context: &AssignmentExecutionContext<'budget, '_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    preflight: &AssignmentExecutionPreflight<'resources>,
+    journal_parent_id: &str,
+    source_attempt: usize,
+    prepared: Box<PreparedChildAttempt<'budget>>,
+    budget_policy: &AssignmentBudgetPolicy,
+    max_attempts: usize,
+    schema_path: &Path,
+    worker_schema_path: &Path,
+    auditor_schema_path: &Path,
+    binding: &crate::supervise::messaging_bridge::worker_requests::WorkerRequestBinding,
+    permit: Option<super::NestedTurnExecutionPermit<'_, 'resources>>,
+) -> Result<CollectedChildAttempt<'budget>> {
     let turn_number = u64::try_from(source_attempt)
         .context("managed parent source attempt does not fit a supervisor turn")?;
     if turn_number == 0 {
         bail!("managed parent inbox turn must be nonzero");
     }
-    let binding = with_supervisor_messaging_session(context.run_dir, |factory| {
-        factory.claim_fresh_worker_request_binding(
-            &context.options.run_id,
-            &preflight.assignment,
-            source_attempt,
-            prepared.launch_runtime,
-        )
-    })?;
     let lease = preflight
         .worktree_write_lease
         .as_ref()
@@ -107,7 +171,12 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
         .map(|(_, worker_id)| worker_id.to_string())
         .collect::<Vec<_>>();
     require_exact_authored_workers(preflight, &requested)?;
-    if bound.selects_isolated_route(context, preflight, source_attempt, &turn)? {
+    // Corrections repair the collected combined predecessor under the original
+    // parent lease. Keep the same managed runtime and authored scopes, but never
+    // reopen or replace the preceding isolated Worker worktrees.
+    if permit.is_none()
+        && bound.selects_isolated_route(context, preflight, source_attempt, &turn)?
+    {
         // Persist the quiescent initial turn before any Worker can run or
         // materialize. No fallible evidence import may follow owner release.
         import_held_initial_parent_evidence(context, &parent)
@@ -143,6 +212,7 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
         schema_path,
         worker_schema_path,
         auditor_schema_path,
+        permit,
     );
     let imported = import_initial_parent_evidence(context, parent);
     match (prepared_final, imported) {
@@ -201,10 +271,10 @@ fn dispatch_and_inspect_initial_parent_attempt<'budget, 'turn>(
 
 #[allow(clippy::too_many_arguments)]
 #[inline(never)]
-fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent>(
+fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent, 'resources>(
     context: &AssignmentExecutionContext<'budget, '_>,
     outcome: &mut AssignmentExecutionOutcome,
-    preflight: &AssignmentExecutionPreflight<'_>,
+    preflight: &AssignmentExecutionPreflight<'resources>,
     journal_parent_id: &str,
     source_attempt: usize,
     bound: BoundParentTurnYield<'inbox, 'parent>,
@@ -214,14 +284,16 @@ fn prepare_serial_parent_continuation<'budget, 'inbox, 'parent>(
     schema_path: &Path,
     worker_schema_path: &Path,
     auditor_schema_path: &Path,
+    permit: Option<super::NestedTurnExecutionPermit<'_, 'resources>>,
 ) -> Result<Box<PreparedManagedParentFinal<'budget>>> {
-    let completed = bound.execute_serial(
+    let completed = bound.execute_serial_with_permit(
         context,
         preflight,
         source_attempt,
         turn,
         outcome,
         budget_policy,
+        permit,
     )?;
     let release_state = std::sync::atomic::AtomicU8::new(0);
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -344,7 +416,7 @@ fn collect_isolated_parent_cycle<'budget>(
     let release_state = std::sync::atomic::AtomicU8::new(0);
     let mut verified_final_capture = false;
     let mut final_panicked = false;
-    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let mut result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         completed.materialize_review_candidate(context, preflight, source_attempt, turn)?;
         let continuation = ParentContinuationLaunch::from_bound_isolated_workers(
             context,
@@ -440,13 +512,32 @@ fn collect_isolated_parent_cycle<'budget>(
             "isolated final continuation panicked; held resources require supervisor recovery"
         ))
     });
-    if result
-        .as_ref()
-        .is_ok_and(|collected| !super::report_failed(&collected.attempt_report))
-    {
+    if result.as_ref().is_ok_and(|collected| {
+        !super::report_failed(&collected.attempt_report)
+            || super::managed_parent_correction::defers_materialization(context)
+    }) {
         // Outer review captures its candidate after this controller returns.
         // Preserve the accepted union; refusal cleanup below must still retain
         // recovery ownership once Worker materialization has started.
+        // Failed validation/structural collection may authorize a fresh cycle,
+        // but cannot import Worker commits. Keep the exact tentative union and
+        // release only the already collected, quiescent subordinate claims.
+        if super::managed_parent_correction::defers_materialization(context) {
+            let deferred =
+                completed.defer_integration(context, preflight, source_attempt, turn, outcome)?;
+            result
+                .as_mut()
+                .map_err(|error| anyhow::anyhow!("{error:#}"))?
+                .deferred_isolated = Some(deferred);
+        } else if !completed.materialization_started() {
+            completed.release_completed_claims(
+                context,
+                preflight,
+                source_attempt,
+                turn,
+                outcome,
+            )?;
+        }
         held.retain_on_drop = false;
         return result;
     }

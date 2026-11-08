@@ -79,7 +79,32 @@ pub(crate) fn run(
             payload["masked_rustc"] = serde_json::json!(shim);
         }
     }
-    let argv = audited_codex_app_server_argv(spec, &controls, EnvironmentVersion::new(0, 162, 0))?;
+    let mut argv =
+        audited_codex_app_server_argv(spec, &controls, EnvironmentVersion::new(0, 162, 0))?;
+    let actual_journal = payload["mode"] == "worker"
+        && payload["case"]
+            .as_str()
+            .is_some_and(|case| case.starts_with("outer-") || case.starts_with("correction-"));
+    let mut bound_profile = Some(SideEffectConfinementProfile::ExternalCodex(profile));
+    let mut source_prompt = fs::read(&spec.prompt)?;
+    let journal_binding = if actual_journal {
+        bind_worker_journal_append_operation(
+            spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &mut source_prompt,
+            &mut bound_profile,
+            &mut argv,
+        )?
+    } else {
+        None
+    };
+    if let Some(binding) = &journal_binding {
+        payload["journal_prefix"] = serde_json::json!(binding.command_prefix()?);
+        payload["native_journal_helper"] = serde_json::json!(true);
+        binding.revalidate()?;
+    }
     let process = ProcessSpec::direct(
         "offline managed parent app-server peer",
         &python,
@@ -90,7 +115,7 @@ pub(crate) fn run(
     .with_stdin(StdinMode::Interactive)
     .with_stdin_limit(MAX_PROMPT_BYTES)
     .with_timeout(Some(spec.timeout))
-    .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(profile));
+    .with_side_effect_confinement(bound_profile.context("offline native profile")?);
     let signal = staging.root_path().join("worker-started");
     let cancel_active = payload["case"] == "cancel-active-worker"
         && payload["mode"] == "worker"
@@ -98,7 +123,7 @@ pub(crate) fn run(
     payload["signal"] = serde_json::json!(signal);
     let prompt = format!(
         "{}\nOFFLINE_FIXTURE={}\n",
-        fs::read_to_string(&spec.prompt)?,
+        String::from_utf8(source_prompt)?,
         payload
     );
     let finished = std::sync::atomic::AtomicBool::new(false);
@@ -161,10 +186,13 @@ pub(crate) fn run(
             claude_broker_witness: None,
         },
     );
-    run.replace_worker_journal_artifacts(capture_worker_journal_artifacts(
-        &controls,
-        run.scratch_quiescence_verified(),
-    ));
+    let mut captures =
+        capture_worker_journal_artifacts(&controls, run.scratch_quiescence_verified());
+    if let Some(binding) = &journal_binding {
+        binding.revalidate()?;
+        binding.attach_command_binding(&mut captures, &spec.cwd);
+    }
+    run.replace_worker_journal_artifacts(captures);
     // Match the production wrapper's host-held invocation receipt. The peer
     // supplies neither this identity nor a self-asserted budget settlement.
     run.retain_live_budget_invocation_for_test(spec);

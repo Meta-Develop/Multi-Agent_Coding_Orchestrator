@@ -642,7 +642,7 @@ fn worker_journal_failed_command_retains_observed_mutation() {
 }
 
 #[test]
-fn worker_journal_enosys_launch_failure_has_completed_observation() {
+fn worker_journal_enosys_launch_failure_is_terminal_and_never_completed() {
     let _error = Openat2Error::force(libc::ENOSYS).with_statx_enosys();
     let (_temp, worktree, path, identity) = observed_fixture();
     let record = observed_entry(&worktree, &["/no-such-maco-test-command"]);
@@ -652,13 +652,21 @@ fn worker_journal_enosys_launch_failure_has_completed_observation() {
     assert!(!error
         .to_string()
         .contains("WorkerJournalObservationRequired"));
-    let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+    let bytes = fs::read(&path).unwrap();
+    let records = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<WorkerExecutionJournalEntry>(line).unwrap())
+        .collect::<Vec<_>>();
     assert_eq!(records.len(), 2);
     assert_eq!(
         records[1].observation.as_ref().unwrap().phase,
-        WorkerJournalObservationPhase::Completed
+        WorkerJournalObservationPhase::Failed
     );
     assert!(records[1].changed_paths.is_empty());
+    assert!(parse_worker_execution_journal(&bytes, &path).is_err());
+    assert!(run_worker_execution_journal_command(&path, &identity, &record, false).is_err());
+    assert_eq!(fs::read(&path).unwrap(), bytes);
 }
 
 #[test]
@@ -763,4 +771,51 @@ fn worker_journal_reserves_terminal_failure_space_before_execution() {
     );
     assert!(!worktree.join("should-not-run").exists());
     assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+#[test]
+fn worker_journal_native_numeric_exit_contract_and_signal_refusal() {
+    for code in [0, 1, 7, 123, 124, 125, 126, 143] {
+        let (_temp, worktree, path, identity) = observed_fixture();
+        let script = format!("exit {code}");
+        let record = observed_entry(&worktree, &["/bin/sh", "-c", &script]);
+        let result = run_worker_execution_journal_command(&path, &identity, &record, false);
+        let bytes = fs::read(&path).unwrap();
+        if code == 0 {
+            assert!(result.is_ok());
+        } else if code < 124 {
+            let error = result.unwrap_err();
+            assert_eq!(
+                error
+                    .downcast_ref::<WorkerJournalCommandExit>()
+                    .unwrap()
+                    .code(),
+                code
+            );
+            assert!(parse_worker_execution_journal(&bytes, &path).is_ok());
+        } else {
+            let error = journal_cli_error(result.unwrap_err());
+            assert_eq!(
+                error
+                    .downcast_ref::<WorkerJournalCommandExit>()
+                    .unwrap()
+                    .code(),
+                125
+            );
+            assert!(parse_worker_execution_journal(&bytes, &path).is_err());
+        }
+    }
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let record = observed_entry(&worktree, &["/bin/sh", "-c", "kill -TERM $$"]);
+    let error = journal_cli_error(
+        run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err(),
+    );
+    assert_eq!(
+        error
+            .downcast_ref::<WorkerJournalCommandExit>()
+            .unwrap()
+            .code(),
+        125
+    );
+    assert!(parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).is_err());
 }

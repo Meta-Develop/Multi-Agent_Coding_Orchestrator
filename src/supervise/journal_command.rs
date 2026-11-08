@@ -39,6 +39,16 @@ pub(super) fn canonicalize_command(
     journal: &WorkerExecutionJournalEvidence,
     entries: &[WorkerExecutionJournalEntry],
 ) -> Option<Vec<String>> {
+    resolve_wrapper(command, cwd, journal, entries).map(|entry| entry.command.clone())
+}
+
+/// Return the unique journal occurrence selected by the existing wrapper grammar.
+pub(super) fn resolve_wrapper<'a>(
+    command: &[String],
+    cwd: &Path,
+    journal: &WorkerExecutionJournalEvidence,
+    entries: &'a [WorkerExecutionJournalEntry],
+) -> Option<&'a WorkerExecutionJournalEntry> {
     let binding = journal.command_binding.as_ref()?;
     if cwd.as_os_str() != binding.cwd.as_os_str() {
         return None;
@@ -173,7 +183,7 @@ pub(super) fn canonicalize_command(
     if matches.next().is_some() {
         return None;
     }
-    Some(matched.command.clone())
+    Some(matched)
 }
 
 pub(super) fn is_wrapper(command: &[String]) -> bool {
@@ -350,4 +360,57 @@ fn literal_shell_words(script: &str, variables: &BTreeSet<String>) -> Option<Vec
         });
     }
     Some(words)
+}
+
+/// Host protocol command text, independently held by the native driver. This
+/// parser never treats Worker stdout, reports, or serialized command items as evidence.
+pub(super) fn host_wrapper(
+    text: &str,
+    cwd: &Path,
+    journal: &WorkerExecutionJournalEvidence,
+    entries: &[WorkerExecutionJournalEntry],
+) -> Option<(Vec<String>, bool)> {
+    let words = shell_wrapper_words(text)?;
+    let argv = words
+        .iter()
+        .map(|word| word.literal().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()?;
+    #[cfg(test)]
+    let argv = unwrap_native_journal_test_helper(argv)?;
+    let argv = match argv.as_slice() {
+        [shell, flag, script]
+            if matches!(shell.as_str(), "/bin/bash" | "bash")
+                && matches!(flag.as_str(), "-lc" | "-c") =>
+        {
+            shell_wrapper_words(script)?
+                .iter()
+                .map(|word| word.literal().map(str::to_owned))
+                .collect::<Option<Vec<_>>>()?
+        }
+        _ => argv,
+    };
+    let inner = canonicalize_command(&argv, cwd, journal, entries)?;
+    let separator = argv.iter().position(|word| word == "--")?;
+    Some((
+        inner,
+        argv[..separator]
+            .iter()
+            .any(|word| word == "--observe-changes"),
+    ))
+}
+
+/// The subprocess test adapter calls the production CLI in the native test
+/// executable. Its argv carries the exact CLI arguments; no journal rows are
+/// synthesized. This grammar exists only in the test build.
+#[cfg(test)]
+fn unwrap_native_journal_test_helper(argv: Vec<String>) -> Option<Vec<String>> {
+    if argv.get(1).map(String::as_str) != Some("--exact") {
+        return Some(argv);
+    }
+    if argv.len() != 7 || argv[2] != "supervise::assignment_execution::managed_parent_outer_tests::production_journal_cli_helper"
+        || argv[3] != "--nocapture" || argv[4] != "--ignored" || argv[5] != "--skip"
+        || Path::new(&argv[0]) != std::env::current_exe().ok()?
+    { return None; }
+    let inner: Vec<String> = serde_json::from_str(&argv[6]).ok()?;
+    (inner.first() == argv.first()).then_some(inner)
 }

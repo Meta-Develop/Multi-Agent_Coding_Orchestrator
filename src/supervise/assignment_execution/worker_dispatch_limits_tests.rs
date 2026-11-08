@@ -646,6 +646,7 @@ fn qualification_mode(
         &dirs.schemas.join("orchestrator-review-report.schema.json"),
         &dirs.schemas.join("worker-report.schema.json"),
         &dirs.schemas.join("auditor-report.schema.json"),
+        None,
     );
     assert!(result.is_err());
     let calls = calls.lock().unwrap();

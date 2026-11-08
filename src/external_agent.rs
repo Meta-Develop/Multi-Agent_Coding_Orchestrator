@@ -730,6 +730,7 @@ struct BoundWorkerJournalAppend {
     helper_sha256: String,
     journal: ExactWritableArtifactFile,
     source_prompt_sha256: String,
+    initial_journal: Vec<u8>,
 }
 
 #[cfg(target_os = "linux")]
@@ -743,6 +744,7 @@ impl BoundWorkerJournalAppend {
                     device: self.journal.identity.device,
                     inode: self.journal.identity.inode,
                     cwd: cwd.to_path_buf(),
+                    initial_journal: self.initial_journal.clone(),
                 });
             }
         }
@@ -1586,7 +1588,15 @@ fn bind_worker_journal_append_operation(
     let helper_file = fs::File::open("/proc/self/exe")?;
     let helper_identity = external_program_identity(&helper_path)?;
     let helper_sha256 = worker_journal_appender_sha256(&helper_file)?;
+    use std::os::unix::fs::FileExt;
+    let length = usize::try_from(journal.held_file.metadata()?.len())?;
+    if length > crate::supervise::MAX_WORKER_EXECUTION_JOURNAL_BYTES {
+        bail!("prelaunch Worker journal exceeds the capture limit");
+    }
+    let mut initial_journal = vec![0; length];
+    journal.held_file.read_exact_at(&mut initial_journal, 0)?;
     let binding = BoundWorkerJournalAppend {
+        initial_journal,
         helper_path,
         helper_file,
         helper_identity,
@@ -2250,6 +2260,7 @@ mod worker_journal_append_binding_tests {
                 device: binding.journal.identity.device,
                 inode: binding.journal.identity.inode,
                 cwd: spec.cwd.clone(),
+                initial_journal: Vec::new(),
             })
         );
         assert_eq!(
@@ -6714,6 +6725,7 @@ pub(crate) struct WorkerJournalCommandBinding {
     pub(crate) device: u64,
     pub(crate) inode: u64,
     pub(crate) cwd: PathBuf,
+    pub(crate) initial_journal: Vec<u8>,
 }
 
 impl std::fmt::Debug for WorkerJournalArtifactCapture {

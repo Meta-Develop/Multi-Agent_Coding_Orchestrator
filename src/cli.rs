@@ -1106,6 +1106,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 args.observe_changes,
                 args.auto_timestamps,
             )
+            .map_err(supervise::journal_cli_error)
         }
         SuperviseSubcommand::Plan(args) => {
             let PlanSuperviseArgs {
