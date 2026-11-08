@@ -140,6 +140,23 @@ fn validate_execution_target_pre_dispatch(
     )
 }
 
+// Public run entrypoints must reject invalid composed limits before granting or
+// acquiring a catalog; scheduler preparation repeats this for internal callers.
+fn validate_run_budget_pre_dispatch(
+    loaded: &LoadedSupervisorPlan,
+    options: &SupervisorRunOptions,
+    verified_execution: bool,
+) -> Result<()> {
+    super::plan_validation::validate_effective_run_budget_reservations(
+        &loaded.plan,
+        &loaded.plan_metadata.run_budget,
+        options.budget_overrides,
+        verified_execution
+            && loaded.plan_metadata.execution_target.is_none()
+            && loaded.plan_metadata.evidence_only_reaudit.is_none(),
+    )
+}
+
 pub fn supervisor_plan_from_task_file(
     repo: impl AsRef<Path>,
     task_file: impl AsRef<Path>,
@@ -920,6 +937,168 @@ mod task_routing_lowering_tests {
             Some(repo),
         )
         .unwrap()
+    }
+
+    fn budget_preflight_options(repo: &Path, plan_file: PathBuf) -> SupervisorRunOptions {
+        SupervisorRunOptions {
+            repo: repo.to_path_buf(),
+            plan_file,
+            run_id: RunId::new("effective-budget-preflight").unwrap(),
+            parent_node: None,
+            codex_bin: PathBuf::from("unused-budget-preflight-codex"),
+            runtime: SupervisorRuntime::Codex,
+            allow_dirty_primary: false,
+            allow_live_run_collision: false,
+            admission_overrides: SupervisorAdmissionConfig::default(),
+            budget_overrides: RunBudgetLimits::default(),
+            budget_max_duration_seconds: None,
+            machine_global_retention: None,
+        }
+    }
+
+    #[test]
+    fn authored_run_cli_ceilings_refuse_before_loaded_plan_gate_or_artifacts() {
+        for limits in [
+            RunBudgetLimits {
+                soft_tokens: Some(1_000_000),
+                ..RunBudgetLimits::default()
+            },
+            RunBudgetLimits {
+                hard_tokens: Some(1_000_000),
+                ..RunBudgetLimits::default()
+            },
+            RunBudgetLimits {
+                soft_cost_usd: Some(1.0),
+                ..RunBudgetLimits::default()
+            },
+            RunBudgetLimits {
+                hard_cost_usd: Some(1.0),
+                ..RunBudgetLimits::default()
+            },
+        ] {
+            for (effective_limits, reserved, expected_gate_calls) in [
+                (limits, false, 0),
+                (limits, true, 1),
+                (RunBudgetLimits::default(), false, 1),
+            ] {
+                let (owner, repo) = super::super::tests::injected_repository();
+                let mut document = json!({
+                    "version": SUPERVISOR_SCHEMA_VERSION,
+                    "task": "budget preflight",
+                    "max_child_assignments": 1,
+                    "assignments": [{
+                        "id": "child", "phase": "execution", "assigned_paths": ["README.md"]
+                    }]
+                });
+                if reserved {
+                    document["run_budget"] = json!({"role_token_reservations": {
+                        "child_orchestrator": 10, "auditor": 10
+                    }});
+                }
+                let plan_file = owner.path().join("plan.json");
+                fs::write(&plan_file, serde_json::to_vec(&document).unwrap()).unwrap();
+                let mut options = budget_preflight_options(&repo, plan_file);
+                options.budget_overrides = effective_limits;
+                // Exercise the public authored-plan route as well as its gated core.
+                if expected_gate_calls == 0 {
+                    let error = run_supervisor_plan_file_cascade_with_concurrency_policy(
+                        options.clone(),
+                        SupervisorConcurrencyPolicy::default(),
+                    )
+                    .unwrap_err();
+                    assert!(
+                        format!("{error:#}")
+                            .contains("run_budget.role_token_reservations.child_orchestrator"),
+                        "{error:#}"
+                    );
+                    let error =
+                        run_supervisor_plan_file_with_max_concurrent_children(options.clone(), 1)
+                            .unwrap_err();
+                    assert!(
+                        format!("{error:#}")
+                            .contains("run_budget.role_token_reservations.child_orchestrator"),
+                        "{error:#}"
+                    );
+                }
+                let outer_run_id = options.run_id.clone();
+                let gate_calls = std::cell::Cell::new(0);
+                let mut gate = |_plan: &SupervisorPlan| -> Result<Option<GateDenial>> {
+                    gate_calls.set(gate_calls.get() + 1);
+                    bail!("budget-preflight gate reached");
+                };
+                let external_runner = |_command: &ExternalAgentCommand,
+                                       _cancellation: &ProcessCancellation,
+                                       _review: Option<ExternalPreActionReviewRuntime<'_>>|
+                 -> ExternalAgentRun {
+                    panic!("budget preflight must not dispatch a provider")
+                };
+                let cancellation_observed = AtomicBool::new(false);
+                let source_dispatch_started = AtomicBool::new(false);
+                let error = run_supervisor_plan_file_cascade_with_gate(
+                    options,
+                    SupervisorConcurrencyPolicy::default(),
+                    GeneratedFollowUpQueueEntrypoint::SuperviseRun,
+                    &outer_run_id,
+                    None,
+                    &cancellation_observed,
+                    Some(&source_dispatch_started),
+                    false,
+                    None,
+                    None,
+                    &mut gate,
+                    &external_runner,
+                )
+                .unwrap_err();
+                let expected_error = if expected_gate_calls == 0 {
+                    "run_budget.role_token_reservations.child_orchestrator"
+                } else {
+                    "budget-preflight gate reached"
+                };
+                assert!(format!("{error:#}").contains(expected_error), "{error:#}");
+                assert_eq!(gate_calls.get(), expected_gate_calls);
+                assert!(!source_dispatch_started.load(Ordering::SeqCst));
+                assert!(!repo.join(".maco").exists());
+            }
+        }
+    }
+
+    #[test]
+    fn normal_document_cli_budget_refuses_before_run_artifacts() {
+        let (owner, repo) = super::super::tests::injected_repository();
+        let mut normalized = loaded(&repo, proposal());
+        // Use the supported legacy document carrier without an assessed task.
+        normalized.plan_metadata.task_routing_assessment = None;
+        normalized.plan_metadata.run_budget = SupervisorBudgetConfig::default();
+        let document = intake_document(&normalized);
+        let parsed = load_normal_intake_document(document.clone(), &repo).unwrap();
+        assert!(parsed.plan_metadata.run_budget.is_unconfigured());
+        let mut options = budget_preflight_options(&repo, owner.path().join("unused.json"));
+        options.budget_overrides.hard_tokens = Some(1_000_000);
+        let role = parsed.plan.assignments[0].role;
+        let error = run_supervisor_normal_document_cascade(
+            options.clone(),
+            document,
+            SupervisorConcurrencyPolicy::default(),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert!(
+            format!("{error:#}").contains(&format!(
+                "run_budget.role_token_reservations.{}",
+                role.as_str()
+            )),
+            "{error:#}"
+        );
+        assert!(!repo.join(".maco").exists());
+
+        let mut explicitly_reserved = parsed.clone();
+        explicitly_reserved.plan_metadata.run_budget = conservative_generated_role_budget();
+        validate_run_budget_pre_dispatch(&explicitly_reserved, &options, true)
+            .expect("normal intake accepts positive explicit estimates with a CLI ceiling");
+        options.budget_overrides = RunBudgetLimits::default();
+        validate_run_budget_pre_dispatch(&parsed, &options, true)
+            .expect("normal intake without a ceiling still accepts no estimates");
     }
 
     #[test]
@@ -4859,6 +5038,7 @@ pub(crate) fn run_held_out_fake_experiment(
         bail!("experiment validation authority does not match the isolated assignment");
     }
     loaded.assignment_metadata.parent_validation = Some(authority);
+    validate_run_budget_pre_dispatch(&loaded, &options, false)?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
             .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
@@ -5346,6 +5526,7 @@ fn run_held_out_production_experiment_with_runner(
         bail!("experiment validation authority does not match the isolated assignment");
     }
     loaded.assignment_metadata.parent_validation = Some(authority);
+    validate_run_budget_pre_dispatch(&loaded, &options, true)?;
     // Catalog preflight admits logical `codex` and binds the frozen absolute
     // `--runtime-bin` to trusted system resolution in
     // `admit_production_supervisor_catalog_preflight_grant` before any catalog
@@ -5410,6 +5591,7 @@ pub(crate) fn run_fake_supervisor_plan_file_for_test(
         Some(options.repo.as_path()),
     )?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    validate_run_budget_pre_dispatch(&loaded, &options, false)?;
     let runtime_model_catalog = test_runtime_model_catalog(&loaded.plan, options.runtime)?;
     let no_external_runner = |_command: &ExternalAgentCommand,
                               _cancellation: &ProcessCancellation,
@@ -5607,6 +5789,11 @@ fn run_loaded_supervisor_normal_cascade(
     let outer_run_id = options.run_id.clone();
     apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
+    validate_run_budget_pre_dispatch(
+        &loaded,
+        &options,
+        options.runtime != SupervisorRuntime::Fake,
+    )?;
     let source_loaded = loaded.clone();
     let template = options.clone();
     let runtime_model_catalog = admit_production_supervisor_catalog_preflight_grant(&options, repo)
@@ -5903,6 +6090,11 @@ fn run_supervisor_plan_file_cascade_with_gate(
     let mut loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     apply_objective_profile_override(&mut loaded, objective_profile_override);
     validate_execution_target_pre_dispatch(&loaded, allow_primary_worktree)?;
+    validate_run_budget_pre_dispatch(
+        &loaded,
+        &options,
+        options.runtime != SupervisorRuntime::Fake,
+    )?;
     if observe_caller_cancellation(caller_cancellation, cancellation_observed) {
         bail!("autopilot caller cancelled before exact loaded-plan dispatch");
     }
@@ -6005,6 +6197,7 @@ fn run_supervisor_goal_spec_with_max_concurrent_children(
     let repo = discover_repo_root(&options.repo)?;
     let loaded = supervisor_plan_and_consultant_from_goal_spec(&repo, goal, spec, None)?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    validate_run_budget_pre_dispatch(&loaded, &options, true)?;
     let manager = WorktreeManager::new(&repo);
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let runtime_model_catalog =
@@ -6075,6 +6268,7 @@ pub fn reaudit_supervisor_assignment(
         budget_max_duration_seconds: None,
         machine_global_retention: request.machine_global_retention,
     };
+    validate_run_budget_pre_dispatch(&loaded, &options, true)?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
             .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));
@@ -6362,6 +6556,7 @@ fn run_supervisor_plan_file_with_runner_and_max_concurrent_children(
     let cleanliness = manager.acquire_repository_cleanliness()?;
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     validate_execution_target_pre_dispatch(&loaded, false)?;
+    validate_run_budget_pre_dispatch(&loaded, &options, true)?;
     let runtime_model_catalog =
         admit_production_supervisor_catalog_preflight_grant(&options, &repo)
             .and_then(|grant| RuntimeModelCatalog::for_supervisor(&options, &repo, grant));

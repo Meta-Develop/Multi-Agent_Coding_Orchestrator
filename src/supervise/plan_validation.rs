@@ -6,6 +6,62 @@ use crate::{
 };
 use std::path::Path;
 
+/// Check authored estimates against the same strictest plan/CLI limits used by dispatch.
+pub(super) fn validate_effective_run_budget_reservations(
+    plan: &SupervisorPlan,
+    budget: &SupervisorBudgetConfig,
+    cli_limits: RunBudgetLimits,
+    managed_worker_dispatch: bool,
+) -> Result<()> {
+    let limits = budget
+        .limits
+        .strictest(cli_limits)
+        .context("supervisor effective run_budget limits are invalid")?;
+    for (role, tokens) in &budget.role_token_reservations {
+        if *tokens == 0 {
+            bail!(
+                "run_budget.role_token_reservations.{} must be greater than zero",
+                role.as_str()
+            );
+        }
+    }
+    if !limits.has_any_ceiling() {
+        return Ok(());
+    }
+    // Selection also binds Supervisor and GateClassifier, but neither dispatches
+    // through the run budget. Parent review can dispatch an Auditor for any
+    // assignment. Nested workers reserve separately only in verified managed
+    // parent execution, not in simulations or in-place/evidence-only execution.
+    let mut roles = BTreeSet::new();
+    for assignment in &plan.assignments {
+        roles.insert(assignment.role);
+        roles.insert(AgentRole::Auditor);
+        // Licensed dependent failures generate ChildOrchestrator follow-ups,
+        // including when the breaking assignment itself is a direct Worker.
+        if assignment.phase == AssignmentPhase::Execution && assignment.licensed_breakage.is_some()
+        {
+            roles.insert(AgentRole::ChildOrchestrator);
+        }
+        if managed_worker_dispatch
+            && assignment.role == AgentRole::ChildOrchestrator
+            && assignment.phase == AssignmentPhase::Execution
+            && assignment.effective_role_category() == RoleCategory::DelegatingCoordinator
+            && !assignment.worker_assignments.is_empty()
+        {
+            roles.insert(AgentRole::Worker);
+        }
+    }
+    for role in roles {
+        if !budget.role_token_reservations.contains_key(&role) {
+            bail!(
+                "effective token or cost ceilings (including CLI overrides) require a positive run_budget.role_token_reservations.{} entry",
+                role.as_str()
+            );
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn validate_authored_check_metadata(
     plan: &SupervisorPlan,
     metadata: &AssignmentMetadata,
@@ -294,14 +350,13 @@ pub(super) fn validate_supervisor_plan_in_repo(
         .limits
         .validate()
         .context("supervisor run_budget limits are invalid")?;
-    for (role, tokens) in &metadata.run_budget.role_token_reservations {
-        if *tokens == 0 {
-            bail!(
-                "run_budget.role_token_reservations.{} must be greater than zero",
-                role.as_str()
-            );
-        }
-    }
+    // Runtime admission determines whether nested Workers dispatch separately.
+    validate_effective_run_budget_reservations(
+        &plan,
+        &metadata.run_budget,
+        RunBudgetLimits::default(),
+        false,
+    )?;
     for (worker_id, limit) in &metadata.run_budget.worker_live_token_limits {
         let authored_worker = plan.assignments.iter().any(|assignment| {
             (assignment.role == AgentRole::Worker && assignment.id == *worker_id)
@@ -321,21 +376,6 @@ pub(super) fn validate_supervisor_plan_in_repo(
             bail!("worker_live_token_limits requires an authored Worker, hard token ceiling and limit >= its positive estimate: {worker_id}");
         }
     }
-    if metadata.run_budget.limits.has_any_ceiling() {
-        for role in [AgentRole::ChildOrchestrator, AgentRole::Auditor] {
-            if !metadata
-                .run_budget
-                .role_token_reservations
-                .contains_key(&role)
-            {
-                bail!(
-                    "run_budget with an enforcement ceiling requires a positive '{}' role_token_reservations entry",
-                    role.as_str()
-                );
-            }
-        }
-    }
-
     if plan.assignments.len() > plan.max_child_assignments {
         bail!(
             "supervisor plan has {} flattened child orchestrators but max_child_assignments is {}",
@@ -362,16 +402,6 @@ pub(super) fn validate_supervisor_plan_in_repo(
                     bail!(
                         "researcher '{}' cannot be a scheduling parent",
                         assignment.id
-                    );
-                }
-                if metadata.run_budget.limits.has_any_ceiling()
-                    && !metadata
-                        .run_budget
-                        .role_token_reservations
-                        .contains_key(&AgentRole::Researcher)
-                {
-                    bail!(
-                        "budgeted researcher requires a researcher role_token_reservations entry"
                     );
                 }
             }

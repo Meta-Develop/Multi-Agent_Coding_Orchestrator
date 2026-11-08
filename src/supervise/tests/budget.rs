@@ -606,6 +606,192 @@ fn priced_budget_fixture_profile() -> Result<(&'static str, ReasoningEffort)> {
 }
 
 #[test]
+fn effective_budget_reservations_cover_dispatch_roles_without_unused_selection_roles() {
+    use crate::supervise::plan_validation::validate_effective_run_budget_reservations;
+
+    let ceilings = [
+        RunBudgetLimits {
+            soft_tokens: Some(100),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            hard_tokens: Some(100),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            soft_cost_usd: Some(1.0),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            hard_cost_usd: Some(1.0),
+            ..RunBudgetLimits::default()
+        },
+    ];
+    for (assignment, roles) in [
+        (
+            json!({
+                "id": "child", "phase": "execution", "assigned_paths": ["README.md"]
+            }),
+            vec![AgentRole::ChildOrchestrator, AgentRole::Auditor],
+        ),
+        (
+            json!({
+                "id": "direct-worker", "phase": "execution", "role": "worker",
+                "role_category": "non_delegating_terminal_worker",
+                "assigned_paths": ["README.md"]
+            }),
+            vec![AgentRole::Worker, AgentRole::Auditor],
+        ),
+        (
+            json!({
+                "id": "licensed-worker", "phase": "execution", "role": "worker",
+                "role_category": "non_delegating_terminal_worker",
+                "assigned_paths": ["src/api.rs"],
+                "licensed_breakage": {
+                    "migration_rationale": "Update the dependent caller after renaming the API",
+                    "dependents": [{
+                        "dependent_id": "client",
+                        "paths": ["src/client.rs"],
+                        "interfaces": ["crate::api::new_name"]
+                    }]
+                }
+            }),
+            vec![
+                AgentRole::Worker,
+                AgentRole::Auditor,
+                AgentRole::ChildOrchestrator,
+            ],
+        ),
+        (
+            json!({
+                "id": "research", "phase": "execution", "role": "researcher",
+                "role_category": "read_only_researcher",
+                "assigned_paths": ["README.md"]
+            }),
+            vec![AgentRole::Researcher, AgentRole::Auditor],
+        ),
+        (
+            json!({
+                "id": "parent", "phase": "execution", "assigned_paths": ["README.md"],
+                "worker_assignments": [{
+                    "id": "nested-worker", "role": "worker", "assigned_paths": ["README.md"]
+                }]
+            }),
+            vec![
+                AgentRole::ChildOrchestrator,
+                AgentRole::Worker,
+                AgentRole::Auditor,
+            ],
+        ),
+    ] {
+        let mut source = json!({
+            "version": SUPERVISOR_SCHEMA_VERSION,
+            "task": "reservation preflight",
+            "max_child_assignments": 1,
+            "assignments": [assignment]
+        });
+        if source["assignments"][0].get("licensed_breakage").is_some() {
+            source["review_lenses"] =
+                serde_json::to_value(single_parent_acceptance_review_lenses())
+                    .expect("licensed breakage auditors must receive the output report");
+        }
+        let loaded = parse_supervisor_plan_with_consultant(&source.to_string())
+            .expect("authored no-ceiling plan remains valid without estimates");
+        let mut budget = loaded.plan_metadata.run_budget;
+        // A duration limit alone does not require token estimates.
+        source["run_budget"] = json!({"max_duration_seconds": 60});
+        parse_supervisor_plan_with_consultant(&source.to_string())
+            .expect("duration-only budget remains valid without token estimates");
+
+        budget.role_token_reservations = roles.iter().copied().map(|role| (role, 10)).collect();
+        for limits in ceilings {
+            validate_effective_run_budget_reservations(&loaded.plan, &budget, limits, true)
+                .expect("only reachable process roles need explicit estimates");
+            for role in &roles {
+                let mut missing = budget.clone();
+                missing.role_token_reservations.remove(role);
+                let error = validate_effective_run_budget_reservations(
+                    &loaded.plan,
+                    &missing,
+                    limits,
+                    true,
+                )
+                .expect_err("missing reachable-role estimate must refuse");
+                assert!(
+                    error.to_string().contains(&format!(
+                        "run_budget.role_token_reservations.{}",
+                        role.as_str()
+                    )),
+                    "{error:#}"
+                );
+                missing.role_token_reservations.insert(*role, 0);
+                let error = validate_effective_run_budget_reservations(
+                    &loaded.plan,
+                    &missing,
+                    limits,
+                    true,
+                )
+                .expect_err("zero reachable-role estimate must refuse");
+                assert!(
+                    error.to_string().contains(&format!(
+                        "run_budget.role_token_reservations.{} must be greater than zero",
+                        role.as_str()
+                    )),
+                    "{error:#}"
+                );
+            }
+        }
+
+        for limits in ceilings {
+            source["run_budget"] = serde_json::to_value(SupervisorBudgetConfig {
+                limits,
+                ..budget.clone()
+            })
+            .expect("serialize authored budget ceiling");
+            parse_supervisor_plan_with_consultant(&source.to_string())
+                .expect("authored ceilings use the same reachable-role validation");
+            for role in &roles {
+                let mut missing = source.clone();
+                missing["run_budget"]["role_token_reservations"]
+                    .as_object_mut()
+                    .expect("reservation object")
+                    .remove(role.as_str());
+                if *role == AgentRole::Worker
+                    && !loaded.plan.assignments[0].worker_assignments.is_empty()
+                {
+                    // An authored nested worker can remain inside a simulated child
+                    // dispatch; verified managed execution checks its own reservation.
+                    let mut simulation_budget = budget.clone();
+                    simulation_budget.role_token_reservations.remove(role);
+                    validate_effective_run_budget_reservations(
+                        &loaded.plan,
+                        &simulation_budget,
+                        RunBudgetLimits {
+                            hard_tokens: Some(100),
+                            ..RunBudgetLimits::default()
+                        },
+                        false,
+                    )
+                    .expect("simulation must not require an undispatched nested Worker");
+                    parse_supervisor_plan_with_consultant(&missing.to_string())
+                        .expect("standalone plan loading does not bind managed execution");
+                    continue;
+                }
+                let error = parse_supervisor_plan_with_consultant(&missing.to_string())
+                    .expect_err("authored ceiling must reject each missing dispatch estimate");
+                assert!(
+                    error.to_string().contains(&format!(
+                        "run_budget.role_token_reservations.{}",
+                        role.as_str()
+                    )),
+                    "{error:#}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn budget_integration_plan_sidecar_is_backward_compatible_and_schema_visible() {
     let legacy_source = json!({
         "version": SUPERVISOR_SCHEMA_VERSION,
