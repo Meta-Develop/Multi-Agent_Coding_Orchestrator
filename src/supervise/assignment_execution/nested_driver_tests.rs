@@ -1515,17 +1515,20 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 )?);
             }
             "permit-race" => {
+                // Share borrowed turn facts without sharing the supervisor-local handoff owner.
+                let parent = ParentTurnObservation::from_collected(&collected);
                 let barrier = std::sync::Barrier::new(2);
                 std::thread::scope(|scope| {
                     let construct = || {
                         let mut independent_outcome = AssignmentExecutionOutcome::default();
                         barrier.wait();
-                        let result = NestedWorkerSerialDriver::from_collected_parent(
+                        let result = NestedWorkerSerialDriver::from_observation(
                             &context,
                             &preflight,
                             &mut independent_outcome,
                             1,
-                            &collected,
+                            parent,
+                            None,
                         );
                         // Hold the successful driver until both constructors return.
                         barrier.wait();
