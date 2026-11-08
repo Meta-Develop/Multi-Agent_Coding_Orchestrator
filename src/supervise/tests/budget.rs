@@ -1900,7 +1900,9 @@ fn budget_integration_scheduler_preserves_judgment_bindings_before_halt() {
     pending_worker.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
     assignments.push(pending_worker);
     let plan = injected_multi_plan(assignments.clone(), 0);
-    let budget = injected_run_budget(Some(10), Some(60), None, None, 10, 1);
+    let mut budget = injected_run_budget(Some(10), Some(60), None, None, 10, 1);
+    // Preflight needs an estimate even for the Worker that must remain pending.
+    budget.role_token_reservations.insert(AgentRole::Worker, 10);
     let run_id = "budget-degrade-production-scheduler";
     let mut options = injected_options(&repo_path, temp.path(), run_id);
     options.admission_overrides = SupervisorAdmissionConfig {
