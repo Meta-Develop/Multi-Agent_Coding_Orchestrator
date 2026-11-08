@@ -1871,7 +1871,6 @@ impl ExternalCodexProfile {
         self
     }
 
-    #[cfg(test)]
     pub(crate) fn writable_artifact_roots(&self) -> &[PathBuf] {
         &self.config.writable_artifact_roots
     }
