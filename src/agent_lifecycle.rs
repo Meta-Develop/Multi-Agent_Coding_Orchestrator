@@ -210,11 +210,14 @@ impl AgentProcessRecord {
                 bail!("agent registry argv entry exceeds its safety bound");
             }
         }
-        self.launch_authority()?;
+        self.historical_launch_authority()?;
         Ok(())
     }
 
-    /// Reconstruct and validate launch authority from immutable record fields.
+    /// Reconstruct launch authority under the current live model authorization.
+    ///
+    /// Historical serialization and registry maintenance use a private validator;
+    /// loading a record must never grant current launch or steering authority.
     ///
     /// Version probes carry no authority. Actual coordinator and acceptance
     /// judge launches require an explicit model accepted by the model policy.
@@ -222,7 +225,33 @@ impl AgentProcessRecord {
     /// Durable mechanical-executor evidence is historical inspect data: it
     /// cannot mint a reusable live proof.
     pub fn launch_authority(&self) -> Result<LaunchAuthorityBinding> {
+        self.validate_mechanical_executor_identity()?;
         derive_launch_authority(&self.role, &self.argv, self.mechanical_executor.as_ref())
+    }
+
+    fn historical_launch_authority(&self) -> Result<LaunchAuthorityBinding> {
+        self.validate_mechanical_executor_identity()?;
+        derive_launch_authority_with_validation(
+            &self.role,
+            &self.argv,
+            self.mechanical_executor.as_ref(),
+            LaunchAuthorityValidation::Historical,
+        )
+    }
+
+    fn validate_mechanical_executor_identity(&self) -> Result<()> {
+        if let Some(evidence) = &self.mechanical_executor {
+            if evidence.run_id != self.run_id
+                || evidence.subject != self.task_id
+                || evidence.grant_nonce == 0
+                || evidence.attempt == 0
+                || !evidence.canonical_program.is_absolute()
+                || !evidence.cwd.is_absolute()
+            {
+                bail!("mechanical executor evidence does not match record identity or paths");
+            }
+        }
+        Ok(())
     }
 
     fn summary(&self) -> String {
@@ -242,7 +271,9 @@ impl Serialize for AgentProcessRecord {
     where
         S: Serializer,
     {
-        let launch_authority = self.launch_authority().map_err(serde::ser::Error::custom)?;
+        let launch_authority = self
+            .historical_launch_authority()
+            .map_err(serde::ser::Error::custom)?;
         let mut field_count = 9;
         if self.parent.is_some() {
             field_count += 1;
@@ -289,10 +320,10 @@ impl<'de> Deserialize<'de> for AgentProcessRecord {
             launch_timestamp_ms: wire.launch_timestamp_ms,
             mechanical_executor: wire.mechanical_executor,
         };
+        let reconstructed = record
+            .historical_launch_authority()
+            .map_err(serde::de::Error::custom)?;
         if let Some(supplied_authority) = supplied_authority {
-            let reconstructed = record
-                .launch_authority()
-                .map_err(serde::de::Error::custom)?;
             if supplied_authority != reconstructed {
                 return Err(serde::de::Error::custom(
                     "agent launch authority does not match immutable role/argv evidence",
@@ -303,13 +334,36 @@ impl<'de> Deserialize<'de> for AgentProcessRecord {
     }
 }
 
+#[derive(Clone, Copy)]
+enum LaunchAuthorityValidation {
+    Current,
+    Historical,
+}
+
 fn derive_launch_authority(
     role: &str,
     argv: &[String],
     mechanical_executor: Option<&MechanicalExecutorLaunchEvidence>,
 ) -> Result<LaunchAuthorityBinding> {
+    derive_launch_authority_with_validation(
+        role,
+        argv,
+        mechanical_executor,
+        LaunchAuthorityValidation::Current,
+    )
+}
+
+fn derive_launch_authority_with_validation(
+    role: &str,
+    argv: &[String],
+    mechanical_executor: Option<&MechanicalExecutorLaunchEvidence>,
+    validation: LaunchAuthorityValidation,
+) -> Result<LaunchAuthorityBinding> {
+    if argv.is_empty() {
+        bail!("agent lifecycle launch requires a non-empty argv");
+    }
     if let Some(evidence) = mechanical_executor {
-        return derive_mechanical_executor_launch_authority(role, argv, evidence);
+        return derive_mechanical_executor_launch_authority(role, argv, evidence, validation);
     }
     let category = lifecycle_role_category(role)?;
     if is_version_probe(argv) {
@@ -356,10 +410,17 @@ fn derive_launch_authority(
     let model = configured_model_from_argv(argv)?;
     let policy_role = lifecycle_policy_role(role);
     match (policy_role, model.as_deref()) {
-        (Some(AgentRole::Worker), None) => {}
-        (Some(policy_role), model) => {
-            validate_known_judgment_role_model(policy_role, model)?;
-        }
+        (Some(AgentRole::Worker), None)
+            if matches!(validation, LaunchAuthorityValidation::Historical)
+                || crate::selection::routing_policy::current_routing_policy().is_none() => {}
+        (Some(policy_role), model) => match validation {
+            LaunchAuthorityValidation::Current => {
+                validate_known_judgment_role_model(policy_role, model)?;
+            }
+            LaunchAuthorityValidation::Historical => {
+                validate_historical_role_model(policy_role, model, None)?;
+            }
+        },
         _ => bail!("agent lifecycle role {role:?} has no launch authority policy"),
     }
     let model_capability = model.as_deref().and_then(trusted_model_capability);
@@ -379,10 +440,37 @@ fn derive_launch_authority(
     })
 }
 
+// Historical classification checks known capability/phase constraints, never the
+// current thread's selected roles. Its output is only durable descriptive data;
+// actual launches still require current selection and any consumed live proof.
+fn validate_historical_role_model(
+    role: AgentRole,
+    model: Option<&str>,
+    duty: Option<MechanicalTerminalDuty>,
+) -> Result<()> {
+    let capability = model
+        .and_then(trusted_model_capability)
+        .context("historical agent model has no trusted capability policy")?;
+    if let Some(duty) = duty {
+        crate::supervise::validate_phase_model_binding(
+            role,
+            OrchestrationPhase::MechanicalTerminal,
+            Some(duty),
+            capability,
+        )?;
+    } else if let Some(phase) = crate::supervise::role_default_phase(role) {
+        crate::supervise::validate_phase_model_binding(role, phase, None, capability)?;
+    } else if capability == ModelCapabilityClass::WeakMechanical {
+        bail!("historical weak_mechanical Worker requires mechanical executor evidence");
+    }
+    Ok(())
+}
+
 fn derive_mechanical_executor_launch_authority(
     role: &str,
     argv: &[String],
     evidence: &MechanicalExecutorLaunchEvidence,
+    validation: LaunchAuthorityValidation,
 ) -> Result<LaunchAuthorityBinding> {
     if role != "worker" || evidence.role != "worker" {
         bail!("mechanical executor evidence requires worker role");
@@ -406,11 +494,18 @@ fn derive_mechanical_executor_launch_authority(
     if model.as_deref() != Some(evidence.model.as_str()) {
         bail!("mechanical executor evidence does not match launched model");
     }
-    authorize_known_executor_role_model(
-        AgentRole::Worker,
-        Some(evidence.model.as_str()),
-        Some(evidence.duty),
-    )?;
+    match validation {
+        LaunchAuthorityValidation::Current => authorize_known_executor_role_model(
+            AgentRole::Worker,
+            Some(evidence.model.as_str()),
+            Some(evidence.duty),
+        )?,
+        LaunchAuthorityValidation::Historical => validate_historical_role_model(
+            AgentRole::Worker,
+            Some(evidence.model.as_str()),
+            Some(evidence.duty),
+        )?,
+    }
     let category = lifecycle_role_category(role)?;
     let model_capability = trusted_model_capability(&evidence.model);
     Ok(LaunchAuthorityBinding {
@@ -446,7 +541,12 @@ pub(crate) fn authorize_process_launch_before_spawn(
     if let Some(reserved) = reserved {
         verify_reserved_mechanical_executor(metadata, argv, current_dir, reserved)?;
         let evidence = evidence_from_reserved(reserved)?;
-        derive_mechanical_executor_launch_authority(&metadata.role, argv, &evidence)?;
+        derive_mechanical_executor_launch_authority(
+            &metadata.role,
+            argv,
+            &evidence,
+            LaunchAuthorityValidation::Current,
+        )?;
         return Ok(());
     }
     if !is_version_probe(argv) && is_agent_runtime_program(&argv[0]) {
@@ -793,6 +893,9 @@ impl AgentRegistry {
         if argv.is_empty() {
             bail!("agent lifecycle registration requires a non-empty argv");
         }
+        // Registry maintenance validates old records historically. This new
+        // record must independently pass current admission before any update.
+        authorize_process_launch_before_spawn(metadata, &argv, &metadata.repo, None)?;
         let record = AgentProcessRecord {
             pid,
             process_start_time: process_start_time(pid)
