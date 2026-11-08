@@ -4153,6 +4153,85 @@ fn preflight_directly_validates_schedule_and_reserves_artifacts() {
 }
 
 #[test]
+fn preflight_cli_only_ceilings_refuse_before_run_artifacts_or_selection() {
+    for limits in [
+        RunBudgetLimits {
+            soft_tokens: Some(1_000_000),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            hard_tokens: Some(1_000_000),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            soft_cost_usd: Some(1.0),
+            ..RunBudgetLimits::default()
+        },
+        RunBudgetLimits {
+            hard_cost_usd: Some(1.0),
+            ..RunBudgetLimits::default()
+        },
+    ] {
+        let (_temp, repo) = test_repository();
+        let plan = test_plan(vec![test_assignment("unreserved-child", "README.md")]);
+        // This is a valid authored plan until the CLI supplies a ceiling.
+        let mut loaded = parse_supervisor_plan_with_consultant(
+            &serde_json::to_string(&plan).expect("serialize authored unbounded plan"),
+        )
+        .expect("no-ceiling plan remains accepted");
+        let mut options = test_options(&repo, "cli-only-unreserved-budget");
+        options.budget_overrides = limits;
+        let error = prepare_supervisor_run(
+            loaded.clone(),
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        )
+        .err()
+        .expect("effective ceiling requires explicit estimates");
+        assert!(
+            error
+                .to_string()
+                .contains("run_budget.role_token_reservations.child_orchestrator"),
+            "{error:#}"
+        );
+        assert!(
+            !repo.join(".maco").exists(),
+            "invalid effective budget must refuse before artifacts, selection or claims"
+        );
+
+        loaded.plan_metadata.run_budget.role_token_reservations =
+            BTreeMap::from([(AgentRole::ChildOrchestrator, 10), (AgentRole::Auditor, 10)]);
+        let prepared = prepare_supervisor_run(
+            loaded,
+            &options,
+            1,
+            SupervisorExecutionRuntime::NonpublishableSimulation,
+            SupervisorWorktreeCreation::TestOnly,
+            Ok(RuntimeModelCatalog::LocalDeterministicFake),
+        )
+        .expect("CLI-only ceilings accept explicit reservations");
+        assert_eq!(
+            prepared
+                .budget_ledger
+                .report()
+                .expect("CLI-only budget report")
+                .sources
+                .expect("CLI source must be retained")
+                .cli
+                .limits,
+            limits
+        );
+        assert_eq!(
+            prepared.plan_metadata.run_budget.role_token_reservations,
+            BTreeMap::from([(AgentRole::ChildOrchestrator, 10), (AgentRole::Auditor, 10),])
+        );
+    }
+}
+
+#[test]
 fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
     let (_temp, repo) = test_repository();
     let mut metadata = SupervisorPlanMetadata::default();
@@ -4163,6 +4242,8 @@ fn preflight_composes_cli_budget_overrides_with_plan_by_strictest_limit() {
         hard_cost_usd: Some(1.0),
     };
     metadata.run_budget_max_duration_seconds = Some(600);
+    metadata.run_budget.role_token_reservations =
+        BTreeMap::from([(AgentRole::ChildOrchestrator, 10), (AgentRole::Auditor, 10)]);
     let loaded = LoadedSupervisorPlan {
         plan: test_plan(vec![test_assignment("budgeted-child", "README.md")]),
         consultant: SupervisorConsultantPlan::default(),

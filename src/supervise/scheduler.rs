@@ -3882,6 +3882,14 @@ fn prepare_supervisor_run(
         mut plan_metadata,
     } = loaded;
     validate_max_concurrent_children(max_concurrent_children)?;
+    super::plan_validation::validate_effective_run_budget_reservations(
+        &plan,
+        &plan_metadata.run_budget,
+        options.budget_overrides,
+        execution_runtime == SupervisorExecutionRuntime::Verified
+            && plan_metadata.execution_target.is_none()
+            && plan_metadata.evidence_only_reaudit.is_none(),
+    )?;
     match worktree_creation {
         SupervisorWorktreeCreation::Bound(_)
         | SupervisorWorktreeCreation::BoundSourceHead(_, _)
