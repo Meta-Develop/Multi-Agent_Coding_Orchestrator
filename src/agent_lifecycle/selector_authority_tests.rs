@@ -399,7 +399,8 @@ fn historical_mechanical_serde_preserves_evidence_without_minting_live_proof() -
     Repository::init(temp.path())?;
     let mut record = historical_record(temp.path());
     record.role = "worker".into();
-    record.argv[0] = "/usr/bin/codex".into();
+    let program = temp.path().join("codex");
+    record.argv[0] = program.to_string_lossy().into_owned();
     record.argv[3] = "historical-mechanical-fixture".into();
     record.mechanical_executor = Some(MechanicalExecutorLaunchEvidence {
         grant_nonce: 7,
