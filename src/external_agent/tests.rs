@@ -10859,7 +10859,7 @@ fn grok_live_launch_profile_binds_exact_credentials_and_normalized_home() -> Res
         ExternalAgentInvocation::Grok,
         "LANG"
     ));
-    assert!(runtime_environment_passthrough_allowed(
+    assert!(!runtime_environment_passthrough_allowed(
         ExternalAgentInvocation::CodexSupervisor,
         "HOME"
     ));
