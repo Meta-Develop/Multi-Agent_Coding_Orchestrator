@@ -31,7 +31,7 @@ pub(super) fn require_worker_custody(
     journal: &WorkerExecutionJournalEvidence,
     run: &ExternalAgentRun,
 ) -> Result<()> {
-    use crate::codex_app_server::{
+    use crate::external_agent::codex_app_server::{
         CommandExecutionObservation, CommandExecutionStatus, TurnTerminalStatus,
     };
     let WorkerExecutionJournalStatus::Loaded(entries) = &journal.status else {

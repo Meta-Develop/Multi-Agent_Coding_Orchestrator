@@ -432,7 +432,7 @@ impl Fixture {
                     || self.case.ends_with("outer-wrong-validation-occurrence")
                     || self.case.ends_with("outer-ambiguous-validation-reference")
                 {
-                    use crate::codex_app_server::CommandExecutionObservation;
+                    use crate::external_agent::codex_app_server::CommandExecutionObservation;
                     let host = native
                         .codex_command_execution_evidence()
                         .context("live host")?;
@@ -687,7 +687,7 @@ impl Fixture {
             let entries = parse_worker_execution_journal(&archived[&journal_path], &journal_path)?;
             let predecessor_runs = self.predecessor_runs.lock().unwrap();
             let native = &predecessor_runs["worker"];
-            use crate::codex_app_server::CommandExecutionObservation;
+            use crate::external_agent::codex_app_server::CommandExecutionObservation;
             let host = native
                 .codex_command_execution_evidence()
                 .context("live host outcomes")?;
