@@ -3192,6 +3192,149 @@ fn managed_git_metadata_is_private_gitdir_write_and_shared_components_read_in_bo
     Ok(())
 }
 
+#[test]
+fn codex_runtime_passthrough_cannot_replace_private_shell_or_managed_git_inputs() {
+    for invocation in [
+        ExternalAgentInvocation::CodexSupervisor,
+        ExternalAgentInvocation::CodexConsultant,
+    ] {
+        for key in [
+            "HOME",
+            "TMPDIR",
+            "PATH",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            "GIT_CONFIG_COUNT",
+            "GIT_CONFIG_GLOBAL",
+            "GIT_CONFIG_NOSYSTEM",
+            "GIT_DIR",
+            "GIT_OBJECT_DIRECTORY",
+            "GIT_TERMINAL_PROMPT",
+            "GIT_WORK_TREE",
+            "GIT_CONFIG_KEY_0",
+            "GIT_CONFIG_KEY_2",
+            "GIT_CONFIG_KEY_999",
+            "GIT_CONFIG_VALUE_0",
+            "GIT_CONFIG_VALUE_2",
+            "GIT_CONFIG_VALUE_999",
+        ] {
+            for candidate in [
+                key.to_string(),
+                key.to_ascii_lowercase(),
+                format!("{}{}", &key[..1], key[1..].to_ascii_lowercase()),
+            ] {
+                assert!(
+                    !runtime_environment_passthrough_allowed(invocation, &candidate),
+                    "{candidate}"
+                );
+            }
+        }
+        // Existing authentication of the outer runtime is separate from shell
+        // inheritance; the exact shell allowlist still withholds these inputs.
+        for key in ["OPENAI_API_KEY", "CODEX_HOME", "ARBITRARY_INPUT"] {
+            assert!(
+                runtime_environment_passthrough_allowed(invocation, key),
+                "{key}"
+            );
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn codex_shell_policy_preserves_exact_managed_git_inputs_without_admitting_launch_secrets(
+) -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = managed_git_command(&child, &incoming);
+    let original_controls = protected_worktree_controls(&command)?;
+    assert!(original_controls
+        .managed_git
+        .as_ref()
+        .context("managed Git controls")?
+        .active_commit_hook
+        .is_some());
+
+    for with_hook in [false, true] {
+        let mut controls = original_controls.clone();
+        let git = controls
+            .managed_git
+            .as_mut()
+            .context("managed Git controls")?;
+        if !with_hook {
+            git.active_commit_hook = None;
+        }
+        let mut expected_environment = managed_git_environment(git)?;
+        expected_environment.insert("GIT_WORK_TREE".to_string(), child.display().to_string());
+        for key in ["HOME", "PATH", "TMPDIR"] {
+            expected_environment.insert(key.to_string(), "private-runtime-fixture".to_string());
+        }
+        let expected_keys = expected_environment.keys().cloned().collect::<Vec<_>>();
+        let expected_config_keys = expected_environment
+            .iter()
+            .filter(|(key, _)| key.starts_with("GIT_CONFIG_KEY_"))
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect::<BTreeMap<_, _>>();
+        assert_eq!(expected_config_keys.len(), if with_hook { 3 } else { 2 });
+
+        for (label, argv) in [
+            ("exec", codex_hardened_argv(&command, &controls)),
+            ("app-server", codex_app_server_argv(&command, &controls)),
+        ] {
+            let policy = argv
+                .windows(2)
+                .filter(|pair| pair[0] == "-c")
+                .filter_map(|pair| pair[1].to_str())
+                .filter_map(|value| value.strip_prefix("shell_environment_policy."))
+                .map(|value| value.split_once('=').expect("policy key=value"))
+                .collect::<BTreeMap<_, _>>();
+            assert_eq!(policy.len(), 4, "{label}");
+            assert_eq!(policy.get("inherit"), Some(&"\"all\""), "{label}");
+            assert_eq!(
+                policy.get("ignore_default_excludes"),
+                Some(&"false"),
+                "{label}"
+            );
+            let included: Vec<String> =
+                serde_json::from_str(policy.get("include_only").context("include_only")?)?;
+            assert_eq!(included, expected_keys, "{label}, hook={with_hook}");
+            for forbidden in [
+                "CODEX_HOME",
+                "OPENAI_API_KEY",
+                "CODEX_API_KEY",
+                "CODEX_ACCESS_TOKEN",
+                "AWS_SECRET_ACCESS_KEY",
+                "SSH_AUTH_SOCK",
+                "MACO_CAM_AUTHORITY_SOCKET",
+                "NODE_OPTIONS",
+                "ARBITRARY_INPUT",
+            ] {
+                assert!(
+                    !included.iter().any(|key| key == forbidden),
+                    "{label}: {forbidden}"
+                );
+            }
+            let overrides = policy.get("set").context("fixed Git key overrides")?;
+            let overrides = overrides
+                .strip_prefix('{')
+                .and_then(|value| value.strip_suffix('}'))
+                .context("inline overrides table")?
+                .split(',')
+                .map(|entry| {
+                    let (key, value) = entry.split_once('=').context("fixed Git key entry")?;
+                    Ok((key.to_string(), serde_json::from_str::<String>(value)?))
+                })
+                .collect::<Result<BTreeMap<_, _>>>()?;
+            // Default *KEY* filtering drops these inputs; only the exact fixed
+            // config names from the managed Git producer may be restored.
+            assert_eq!(overrides, expected_config_keys, "{label}, hook={with_hook}");
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 #[test]
 fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection() -> Result<()> {
@@ -6587,11 +6730,11 @@ fn supervisor_argv_enables_multi_agent_without_ephemeral() {
             "-c",
             "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},\"/run\"=\"write\"}",
             "-c",
-            "shell_environment_policy.inherit=\"core\"",
+            "shell_environment_policy.inherit=\"all\"",
             "-c",
             "shell_environment_policy.ignore_default_excludes=false",
             "-c",
-            "shell_environment_policy.include_only=[\"PATH\"]",
+            "shell_environment_policy.include_only=[\"HOME\",\"PATH\",\"TMPDIR\"]",
             "-c",
             "web_search=\"disabled\"",
             "--disable",
@@ -10926,9 +11069,9 @@ fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
             "default_permissions=\"maco_external_codex\"",
             "permissions.maco_external_codex.network={enabled=false}",
             "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},\"/run\"=\"write\"}",
-            "shell_environment_policy.inherit=\"core\"",
+            "shell_environment_policy.inherit=\"all\"",
             "shell_environment_policy.ignore_default_excludes=false",
-            "shell_environment_policy.include_only=[\"PATH\"]",
+            "shell_environment_policy.include_only=[\"HOME\",\"PATH\",\"TMPDIR\"]",
             "web_search=\"disabled\"",
             "project_doc_max_bytes=0",
         ] {
