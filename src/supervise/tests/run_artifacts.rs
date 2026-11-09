@@ -5722,7 +5722,7 @@ fn bounded_review_transcript_fails_closed_when_required_material_cannot_fit() {
 
 #[test]
 fn retained_large_multibyte_transcript_is_authenticated_before_request_bounding() {
-    const LARGE_TRANSCRIPT_FLOOR_BYTES: usize = 550 * 1024;
+    const LARGE_TRANSCRIPT_FLOOR_BYTES: usize = REVIEW_LENS_REQUEST_LIMIT_BYTES + 32 * 1024;
 
     let (_temp, repo_path) = injected_repository();
     let run_id = RunId::new("review-transcript-large-multibyte").expect("valid run id");

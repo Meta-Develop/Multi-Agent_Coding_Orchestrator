@@ -2967,6 +2967,308 @@ fn managed_git_command(child: &Path, incoming: &Path) -> ExternalAgentCommand {
 }
 
 #[cfg(unix)]
+fn worker_read_only_roots_fixture() -> Result<(tempfile::TempDir, ExternalAgentCommand)> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _git) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = managed_git_command(&child, &incoming).with_agent_lifecycle(
+        &child,
+        "worker",
+        "run-roots",
+        "worker-roots",
+    );
+    Ok((temp, command))
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_parse_colon_list_and_deduplicate() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let roots = [
+        temp.path().join("toolchain-a"),
+        temp.path().join("toolchain-b"),
+    ];
+    for root in &roots {
+        fs::create_dir(root)?;
+    }
+    let configured = std::env::join_paths([&roots[1], &roots[0], &roots[1]])?;
+    let controls = protected_worktree_controls_with_worker_roots(&command, Some(&configured))?;
+    assert_eq!(controls.worker_read_only_roots, roots);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reject_invalid_entries_before_launch() -> Result<()> {
+    use std::os::unix::{ffi::OsStringExt, fs::symlink};
+
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    let file = temp.path().join("file");
+    fs::write(&file, b"file")?;
+    let alias = temp.path().join("alias");
+    symlink(&root, &alias)?;
+    let non_utf8 = temp.path().join(OsString::from_vec(vec![b't', 0xff]));
+    fs::create_dir(&non_utf8)?;
+    for (entry, reason) in [
+        (PathBuf::from("relative"), "must be absolute"),
+        (root.join("../toolchain"), "must already be normalized"),
+        (temp.path().join("missing"), "could not be resolved"),
+        (file, "must be a directory"),
+        (alias, "must already be canonical"),
+        (root.join("."), "must already be canonical"),
+        (non_utf8, "must be valid UTF-8"),
+    ] {
+        // Include a valid first entry to prove a later bad entry rejects the list.
+        let configured = std::env::join_paths([&root, &entry])?;
+        let error = protected_worktree_controls_with_worker_roots(&command, Some(&configured))
+            .expect_err("invalid root must refuse launch");
+        assert!(error
+            .to_string()
+            .contains(&format!("{:?}", entry.as_os_str())));
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+    }
+    for configured in [
+        format!(":{}", root.display()),
+        format!("{}:", root.display()),
+        format!("{}::{}", root.display(), root.display()),
+    ] {
+        let error =
+            protected_worktree_controls_with_worker_roots(&command, Some(OsStr::new(&configured)))
+                .expect_err("empty list entry must refuse launch");
+        assert!(error.to_string().contains("entry \"\""));
+        assert!(format!("{error:#}").contains("must be absolute"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reject_overlaps_in_both_directions() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let (temp, mut command) = worker_read_only_roots_fixture()?;
+    let hidden = temp.path().join("hidden-parent/hidden");
+    let writable = temp.path().join("writable-parent/writable");
+    fs::create_dir_all(&hidden)?;
+    fs::create_dir_all(&writable)?;
+    command.hidden_roots.push(hidden.clone());
+    let mut controls = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let mut writable_control = controls.read_only_roots[0].clone();
+    writable_control.absolute = writable.clone();
+    controls.read_write_roots.push(writable_control);
+    let private_git = controls
+        .managed_git
+        .as_ref()
+        .unwrap()
+        .private_git_dir
+        .clone();
+    for protected in [
+        command.cwd.clone(),
+        private_git,
+        hidden.clone(),
+        writable,
+        controls.writable_artifact_root.clone().unwrap(),
+    ] {
+        let child = protected.join("nested-read-only-root");
+        fs::create_dir(&child)?;
+        for entry in [&protected, &child, protected.parent().unwrap()] {
+            let error =
+                validate_worker_read_only_roots(&command, &controls, Some(entry.as_os_str()))
+                    .expect_err("overlapping root must refuse launch");
+            assert!(error
+                .to_string()
+                .contains(&format!("{:?}", entry.as_os_str())));
+            assert!(format!("{error:#}").contains("overlaps protected path"));
+        }
+        fs::remove_dir(child)?;
+    }
+    // Hidden aliases, including missing descendants, must not reveal a granted root.
+    let toolchain = temp.path().join("toolchain");
+    fs::create_dir(&toolchain)?;
+    let alias = temp.path().join("hidden-alias");
+    symlink(&toolchain, &alias)?;
+    for hidden in [alias.clone(), alias.join("missing")] {
+        command.hidden_roots = vec![hidden];
+        let error =
+            validate_worker_read_only_roots(&command, &controls, Some(toolchain.as_os_str()))
+                .expect_err("hidden alias must refuse launch");
+        assert!(format!("{error:#}").contains("overlaps protected path"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reach_both_layers_with_exact_read_permission() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("aaa-toolchain");
+    fs::create_dir(&root)?;
+    let baseline = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let controls = protected_worktree_controls_with_worker_roots(&command, Some(root.as_os_str()))?;
+    let prefix = "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},";
+    let baseline_permissions = codex_filesystem_permissions(&command, &baseline);
+    let expected = format!(
+        "{prefix}{}=\"read\",{}",
+        toml_basic_string(root.to_str().unwrap()),
+        baseline_permissions
+            .strip_prefix(prefix)
+            .context("legacy permission prefix")?,
+    );
+    assert_eq!(codex_filesystem_permissions(&command, &controls), expected);
+    for argv in [
+        command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+        codex_app_server_argv(&command, &controls),
+    ] {
+        assert!(argv.contains(&OsString::from(&expected)));
+    }
+    let profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(profile.visible_read_only_roots().contains(&root));
+    assert!(!profile.visible_read_write_roots().contains(&root));
+    assert!(!profile.writable_artifact_roots().contains(&root));
+    let mut staged_controls = controls.clone();
+    staged_controls.writable_artifact_root = Some(root.join("private-staging"));
+    let error = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &staged_controls,
+    )
+    .expect_err("final output staging must remain disjoint from the read-only root");
+    assert!(error
+        .to_string()
+        .contains(&format!("{:?}", root.as_os_str())));
+    assert!(format!("{error:#}").contains("overlaps protected path"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_unset_and_empty_preserve_legacy_argv_and_profile() -> Result<()> {
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    // This role used the same Git controls and writable profile before the setting existed.
+    let legacy_command = command.clone().with_agent_lifecycle(
+        &command.cwd,
+        "child_orchestrator",
+        "run-roots",
+        "worker-roots",
+    );
+    let legacy = protected_worktree_controls_with_worker_roots(&legacy_command, None)?;
+    assert!(legacy.worker_read_only_roots.is_empty());
+    let expected_argv = command_argv_with_controls_and_service_tier_input(&command, &legacy, None)?;
+    let expected_app_server = codex_app_server_argv(&command, &legacy);
+    let expected_profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &legacy,
+    )?;
+    for configured in [None, Some(OsStr::new(""))] {
+        let controls = protected_worktree_controls_with_worker_roots(&command, configured)?;
+        assert_eq!(controls, legacy);
+        assert_eq!(
+            command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+            expected_argv
+        );
+        assert_eq!(
+            codex_app_server_argv(&command, &controls),
+            expected_app_server
+        );
+        assert_eq!(
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &controls,
+            )?,
+            expected_profile
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_exclude_other_roles_read_only_primary_and_consultants() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    let mut excluded = Vec::new();
+    for role in [
+        "auditor",
+        "reviewer",
+        "researcher",
+        "consultant",
+        "child_orchestrator",
+        "Worker",
+    ] {
+        excluded.push(
+            command
+                .clone()
+                .with_agent_lifecycle(&command.cwd, role, "run", "task"),
+        );
+    }
+    excluded.push(
+        command
+            .clone()
+            .with_workspace_access(WorkspaceAccess::ReadOnly),
+    );
+    let mut primary = command.clone();
+    primary.writable_launch_target = WritableLaunchTarget::PrimaryWorktree;
+    excluded.push(primary);
+    let mut anonymous = command.clone();
+    anonymous.agent_lifecycle = None;
+    excluded.push(anonymous);
+    for invocation in [
+        ExternalAgentInvocation::CodexConsultant,
+        ExternalAgentInvocation::ClaudeConsultant,
+    ] {
+        let mut consultant = command.clone();
+        consultant.invocation = invocation;
+        excluded.push(consultant);
+    }
+    for excluded in excluded {
+        let baseline = protected_worktree_controls_with_worker_roots(&excluded, None)?;
+        for configured in [root.as_os_str(), OsStr::new("invalid-relative-entry")] {
+            let controls =
+                protected_worktree_controls_with_worker_roots(&excluded, Some(configured))?;
+            assert_eq!(controls, baseline);
+            assert_eq!(
+                codex_app_server_argv(&excluded, &controls),
+                codex_app_server_argv(&excluded, &baseline)
+            );
+            if excluded.invocation != ExternalAgentInvocation::ClaudeConsultant {
+                assert_eq!(
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &controls,
+                    )?,
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &baseline,
+                    )?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn exact_worker_journal_controls(
     child: &Path,
     root: &Path,
@@ -3412,6 +3714,246 @@ fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection
     assert!(crate::git_repository::open(&primary)?
         .find_commit(private_head)
         .is_ok());
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_profile_exposes_only_primary_authorship_guard() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let guard = primary.join(".agents/scripts/check-human-authorship");
+    fs::create_dir_all(guard.parent().context("guard parent")?)?;
+    fs::write(&guard, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    fs::write(primary.join(".agents/private-sibling"), "private\n")?;
+    prepare_managed_child_git_boundary_for_test(&child)?;
+    let mut boundary = bind_existing_managed_child_git_boundary(&child)?;
+    assert!(!boundary.metadata.common_read_only_files.contains(&guard));
+    assert!(!child
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let expected = StrictOfflineWorkspaceProfile::read_only(&child)
+        .with_writable_artifact_root(boundary.private_git_dir())
+        .with_visible_read_only_root(boundary.shared_object_dir());
+    let hook_profile = expected
+        .clone()
+        .with_visible_read_only_file(common.join("hooks/commit-msg"));
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile.clone().with_visible_read_only_file(&guard)
+    );
+
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o644))?;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile
+    );
+    fs::remove_file(&guard)?;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile
+    );
+    fs::write(&guard, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    boundary.metadata.active_commit_hook = None;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        expected
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_profile_rejects_unsafe_authorship_guards() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let scripts = primary.join(".agents/scripts");
+    fs::create_dir_all(&scripts)?;
+    let guard = scripts.join("check-human-authorship");
+    let target = temp.path().join("outside-guard");
+    fs::write(&target, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+    prepare_managed_child_git_boundary_for_test(&child)?;
+    let mut boundary = bind_existing_managed_child_git_boundary(&child)?;
+
+    symlink(&target, &guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("non-symlink regular file"));
+    fs::remove_file(&guard)?;
+    fs::create_dir(&guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("non-symlink regular file"));
+    fs::remove_dir(&guard)?;
+    fs::hard_link(&target, &guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("hard-link alias"));
+    fs::remove_file(&guard)?;
+    fs::rename(&target, &guard)?;
+    boundary.metadata.private_git_dir = scripts;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("overlaps writable private Git"));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_runs_primary_authorship_guard() -> Result<()> {
+    skip_without_containment!(ok);
+    check_managed_child_materialization_primary_guard(true)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_missing_primary_authorship_guard_fails_closed() -> Result<()> {
+    skip_without_containment!(ok);
+    check_managed_child_materialization_primary_guard(false)
+}
+
+#[cfg(target_os = "linux")]
+fn check_managed_child_materialization_primary_guard(with_guard: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let hook = common.join("hooks/commit-msg");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+installed_guard_dir='{}'
+"#,
+            primary.join(".agents/scripts").display()
+        ) + r#"self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+previous="$self.human-authorship-previous"
+if [[ -x "$previous" ]]; then
+  "$previous" "$@"
+fi
+
+resolve_guard() {
+  local name="$1"
+  local repo_root
+  local primary
+  local common_dir
+  local fallback
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  primary="$repo_root/.agents/scripts/$name"
+  if [[ -x "$primary" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
+      "$name" >&2
+    return 1
+  fi
+  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
+  if [[ -x "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  if [[ -x "$installed_guard_dir/$name" ]]; then
+    printf '%s\n' "$installed_guard_dir/$name"
+    return 0
+  fi
+
+  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s, %s and %s\n' \
+    "$name" "$primary" "$fallback" "$installed_guard_dir/$name" >&2
+  return 1
+}
+
+guard="$(resolve_guard check-human-authorship)"
+exec "$guard" "$@"
+"#,
+    )?;
+    let guard = primary.join(".agents/scripts/check-human-authorship");
+    let guard_contents = r#"#!/bin/sh
+set -eu
+test "$(git config --local --get user.name)" = 'Fixture Owner'
+test "$(git config --local --get user.email)" = 'fixture@example.invalid'
+for ident in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+  git var "$ident" | awk '{ if ($1 != "Fixture" || $2 != "Owner" || $3 != "<fixture@example.invalid>") exit 1 }'
+done
+temporary="$(mktemp)"
+trap 'rm -f "$temporary"' EXIT
+awk 'NR == 1 { if ($0 != "Materialize verified managed child candidate") exit 1; print "checked" }' "$1" > "$temporary"
+test "$(cat "$temporary")" = checked
+if printf 'tamper\n' >> "$0" 2>/dev/null; then
+  exit 1
+fi
+"#;
+    if with_guard {
+        fs::create_dir_all(guard.parent().context("guard parent")?)?;
+        fs::write(&guard, guard_contents)?;
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    }
+    assert!(!child
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let metadata = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    // Without commondir, Git's common directory is the private GIT_DIR.
+    // Neither earlier dispatcher candidate exists, so only installed_guard_dir works.
+    assert!(!boundary.private_git_dir().join("commondir").exists());
+    assert!(!boundary
+        .private_git_dir()
+        .parent()
+        .context("private Git directory parent")?
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let base = boundary.revalidate()?;
+    let shared_before = snapshot_managed_git_tree(&common)?;
+    fs::write(child.join("RELEASE_NOTES.md"), "guarded candidate\n")?;
+    let candidate_tree = expected_managed_candidate_tree(
+        &metadata,
+        base,
+        &[("RELEASE_NOTES.md", Some(b"guarded candidate\n"), 0o100644)],
+    )?;
+    let paths = [PathBuf::from("RELEASE_NOTES.md")];
+    let result = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        base,
+        &paths,
+        &paths,
+        candidate_tree,
+    );
+    if with_guard {
+        let head = result?.context("guarded candidate did not materialize")?;
+        assert_ne!(head, base);
+        assert_eq!(boundary.revalidate()?, head);
+        assert_eq!(fs::read_to_string(&guard)?, guard_contents);
+    } else {
+        let error = result.expect_err("missing guard must reject the commit");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("commit managed child materialization candidate failed"),
+            "{message}"
+        );
+        assert!(message.contains("missing executable guard"), "{message}");
+        assert_eq!(boundary.revalidate()?, base);
+    }
+    let mut shared_after = snapshot_managed_git_tree(&common)?;
+    // The private boundary alone may change during supervisor materialization.
+    let private_relative = boundary.private_git_dir().strip_prefix(&common)?;
+    shared_after.retain(|path, _| !path.starts_with(private_relative));
+    let shared_before = shared_before
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(private_relative))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(shared_after, shared_before);
     Ok(())
 }
 

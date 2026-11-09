@@ -1866,7 +1866,7 @@ fn review_lens_withheld_evidence_rule(
             "The earlier instruction to reject when the worktree diff is missing does not apply to this output-only scope: the diff is withheld by the information boundary. Judge only the supplied reports against REQUIRED_COVERAGE_JSON."
         }
         (ReviewInformationScope::FullChildTranscript, _) => {
-            "This full-transcript scope supplies the child transcript. Missing worker evidence inside that supplied transcript remains grounds for rejection."
+            "This full-transcript scope supplies the child transcript. Declared compaction removes records repeated later with only in-progress placeholders and start timestamps differing, and provider telemetry; their absence is not missing evidence. Head/tail truncation leaves evidence unavailable and may justify rejection. Other missing worker evidence remains grounds for rejection."
         }
     }
 }
@@ -3510,7 +3510,7 @@ mod regression_tests {
             },
             information_scope: ReviewInformationScope::FullChildTranscript,
         };
-        let child_transcript = "t".repeat(96 * 1024);
+        let child_transcript = "t".repeat(600 * 1024);
         let output_report = "r".repeat(32 * 1024);
         let request = build_review_lens_request(
             &lens,
