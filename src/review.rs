@@ -37,7 +37,8 @@ use std::os::unix::{
 const REVIEW_OUTPUT_LIMIT: usize = 8 * 1024;
 const REVIEW_CAPTURE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
 const REVIEW_JSON_LIMIT_BYTES: usize = 256 * 1024;
-pub const REVIEW_LENS_REQUEST_LIMIT_BYTES: usize = 256 * 1024;
+pub const REVIEW_LENS_REQUEST_LIMIT_BYTES: usize = 640 * 1024;
+const REVIEW_EXTERNAL_INPUT_LIMIT_BYTES: usize = 256 * 1024;
 const REVIEW_INPUT_LIMIT_BYTES: usize = REVIEW_LENS_REQUEST_LIMIT_BYTES;
 const REVIEW_CONFIG_LIMIT_BYTES: usize = 64 * 1024;
 const REVIEW_COMMAND_LIMIT_BYTES: usize = 16 * 1024;
@@ -73,6 +74,8 @@ const SANITIZED_REVIEW_VIEW_DOMAIN: &[u8] = b"MACO\0sanitized-review-view\0v1\0"
 const REVIEW_SHA256_IDENTITY_PREFIX: &str = "sha256:";
 const REVIEW_TRANSCRIPT_COMPLETE_MARKER: &str =
     "complete: authoritative transcript is reproduced in head_excerpt";
+const REVIEW_TRANSCRIPT_COMPACTED_MARKER: &str =
+    "complete after compaction: only superseded records and provider telemetry removed";
 const REVIEW_TRANSCRIPT_TRUNCATED_MARKER: &str =
     "truncated: middle omitted; authoritative full transcript retained in authenticated parent artifact";
 
@@ -583,11 +586,188 @@ pub struct BoundedReviewTranscript {
     pub authoritative_artifact: PathBuf,
     pub original_bytes: u64,
     pub sha256: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction: Option<ReviewTranscriptCompaction>,
     pub truncated: bool,
     pub omitted_bytes: u64,
     pub truncation_marker: String,
     pub head_excerpt: String,
     pub tail_excerpt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReviewTranscriptCompaction {
+    pub compacted_bytes: u64,
+    pub compacted_sha256: String,
+    pub removed_records: BTreeMap<String, u64>,
+}
+
+/// Removes only whole records. Unknown notifications and malformed lines remain
+/// byte-identical, including their original line endings.
+fn compact_review_transcript(transcript: &str) -> (String, Option<ReviewTranscriptCompaction>) {
+    let lines: Vec<&str> = transcript.split_inclusive('\n').collect();
+    let records: Vec<Option<serde_json::Value>> = lines
+        .iter()
+        .map(|line| serde_json::from_str(line).ok())
+        .collect();
+    let mut item_counts = BTreeMap::<_, (usize, usize)>::new();
+    for record in records.iter().flatten() {
+        let params = &record["params"];
+        let Some(id) = params["item"]["id"].as_str() else {
+            continue;
+        };
+        let counts = item_counts
+            .entry(review_transcript_item_key(params, id))
+            .or_default();
+        match record["method"].as_str() {
+            Some("item/started") => counts.0 += 1,
+            Some("item/completed") => counts.1 += 1,
+            _ => {}
+        }
+    }
+    let mut completed = BTreeMap::new();
+    let mut delta_groups = BTreeMap::<_, Vec<usize>>::new();
+    let mut removed = vec![None; lines.len()];
+    for (index, record) in records.iter().enumerate().rev() {
+        let Some(record) = record else {
+            continue;
+        };
+        let method = record["method"].as_str().unwrap_or_default();
+        let params = &record["params"];
+        match method {
+            "thread/tokenUsage/updated"
+            | "account/rateLimits/updated"
+            | "turn/moderationMetadata"
+            | "remoteControl/status/changed"
+            | "account/updated" => removed[index] = Some("provider_telemetry"),
+            "item/completed" => {
+                if let Some(id) = params["item"]["id"].as_str() {
+                    completed.insert(review_transcript_item_key(params, id), index);
+                }
+            }
+            "item/started" => {
+                if params["item"]["id"].as_str().is_some_and(|id| {
+                    let key = review_transcript_item_key(params, id);
+                    item_counts.get(&key) == Some(&(1, 1))
+                        && completed.get(&key).is_some_and(|&completion| {
+                            review_transcript_started_item_is_superseded(
+                                &params["item"],
+                                &records[completion].as_ref().expect("parsed completion")["params"]
+                                    ["item"],
+                            )
+                        })
+                }) {
+                    removed[index] = Some("superseded_item_started");
+                }
+            }
+            "item/commandExecution/outputDelta"
+            | "item/agentMessage/delta"
+            | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/textDelta" => {
+                let Some(id) = params["itemId"].as_str() else {
+                    continue;
+                };
+                let Some(&completion) = completed.get(&review_transcript_item_key(params, id))
+                else {
+                    continue;
+                };
+                // Reasoning streams have separately indexed summary/content parts.
+                let part = match method {
+                    "item/reasoning/summaryTextDelta" => params["summaryIndex"].as_u64(),
+                    "item/reasoning/textDelta" => params["contentIndex"].as_u64(),
+                    _ => Some(0),
+                };
+                if let Some(part) = part {
+                    delta_groups
+                        .entry((completion, method, part))
+                        .or_default()
+                        .push(index);
+                }
+            }
+            _ => {}
+        }
+    }
+    for ((completion, method, part), indices) in delta_groups {
+        let item = &records[completion].as_ref().expect("parsed completion")["params"]["item"];
+        let content = match (method, item["type"].as_str()) {
+            ("item/commandExecution/outputDelta", Some("commandExecution")) => {
+                item["aggregatedOutput"].as_str()
+            }
+            ("item/agentMessage/delta", Some("agentMessage")) => item["text"].as_str(),
+            ("item/reasoning/summaryTextDelta", Some("reasoning")) => usize::try_from(part)
+                .ok()
+                .and_then(|part| item["summary"].get(part))
+                .and_then(serde_json::Value::as_str),
+            ("item/reasoning/textDelta", Some("reasoning")) => usize::try_from(part)
+                .ok()
+                .and_then(|part| item["content"].get(part))
+                .and_then(serde_json::Value::as_str),
+            _ => None,
+        };
+        let deltas = indices
+            .iter()
+            .rev()
+            .try_fold(String::new(), |mut text, &index| {
+                text.push_str(records[index].as_ref()?["params"]["delta"].as_str()?);
+                Some(text)
+            });
+        // A populated aggregate is insufficient if it does not actually contain
+        // the complete stream (for example, provider-side output truncation).
+        if content
+            .zip(deltas.as_deref())
+            .is_some_and(|(full, deltas)| full.contains(deltas))
+        {
+            for index in indices {
+                removed[index] = Some("aggregated_item_delta");
+            }
+        }
+    }
+    let mut compacted = String::new();
+    let mut removed_records = BTreeMap::new();
+    for (line, rule) in lines.into_iter().zip(removed) {
+        if let Some(rule) = rule {
+            *removed_records.entry(rule.to_string()).or_insert(0) += 1;
+        } else {
+            compacted.push_str(line);
+        }
+    }
+    let compaction = (!removed_records.is_empty()).then(|| ReviewTranscriptCompaction {
+        compacted_bytes: compacted.len() as u64,
+        compacted_sha256: sha256_hex(compacted.as_bytes()),
+        removed_records,
+    });
+    (compacted, compaction)
+}
+
+fn review_transcript_started_item_is_superseded(
+    started: &serde_json::Value,
+    completed: &serde_json::Value,
+) -> bool {
+    let Some(started_fields) = started.as_object() else {
+        return false;
+    };
+    if started["type"].as_str().is_none() || started["type"] != completed["type"] {
+        return false;
+    }
+    started_fields.iter().all(|(field, value)| {
+        completed.get(field) == Some(value)
+            || matches!(field.as_str(), "status" | "startedAtMs")
+            || match value {
+                serde_json::Value::Null => true,
+                serde_json::Value::String(value) => value.is_empty(),
+                serde_json::Value::Array(value) => value.is_empty(),
+                serde_json::Value::Object(value) => value.is_empty(),
+                _ => false,
+            }
+    })
+}
+
+fn review_transcript_item_key<'a>(
+    params: &'a serde_json::Value,
+    id: &'a str,
+) -> (Option<&'a str>, Option<&'a str>, &'a str) {
+    (params["threadId"].as_str(), params["turnId"].as_str(), id)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -679,9 +859,9 @@ pub fn build_review_lens_request(
 /// Constructs the bounded full-transcript representation used at the parent
 /// review boundary. Required report, diff, candidate, path, and validation
 /// material is never shortened. If that material plus transcript
-/// authentication metadata cannot fit, construction fails closed. Otherwise
-/// the largest deterministic, balanced UTF-8 head/tail excerpt that fits is
-/// selected by serialized request size.
+/// authentication metadata cannot fit, construction fails closed. A complete
+/// raw transcript is preferred, then a complete compacted transcript, then the
+/// largest balanced UTF-8 head/tail excerpt of that compacted text that fits.
 pub(crate) fn build_bounded_review_lens_request(
     lens: &ReviewLensConfig,
     sources: BoundedReviewLensRequestSources<'_>,
@@ -719,13 +899,32 @@ pub(crate) fn build_bounded_review_lens_request(
         return Ok(request);
     }
 
-    let minimal = bounded_review_transcript(
-        sources.child_transcript,
-        sources.authoritative_transcript_path,
-        &sha256,
-        0,
-        true,
-    )?;
+    let (compacted, compaction) = compact_review_transcript(sources.child_transcript);
+    let make_transcript = |budget, truncated| -> Result<BoundedReviewTranscript> {
+        let mut transcript = bounded_review_transcript(
+            &compacted,
+            sources.authoritative_transcript_path,
+            &sha256,
+            budget,
+            truncated,
+        )?;
+        transcript.original_bytes = sources.child_transcript.len() as u64;
+        transcript.compaction = compaction.clone();
+        if !truncated && compaction.is_some() {
+            transcript.truncation_marker = REVIEW_TRANSCRIPT_COMPACTED_MARKER.to_string();
+        }
+        Ok(transcript)
+    };
+    if compaction.is_some() {
+        let complete = make_transcript(compacted.len(), false)?;
+        if let Ok(request) =
+            build_bounded_review_lens_request_with_transcript(lens, sources, complete)
+        {
+            return Ok(request);
+        }
+    }
+
+    let minimal = make_transcript(0, true)?;
     let mut best = build_bounded_review_lens_request_with_transcript(lens, sources, minimal)
         .with_context(|| {
             format!(
@@ -735,16 +934,10 @@ pub(crate) fn build_bounded_review_lens_request(
         })?;
 
     let mut low = 0usize;
-    let mut high = sources.child_transcript.len().saturating_sub(1);
+    let mut high = compacted.len().saturating_sub(1);
     while low < high {
         let middle = low + (high - low).div_ceil(2);
-        let transcript = bounded_review_transcript(
-            sources.child_transcript,
-            sources.authoritative_transcript_path,
-            &sha256,
-            middle,
-            true,
-        )?;
+        let transcript = make_transcript(middle, true)?;
         match build_bounded_review_lens_request_with_transcript(lens, sources, transcript) {
             Ok(request) => {
                 low = middle;
@@ -797,6 +990,7 @@ pub(crate) fn bounded_review_transcript(
         original_bytes: u64::try_from(transcript.len())
             .context("authoritative review transcript byte length overflow")?,
         sha256: sha256.to_string(),
+        compaction: None,
         truncated,
         omitted_bytes: u64::try_from(omitted_bytes)
             .context("omitted review transcript byte length overflow")?,
@@ -2350,10 +2544,10 @@ fn external_review_runtime(
         request_binding: &request_binding,
     })
     .context("failed to serialize external review input")?;
-    if input.len() > REVIEW_INPUT_LIMIT_BYTES {
+    if input.len() > REVIEW_EXTERNAL_INPUT_LIMIT_BYTES {
         bail!(
             "external review input exceeds its {} byte limit",
-            REVIEW_INPUT_LIMIT_BYTES
+            REVIEW_EXTERNAL_INPUT_LIMIT_BYTES
         );
     }
     let timeout = Some(Duration::from_secs(effective_timeout_seconds));
@@ -4087,3 +4281,386 @@ include!("review/part2.rs");
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod transcript_compaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn jsonl(records: &[serde_json::Value]) -> String {
+        records.iter().map(|record| format!("{record}\n")).collect()
+    }
+
+    fn item(method: &str, id: &str, fields: serde_json::Value) -> serde_json::Value {
+        let mut item = fields;
+        item["id"] = json!(id);
+        json!({"method": method, "params": {"threadId": "t", "turnId": "u", "item": item}})
+    }
+
+    fn delta(method: &str, id: &str, text: &str) -> serde_json::Value {
+        json!({"method": method, "params": {
+            "threadId": "t", "turnId": "u", "itemId": id, "delta": text,
+            "summaryIndex": 0, "contentIndex": 0,
+        }})
+    }
+
+    #[test]
+    fn compaction_removes_only_started_records_with_later_matching_completion() {
+        let start = item("item/started", "a", json!({"type": "commandExecution"}));
+        let done = item("item/completed", "a", json!({"type": "commandExecution"}));
+        let mut other_turn = start.clone();
+        other_turn["params"]["turnId"] = json!("other");
+        let unmatched = item("item/started", "b", json!({"type": "userMessage"}));
+        let completed_first = item("item/completed", "c", json!({"type": "commandExecution"}));
+        let late_start = item("item/started", "c", json!({"type": "commandExecution"}));
+        let raw = jsonl(&[
+            completed_first.clone(),
+            start,
+            other_turn.clone(),
+            unmatched.clone(),
+            done.clone(),
+            late_start.clone(),
+        ]);
+        let (text, metadata) = compact_review_transcript(&raw);
+        assert_eq!(
+            text,
+            jsonl(&[completed_first, other_turn, unmatched, done, late_start])
+        );
+        assert_eq!(
+            metadata.unwrap().removed_records,
+            BTreeMap::from([("superseded_item_started".into(), 1)])
+        );
+    }
+
+    #[test]
+    fn compaction_keeps_started_items_with_changed_fields_or_types() {
+        for (started, completed) in [
+            (
+                json!({"type": "commandExecution", "command": "cargo check"}),
+                json!({"type": "commandExecution", "command": "cargo test"}),
+            ),
+            (
+                json!({"type": "commandExecution", "unknown": {"evidence": true}}),
+                json!({"type": "commandExecution"}),
+            ),
+            (
+                json!({"type": "commandExecution"}),
+                json!({"type": "agentMessage"}),
+            ),
+        ] {
+            let raw = jsonl(&[
+                item("item/started", "a", started),
+                item("item/completed", "a", completed),
+            ]);
+            assert_eq!(compact_review_transcript(&raw), (raw.clone(), None));
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_started_items_when_ids_are_reused() {
+        let start = item("item/started", "a", json!({"type": "commandExecution"}));
+        let done = item("item/completed", "a", json!({"type": "commandExecution"}));
+        for records in [
+            vec![start.clone(), start.clone(), done.clone()],
+            vec![start.clone(), done.clone(), start.clone()],
+            vec![start.clone(), done.clone(), done.clone()],
+            vec![done.clone(), start.clone(), done.clone()],
+        ] {
+            let raw = jsonl(&records);
+            assert_eq!(compact_review_transcript(&raw), (raw.clone(), None));
+        }
+    }
+
+    #[test]
+    fn compaction_removes_started_items_with_only_placeholder_and_lifecycle_differences() {
+        let start = item(
+            "item/started",
+            "a",
+            json!({
+                "type": "commandExecution", "command": ["cargo", "test"],
+                "status": "inProgress", "startedAtMs": 123,
+                "aggregatedOutput": "", "exitCode": null,
+                "parts": [], "details": {},
+            }),
+        );
+        let done = item(
+            "item/completed",
+            "a",
+            json!({
+                "type": "commandExecution", "command": ["cargo", "test"],
+                "status": "completed", "aggregatedOutput": "ok", "exitCode": 0,
+                "parts": ["result"], "details": {"result": true},
+            }),
+        );
+        let (text, metadata) = compact_review_transcript(&jsonl(&[start, done.clone()]));
+        assert_eq!(text, jsonl(&[done]));
+        assert_eq!(
+            metadata.unwrap().removed_records,
+            BTreeMap::from([("superseded_item_started".into(), 1)])
+        );
+    }
+
+    #[test]
+    fn compaction_removes_aggregated_deltas_when_the_start_is_retained() {
+        let start = item(
+            "item/started",
+            "a",
+            json!({"type": "commandExecution", "command": "cargo check"}),
+        );
+        let done = item(
+            "item/completed",
+            "a",
+            json!({"type": "commandExecution", "command": "cargo test", "aggregatedOutput": "ok"}),
+        );
+        let (text, metadata) = compact_review_transcript(&jsonl(&[
+            start.clone(),
+            delta("item/commandExecution/outputDelta", "a", "ok"),
+            done.clone(),
+        ]));
+        assert_eq!(text, jsonl(&[start, done]));
+        assert_eq!(
+            metadata.unwrap().removed_records,
+            BTreeMap::from([("aggregated_item_delta".into(), 1)])
+        );
+    }
+
+    #[test]
+    fn compaction_removes_each_declared_telemetry_method_only() {
+        let mut records = Vec::new();
+        for method in [
+            "thread/tokenUsage/updated",
+            "account/rateLimits/updated",
+            "turn/moderationMetadata",
+            "remoteControl/status/changed",
+            "account/updated",
+        ] {
+            records.push(json!({"method": method, "params": {}}));
+        }
+        let retained = json!({"method": "thread/status/changed", "params": {}});
+        records.push(retained.clone());
+        let (text, metadata) = compact_review_transcript(&jsonl(&records));
+        assert_eq!(text, jsonl(&[retained]));
+        assert_eq!(
+            metadata.unwrap().removed_records,
+            BTreeMap::from([("provider_telemetry".into(), 5)])
+        );
+    }
+
+    #[test]
+    fn compaction_removes_command_message_and_reasoning_deltas_with_full_content() {
+        for (method, fields) in [
+            (
+                "item/commandExecution/outputDelta",
+                json!({"type": "commandExecution", "aggregatedOutput": "prefix hello world"}),
+            ),
+            (
+                "item/agentMessage/delta",
+                json!({"type": "agentMessage", "text": "hello world"}),
+            ),
+            (
+                "item/reasoning/summaryTextDelta",
+                json!({"type": "reasoning", "summary": ["hello world"]}),
+            ),
+            (
+                "item/reasoning/textDelta",
+                json!({"type": "reasoning", "content": ["hello world"]}),
+            ),
+        ] {
+            let done = item("item/completed", "a", fields);
+            let raw = jsonl(&[
+                delta(method, "a", "hello "),
+                delta(method, "a", "world"),
+                done.clone(),
+            ]);
+            let (text, metadata) = compact_review_transcript(&raw);
+            assert_eq!(text, jsonl(&[done]), "{method}");
+            assert_eq!(
+                metadata.unwrap().removed_records,
+                BTreeMap::from([("aggregated_item_delta".into(), 2)])
+            );
+        }
+    }
+
+    #[test]
+    fn compaction_keeps_deltas_without_a_later_complete_aggregate() {
+        let method = "item/commandExecution/outputDelta";
+        for fields in [
+            json!({"type": "commandExecution"}),
+            json!({"type": "commandExecution", "aggregatedOutput": null}),
+            json!({"type": "commandExecution", "aggregatedOutput": ""}),
+            json!({"type": "commandExecution", "aggregatedOutput": "hello"}),
+        ] {
+            let done = item("item/completed", "a", fields);
+            let raw = jsonl(&[
+                done.clone(),
+                delta(method, "a", "hello "),
+                delta(method, "a", "world"),
+                done,
+                delta(method, "b", "uncompleted"),
+            ]);
+            assert_eq!(compact_review_transcript(&raw), (raw, None));
+        }
+        let mut wrong_part = delta("item/reasoning/textDelta", "a", "hello");
+        wrong_part["params"]["contentIndex"] = json!(1);
+        let raw = jsonl(&[
+            wrong_part,
+            item(
+                "item/completed",
+                "a",
+                json!({"type": "reasoning", "content": ["hello"]}),
+            ),
+        ]);
+        assert_eq!(compact_review_transcript(&raw), (raw, None));
+    }
+
+    #[test]
+    fn compaction_preserves_unparseable_unknown_and_nonstandard_lines_byte_for_byte() {
+        let kept = "  {\"method\":\"unknown\"} \r\nnot JSON\n\n{\"incomplete\":\nnull\n42";
+        let raw = format!("{}{}", jsonl(&[json!({"method": "account/updated"})]), kept);
+        let (text, _) = compact_review_transcript(&raw);
+        assert_eq!(text.as_bytes(), kept.as_bytes());
+    }
+
+    fn request_fixture(
+        raw: &str,
+    ) -> (
+        ReviewLensConfig,
+        ReviewLensBindingMaterial,
+        BoundedReviewTranscript,
+    ) {
+        let lens = ReviewLensConfig {
+            id: "compaction".into(),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "local".into(),
+                model: "local".into(),
+                model_provider: None,
+                reasoning_effort: None,
+            },
+            information_scope: ReviewInformationScope::FullChildTranscript,
+        };
+        let bindings = ReviewLensBindingMaterial {
+            candidate_binding: json!({}),
+            path_bindings: json!({}),
+            validation_bindings: json!({}),
+        };
+        let sources = BoundedReviewLensRequestSources {
+            child_transcript: raw,
+            authoritative_transcript_path: Path::new("logs/child.jsonl"),
+            diff: "diff",
+            output_report: "report",
+            bindings: &bindings,
+        };
+        let request = build_bounded_review_lens_request(&lens, sources).unwrap();
+        let ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript, ..
+        } = request.information
+        else {
+            panic!("bounded transcript")
+        };
+        (lens, bindings, *child_transcript)
+    }
+
+    #[test]
+    fn complete_compacted_transcript_fits_and_round_trips_with_raw_identity() {
+        let retained = "retained test and build evidence\n";
+        let raw = format!(
+            "{}{}",
+            jsonl(&[
+                json!({"method": "thread/tokenUsage/updated", "params": {"padding": "x".repeat(REVIEW_LENS_REQUEST_LIMIT_BYTES)}})
+            ]),
+            retained
+        );
+        let (_, _, transcript) = request_fixture(&raw);
+        assert!(!transcript.truncated);
+        assert_eq!(transcript.omitted_bytes, 0);
+        assert_eq!(transcript.head_excerpt, retained);
+        assert_eq!(transcript.tail_excerpt, "");
+        assert_eq!(transcript.original_bytes, raw.len() as u64);
+        assert_eq!(transcript.sha256, sha256_hex(raw.as_bytes()));
+        assert_eq!(
+            transcript.truncation_marker,
+            REVIEW_TRANSCRIPT_COMPACTED_MARKER
+        );
+        let metadata = transcript.compaction.as_ref().unwrap();
+        assert_eq!(metadata.compacted_bytes, retained.len() as u64);
+        assert_eq!(metadata.compacted_sha256, sha256_hex(retained.as_bytes()));
+        assert_eq!(
+            serde_json::from_str::<BoundedReviewTranscript>(
+                &serde_json::to_string(&transcript).unwrap()
+            )
+            .unwrap(),
+            transcript
+        );
+        let mut unknown = serde_json::to_value(&transcript).unwrap();
+        unknown["compaction"]["unexpected"] = json!(true);
+        assert!(serde_json::from_value::<BoundedReviewTranscript>(unknown).is_err());
+    }
+
+    #[test]
+    fn compacted_transcript_bounding_counts_only_omitted_compacted_bytes() {
+        let retained = format!("HEAD{}TAIL", "雪".repeat(REVIEW_LENS_REQUEST_LIMIT_BYTES));
+        let raw = format!(
+            "{}{}",
+            jsonl(&[json!({"method": "account/updated"})]),
+            retained
+        );
+        let (_, _, transcript) = request_fixture(&raw);
+        assert!(transcript.truncated);
+        assert!(transcript.head_excerpt.starts_with("HEAD"));
+        assert!(transcript.tail_excerpt.ends_with("TAIL"));
+        assert_eq!(transcript.original_bytes, raw.len() as u64);
+        assert_eq!(transcript.sha256, sha256_hex(raw.as_bytes()));
+        assert_eq!(
+            transcript.compaction.as_ref().unwrap().compacted_bytes,
+            retained.len() as u64
+        );
+        assert_eq!(
+            transcript.omitted_bytes as usize
+                + transcript.head_excerpt.len()
+                + transcript.tail_excerpt.len(),
+            retained.len()
+        );
+        assert_eq!(
+            transcript.truncation_marker,
+            REVIEW_TRANSCRIPT_TRUNCATED_MARKER
+        );
+    }
+
+    #[test]
+    fn fitting_raw_transcript_keeps_original_request_serialization_and_binding() {
+        let raw = jsonl(&[json!({"method": "account/updated"})]);
+        let (lens, bindings, transcript) = request_fixture(&raw);
+        assert!(transcript.compaction.is_none());
+        let sources = BoundedReviewLensRequestSources {
+            child_transcript: &raw,
+            authoritative_transcript_path: Path::new("logs/child.jsonl"),
+            diff: "diff",
+            output_report: "report",
+            bindings: &bindings,
+        };
+        let old_transcript = bounded_review_transcript(
+            &raw,
+            sources.authoritative_transcript_path,
+            &sha256_hex(raw.as_bytes()),
+            raw.len(),
+            false,
+        )
+        .unwrap();
+        let original =
+            build_bounded_review_lens_request_with_transcript(&lens, sources, old_transcript)
+                .unwrap();
+        let actual = build_bounded_review_lens_request(&lens, sources).unwrap();
+        let bytes = serde_json::to_vec(&actual).unwrap();
+        assert_eq!(bytes, serde_json::to_vec(&original).unwrap());
+        assert!(
+            serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["information"]
+                ["child_transcript"]
+                .get("compaction")
+                .is_none()
+        );
+        assert_eq!(
+            serde_json::from_slice::<ReviewLensRequest>(&bytes).unwrap(),
+            actual
+        );
+    }
+}
