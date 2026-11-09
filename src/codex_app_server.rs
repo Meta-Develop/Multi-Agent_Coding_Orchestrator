@@ -1808,7 +1808,12 @@ where
                 },
                 "capabilities": {
                     "experimentalApi": true,
-                    "optOutNotificationMethods": []
+                    // Terminal agentMessage/fileChange items retain text and patches.
+                    // Keep command output, lifecycle, approval and usage notifications.
+                    "optOutNotificationMethods": [
+                        "item/agentMessage/delta",
+                        "turn/diff/updated"
+                    ]
                 }
             }
         }),
@@ -3957,6 +3962,210 @@ mod tests {
             },
             || false,
         )
+    }
+
+    #[test]
+    fn initialize_opt_out_preserves_terminal_evidence_and_unsuppressed_wire_bytes() {
+        // Model the upstream connection filter before delivery, never prune a
+        // captured transcript. Also replay a producer that ignores the capability.
+        struct OptOutFixture {
+            inner: FakeTransport,
+            honor_opt_out: bool,
+            opted_out: Vec<String>,
+            emitted: Vec<Vec<u8>>,
+            suppressed: usize,
+        }
+
+        impl JsonLineTransport for OptOutFixture {
+            fn receive(
+                &mut self,
+                wait: Duration,
+                max_line_bytes: usize,
+                destination: &mut Vec<u8>,
+            ) -> Result<TransportRead, String> {
+                loop {
+                    let read = self.inner.receive(wait, max_line_bytes, destination)?;
+                    if read != TransportRead::Line {
+                        return Ok(read);
+                    }
+                    let message: Value = serde_json::from_slice(destination).unwrap();
+                    if self.honor_opt_out
+                        && self.opted_out.iter().any(|method| {
+                            message.get("method").and_then(Value::as_str) == Some(method.as_str())
+                        })
+                    {
+                        assert!(message.get("id").is_none(), "only notifications");
+                        self.suppressed += 1;
+                        continue;
+                    }
+                    self.emitted.push(destination.clone());
+                    return Ok(read);
+                }
+            }
+
+            fn send(&mut self, line: &[u8]) -> Result<(), String> {
+                let message: Value = serde_json::from_slice(line).unwrap();
+                if message["method"] == "initialize" {
+                    let methods = &message["params"]["capabilities"]["optOutNotificationMethods"];
+                    assert_eq!(
+                        methods,
+                        &json!(["item/agentMessage/delta", "turn/diff/updated"])
+                    );
+                    self.opted_out = serde_json::from_value(methods.clone()).unwrap();
+                }
+                self.inner.send(line)
+            }
+        }
+
+        let mut lines: Vec<Vec<u8>> = CODEX_0162_WORKER_TURN
+            .lines()
+            .map(|line| line.as_bytes().to_vec())
+            .collect();
+        let mut commands = Vec::new();
+        for mut message in captured_0162_values(include_str!(
+            "../tests/fixtures/codex-0.162.0/researcher-commands.jsonl"
+        )) {
+            // The captured commands belong to another turn; correlate this
+            // controlled replay without changing their command/output payloads.
+            message["params"]["threadId"] = json!("thread-1");
+            message["params"]["turnId"] = json!("turn-1");
+            commands.push(serde_json::to_vec(&message).unwrap());
+            if message["method"] == "item/started" {
+                // These bytes deliberately occur only in streamed output. They
+                // must survive even when a terminal aggregate omits them.
+                for delta in ["stdout-only\n", "stderr-only\n"] {
+                    commands.push(
+                        serde_json::to_vec(&json!({
+                            "method": "item/commandExecution/outputDelta",
+                            "params": {
+                                "threadId": "thread-1", "turnId": "turn-1",
+                                "itemId": message["params"]["item"]["id"], "delta": delta
+                            }
+                        }))
+                        .unwrap(),
+                    );
+                }
+            }
+        }
+        let terminal = lines
+            .iter()
+            .position(|line| {
+                serde_json::from_slice::<Value>(line).unwrap()["method"] == "turn/completed"
+            })
+            .unwrap();
+        let values = captured_0162_values(CODEX_0162_WORKER_TURN);
+        let patch = values
+            .iter()
+            .find(|value| {
+                value["method"] == "item/completed"
+                    && value["params"]["item"]["type"] == "fileChange"
+            })
+            .unwrap()["params"]["item"]["changes"][0]["diff"]
+            .clone();
+        for _ in 0..16 {
+            commands.push(
+                serde_json::to_vec(&json!({
+                    "method": "turn/diff/updated",
+                    "params": {"threadId": "thread-1", "turnId": "turn-1", "diff": patch}
+                }))
+                .unwrap(),
+            );
+        }
+        lines.splice(terminal..terminal, commands);
+        let mut baseline: Option<AppServerOutcome> = None;
+        for honor_opt_out in [false, true] {
+            let expected: Vec<Vec<u8>> = lines
+                .iter()
+                .filter(|line| {
+                    let message: Value = serde_json::from_slice(line).unwrap();
+                    !honor_opt_out
+                        || !matches!(
+                            message["method"].as_str(),
+                            Some("item/agentMessage/delta" | "turn/diff/updated")
+                        )
+                })
+                .cloned()
+                .collect();
+            let mut transport = OptOutFixture {
+                inner: FakeTransport {
+                    incoming: lines.iter().rev().cloned().map(ReaderEvent::Line).collect(),
+                    ..FakeTransport::default()
+                },
+                honor_opt_out,
+                opted_out: Vec::new(),
+                emitted: Vec::new(),
+                suppressed: 0,
+            };
+            let mut turn = test_turn();
+            turn.model = Some("gpt-6.1-sol".to_string());
+            turn.minimum_effort = Some("xhigh".to_string());
+            let outcome = run_app_server_turn(
+                &mut transport,
+                &turn,
+                AppServerLimits::default(),
+                &mut |request: ApprovalRequest| {
+                    assert_eq!(request.kind, ApprovalKind::FileChange);
+                    Ok(ApprovalReview::accept())
+                },
+                || false,
+            )
+            .expect("terminal evidence is independent of redundant progress");
+            assert_eq!(transport.emitted, expected);
+            assert!(transport.inner.incoming.is_empty());
+            assert_eq!(outcome.messages_received, expected.len());
+            assert_eq!(
+                outcome.bytes_received,
+                expected.iter().map(Vec::len).sum::<usize>()
+            );
+            assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+            assert_eq!(outcome.command_execution_evidence.observations.len(), 2);
+            assert!(outcome.command_execution_evidence.observations.iter().all(
+                |observation| matches!(observation, CommandExecutionObservation::Complete { .. })
+            ));
+            assert!(outcome.final_message.is_some());
+            assert!(outcome.token_usage.is_some());
+            if let Some(baseline) = &baseline {
+                assert!(
+                    transport.suppressed > 16,
+                    "captured message deltas plus diffs"
+                );
+                assert_eq!(
+                    outcome.command_execution_evidence,
+                    baseline.command_execution_evidence
+                );
+                assert_eq!(outcome.item_outcomes, baseline.item_outcomes);
+                assert_eq!(outcome.final_message, baseline.final_message);
+                assert_eq!(outcome.token_usage, baseline.token_usage);
+                assert_eq!(outcome.resolved_model, baseline.resolved_model);
+                assert_eq!(outcome.resolved_effort, baseline.resolved_effort);
+            } else {
+                assert_eq!(transport.suppressed, 0);
+                baseline = Some(outcome);
+            }
+        }
+    }
+
+    #[test]
+    fn rejected_notification_opt_out_stops_at_initialize_without_retry() {
+        let mut transport = FakeTransport::from_values(vec![json!({
+            "id": 1,
+            "error": {"code": -32602, "message": "optOutNotificationMethods unsupported"}
+        })]);
+        let error = run_app_server_turn(
+            &mut transport,
+            &test_turn(),
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| panic!("initialization grants no approval"),
+            || false,
+        )
+        .expect_err("unsupported initialization must remain a failure");
+        assert!(matches!(
+            error,
+            AppServerError::Remote { phase: "initialize", message }
+                if message.contains("optOutNotificationMethods unsupported")
+        ));
+        assert_eq!(transport.sent.len(), 1, "no retry or thread launch");
+        assert_eq!(transport.sent[0]["method"], "initialize");
     }
 
     #[test]
