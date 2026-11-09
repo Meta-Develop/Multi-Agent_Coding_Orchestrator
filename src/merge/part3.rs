@@ -1240,6 +1240,70 @@ fn trusted_executable_entry_candidates(name: &str) -> [PathBuf; 3] {
 }
 
 #[cfg(unix)]
+pub(crate) fn trusted_executable_owner(
+    owner: u32,
+    ancestor: Option<&Path>,
+    namespace_owners: Option<(u32, u32)>,
+) -> bool {
+    if owner == 0 {
+        return true;
+    }
+    #[cfg(test)]
+    {
+        namespace_owners.is_some_and(|(overflow, effective)| {
+            owner == overflow || (ancestor == Some(Path::new("/")) && owner == effective)
+        })
+    }
+    #[cfg(not(test))]
+    {
+        let _ = (ancestor, namespace_owners);
+        false
+    }
+}
+
+#[cfg(unix)]
+pub(crate) fn trusted_executable_namespace_owners() -> Option<(u32, u32)> {
+    #[cfg(all(test, target_os = "linux"))]
+    {
+        let uid_map = fs::read_to_string("/proc/self/uid_map").ok()?;
+        let overflow_uid = fs::read_to_string("/proc/sys/kernel/overflowuid").ok()?;
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        trusted_owner_namespace(&uid_map, &overflow_uid, unsafe { libc::geteuid() })
+    }
+    #[cfg(not(all(test, target_os = "linux")))]
+    {
+        None
+    }
+}
+
+#[cfg(all(test, unix))]
+fn trusted_owner_namespace(
+    uid_map: &str,
+    overflow_uid: &str,
+    effective_uid: u32,
+) -> Option<(u32, u32)> {
+    let mut has_mapping = false;
+    let mut root_mapped = false;
+    for line in uid_map.lines() {
+        let mut fields = line.split_whitespace();
+        let inside = fields.next()?.parse::<u32>().ok()?;
+        let outside = fields.next()?.parse::<u32>().ok()?;
+        let count = fields.next()?.parse::<u32>().ok()?;
+        if fields.next().is_some() || count == 0 {
+            return None;
+        }
+        inside.checked_add(count - 1)?;
+        outside.checked_add(count - 1)?;
+        has_mapping = true;
+        root_mapped |= inside == 0;
+    }
+    if !has_mapping || root_mapped {
+        return None;
+    }
+    Some((overflow_uid.trim().parse().ok()?, effective_uid))
+}
+
+#[cfg(unix)]
 fn validate_trusted_unix_executable(path: &Path) -> Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
 
@@ -1249,7 +1313,11 @@ fn validate_trusted_unix_executable(path: &Path) -> Result<()> {
         bail!("trusted executable candidate is not a regular file");
     }
     let mode = metadata.permissions().mode();
-    if metadata.uid() != 0 || mode & 0o022 != 0 || mode & 0o111 == 0 {
+    let namespace_owners = trusted_executable_namespace_owners();
+    if !trusted_executable_owner(metadata.uid(), None, namespace_owners)
+        || mode & 0o022 != 0
+        || mode & 0o111 == 0
+    {
         bail!("trusted executable candidate has unsafe owner or mode");
     }
     let mut ancestor = path.parent();
@@ -1260,11 +1328,13 @@ fn validate_trusted_unix_executable(path: &Path) -> Result<()> {
                 directory.display()
             )
         })?;
+        let trusted_owner =
+            trusted_executable_owner(directory_metadata.uid(), Some(directory), namespace_owners);
         let immutable_nix_store_root = directory == Path::new("/nix/store")
-            && directory_metadata.uid() == 0
+            && trusted_owner
             && directory_metadata.permissions().mode() & 0o1000 != 0;
         if !directory_metadata.file_type().is_dir()
-            || directory_metadata.uid() != 0
+            || !trusted_owner
             || (!immutable_nix_store_root && directory_metadata.permissions().mode() & 0o022 != 0)
         {
             bail!("trusted executable candidate has a writable or non-root ancestor");
