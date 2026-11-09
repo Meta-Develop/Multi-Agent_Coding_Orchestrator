@@ -2033,6 +2033,7 @@ fn direct_worker_fake_output_and_journal_are_first_class_and_non_delegating() {
         device: 123,
         inode: 456,
         cwd: repo_path.clone(),
+        initial_journal: Vec::new(),
     };
     let mut captures = fake.worker_journal_artifacts().to_vec();
     captures[0].command_binding = Some(binding.clone());

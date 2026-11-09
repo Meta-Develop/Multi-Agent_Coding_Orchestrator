@@ -476,8 +476,9 @@ pub(crate) use reporting::import_worker_execution_journals_at;
 pub(crate) use reporting::parse_worker_execution_journal;
 #[cfg(test)]
 pub(crate) use reporting::run_worker_execution_journal_command;
-pub(crate) use reporting::run_worker_execution_journal_command_with_clock;
+pub use reporting::WorkerJournalCommandExit;
 use reporting::*;
+pub(crate) use reporting::{journal_cli_error, run_worker_execution_journal_command_with_clock};
 pub(crate) use target_containment::observed_role_identity;
 
 #[cfg(test)]
@@ -623,7 +624,7 @@ const FIELD_GUIDE_READABLE_ENTRY_PREFIX: &str = "MACO_FIELD_GUIDE_READABLE_ENTRY
 const MAX_SUPERVISOR_INPUT_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_SPEC_FRAGMENT_IDS: usize = 4096;
 const MAX_SPEC_FRAGMENT_ID_BYTES: usize = 256;
-const MAX_WORKER_EXECUTION_JOURNAL_BYTES: usize = 1024 * 1024;
+pub(crate) const MAX_WORKER_EXECUTION_JOURNAL_BYTES: usize = 1024 * 1024;
 const MAX_BLOATED_FILE_FLAGS_PER_WORKER: usize = 64;
 const MAX_DECOMPOSITION_REPLACEMENT_PATHS: usize = 256;
 const ARTIFACT_FINALIZATION_MARKER: &str = ".maco-artifact-final.json";
@@ -4518,6 +4519,7 @@ pub(crate) struct WorkerJournalObservation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum WorkerJournalObservationPhase {
+    Baseline,
     Started,
     Completed,
     NativeEdit,

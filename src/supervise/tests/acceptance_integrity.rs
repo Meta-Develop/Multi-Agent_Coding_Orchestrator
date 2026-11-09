@@ -2088,6 +2088,7 @@ fn wrapper_journal_fixture(
         device: metadata.dev(),
         inode: metadata.ino(),
         cwd: cwd.clone(),
+        initial_journal: Vec::new(),
     };
     if observe {
         let entry = WorkerExecutionJournalEntry {

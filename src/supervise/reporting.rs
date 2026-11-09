@@ -8,8 +8,11 @@ mod claude_identity_tests;
 mod journal_observation;
 #[cfg(test)]
 pub(crate) use journal_observation::run_worker_execution_journal_command;
-pub(crate) use journal_observation::run_worker_execution_journal_command_with_clock;
 pub(super) use journal_observation::validate_worker_journal_observations;
+pub use journal_observation::WorkerJournalCommandExit;
+pub(crate) use journal_observation::{
+    journal_cli_error, run_worker_execution_journal_command_with_clock,
+};
 
 pub(super) const MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS: usize = 1024;
 pub(super) const ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER: &str = "…<truncated>";
@@ -438,8 +441,31 @@ pub(crate) fn import_worker_execution_journals_at(
                             bytes,
                             ArtifactFileDisposition::PrivateEvidence,
                         )?;
+                        if let Some(binding) = &capture.command_binding {
+                            if !bytes.starts_with(&binding.initial_journal) {
+                                bail!("Worker journal lost its supervisor prelaunch prefix");
+                            }
+                        }
                         match parse_worker_execution_journal(bytes, &evidence_relative_path) {
-                            Ok(entries) => WorkerExecutionJournalStatus::Loaded(entries),
+                            Ok(entries) => {
+                                if entries
+                                    .first()
+                                    .and_then(|entry| entry.observation.as_ref())
+                                    .is_some_and(|observation| {
+                                        observation.phase == WorkerJournalObservationPhase::Baseline
+                                    })
+                                    && capture
+                                        .command_binding
+                                        .as_ref()
+                                        .is_none_or(|binding| binding.initial_journal.is_empty())
+                                {
+                                    WorkerExecutionJournalStatus::Invalid(
+                                        "unbound supervisor candidate baseline".into(),
+                                    )
+                                } else {
+                                    WorkerExecutionJournalStatus::Loaded(entries)
+                                }
+                            }
                             Err(error) => {
                                 WorkerExecutionJournalStatus::Invalid(format!("{error:#}"))
                             }
@@ -3517,4 +3543,19 @@ mod cursor_managed_usage_evidence {
             assert!(!report.new_dispatch_allowed, "{case}");
         }
     }
+}
+
+pub(super) fn precreate_worker_execution_journals_for_candidate(
+    assignment: &OrchestratorAssignment,
+    incoming: &ArtifactScratchDirectory,
+    cwd: &Path,
+) -> Result<Vec<PathBuf>> {
+    let paths = precreate_worker_execution_journals(assignment, incoming)?;
+    #[cfg(target_os = "linux")]
+    for path in &paths {
+        journal_observation::seed_worker_candidate_baseline(path, cwd)?;
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = cwd;
+    Ok(paths)
 }

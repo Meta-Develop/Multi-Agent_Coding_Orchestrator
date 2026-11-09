@@ -232,6 +232,28 @@ impl<'inbox, 'parent> BoundParentTurnYield<'inbox, 'parent> {
         outcome: &mut AssignmentExecutionOutcome,
         policy: &AssignmentBudgetPolicy,
     ) -> Result<BoundNestedWorkerEvidence<'inbox, 'parent>> {
+        self.execute_serial_with_permit(
+            context,
+            preflight,
+            current_attempt,
+            current,
+            outcome,
+            policy,
+            None,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn execute_serial_with_permit<'resources>(
+        self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'resources>,
+        current_attempt: usize,
+        current: &WorkerInboxTurn<'_>,
+        outcome: &mut AssignmentExecutionOutcome,
+        policy: &AssignmentBudgetPolicy,
+        permit: Option<NestedTurnExecutionPermit<'_, 'resources>>,
+    ) -> Result<BoundNestedWorkerEvidence<'inbox, 'parent>> {
         self.revalidate(context, preflight, current_attempt, current)?;
         let requests = self
             .requests()
@@ -244,6 +266,7 @@ impl<'inbox, 'parent> BoundParentTurnYield<'inbox, 'parent> {
                 outcome,
                 current_attempt,
                 self.parent,
+                permit,
             )?;
             let mut candidate = self.candidate.clone();
             let mut workers = Vec::new();
@@ -602,7 +625,34 @@ impl IsolatedWorkerAttemptEvidence {
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
     ) -> Result<()> {
-        self.authority.revalidate(context, preflight)?;
+        self.revalidate_capture(context, preflight, false)
+    }
+
+    fn revalidate_capture(
+        &self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        claims_released: bool,
+    ) -> Result<()> {
+        if claims_released {
+            if self.authority.run_id != context.options.run_id
+                || self.authority.parent_claim != preflight.claim
+                || self.authority.source_digest.is_empty()
+                || !preflight
+                    .assignment
+                    .worker_assignments
+                    .contains(&self.authority.worker)
+                || context
+                    .sync_store
+                    .snapshot()?
+                    .iter()
+                    .any(|claim| claim.token == self.claim().token)
+            {
+                bail!("deferred isolated evidence lost its retired exact grant");
+            }
+        } else {
+            self.authority.revalidate(context, preflight)?;
+        }
         let worker = self.authority.worker();
         let report = self.report();
         let (before, after) = self.candidate_snapshots();
@@ -650,7 +700,16 @@ impl IsolatedWorkerAttemptEvidence {
             || report.semantic_intent_token != self.semantic_token
             || report.no_further_delegation != Some(true)
             || report.files_changed != changes.paths
-            || worker_technical_failure(report, &[])
+            || (worker_technical_failure(report, &[])
+                && (!super::managed_parent_correction::defers_materialization(context)
+                    || self.journals().get(&worker.id).is_none_or(|journal| {
+                        super::managed_parent_correction::require_worker_custody(
+                            report,
+                            journal,
+                            self.run(),
+                        )
+                        .is_err()
+                    })))
             || self.run().environment_blocked()
             || self.run().external_side_effect_state().is_some()
             || !self.run().sandbox_denials().is_empty()
@@ -683,6 +742,32 @@ pub(super) struct BoundIsolatedWorkers<'inbox, 'parent> {
 }
 
 impl BoundIsolatedWorkers<'_, '_> {
+    pub(super) fn materialization_started(&self) -> bool {
+        self.worker_materialization_started.get()
+    }
+
+    pub(super) fn defer_integration(
+        &mut self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        parent_attempt: usize,
+        current: &WorkerInboxTurn<'_>,
+        outcome: &mut AssignmentExecutionOutcome,
+    ) -> Result<DeferredIsolatedIntegration> {
+        self.require_pre_materialization_cleanup()?;
+        self.release_completed_claims(context, preflight, parent_attempt, current, outcome)?;
+        let candidate = self
+            .review_candidate
+            .take()
+            .context("deferred isolated union missing")?;
+        Ok(DeferredIsolatedIntegration {
+            workers: Some(std::mem::take(&mut self.workers)),
+            candidate,
+            started: std::cell::Cell::new(false),
+            accepted: std::cell::Cell::new(false),
+        })
+    }
+
     pub(super) fn parent_candidate(&self) -> &PrimaryWorktreeSnapshot {
         self.review_candidate
             .as_ref()
@@ -1000,6 +1085,88 @@ fn mutate_candidate_at_handoff(before: bool, worktree: &Path) -> Result<()> {
         }
         Ok(())
     })
+}
+
+/// A once-only post-review handoff, retaining every original live capture and
+/// independent lease. Retired claims cannot authorize another Worker launch.
+pub(super) struct DeferredIsolatedIntegration {
+    workers: Option<Vec<IsolatedWorkerAttemptEvidence>>,
+    candidate: isolated_parent_candidate::IsolatedParentCandidate,
+    started: std::cell::Cell<bool>,
+    accepted: std::cell::Cell<bool>,
+}
+impl DeferredIsolatedIntegration {
+    pub(super) fn revalidate(
+        &self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+    ) -> Result<()> {
+        if self.started.get()
+            || self.accepted.get()
+            || context.cancellation.is_cancelled()
+            || !context.sync_store.snapshot()?.contains(&preflight.claim)
+        {
+            bail!("deferred isolated handoff is spent or lost its parent claim");
+        }
+        verify_candidate(&self.candidate.snapshot, context, preflight)?;
+        let workers = self
+            .workers
+            .as_ref()
+            .context("deferred isolated captures missing")?;
+        if workers.len() != preflight.assignment.worker_assignments.len() {
+            bail!("deferred isolated Worker set changed");
+        }
+        for (worker, authored) in workers.iter().zip(&preflight.assignment.worker_assignments) {
+            if worker.report().id != authored.id {
+                bail!("deferred isolated order changed");
+            }
+            worker.revalidate_capture(context, preflight, true)?;
+        }
+        Ok(())
+    }
+
+    pub(super) fn integrate(
+        &self,
+        context: &AssignmentExecutionContext<'_, '_>,
+        preflight: &AssignmentExecutionPreflight<'_>,
+        accepted_paths: &[PathBuf],
+    ) -> Result<()> {
+        self.revalidate(context, preflight)?;
+        super::integrate_isolated_worker_candidates(
+            context,
+            preflight,
+            self.workers
+                .as_deref()
+                .context("deferred isolated Workers missing")?,
+            &self.candidate,
+            &self.candidate.snapshot,
+            accepted_paths,
+            || {
+                self.revalidate(context, preflight)?;
+                if self.started.replace(true) {
+                    bail!("isolated integration handoff repeated");
+                }
+                Ok(())
+            },
+        )
+    }
+
+    pub(super) fn materialization_started(&self) -> bool {
+        self.started.get()
+    }
+
+    pub(super) fn accept_materialized(&self) {
+        self.accepted.set(true);
+    }
+}
+impl Drop for DeferredIsolatedIntegration {
+    fn drop(&mut self) {
+        if self.started.get() && !self.accepted.get() {
+            if let Some(workers) = self.workers.take() {
+                std::mem::forget(workers);
+            }
+        }
+    }
 }
 
 #[cfg(test)]

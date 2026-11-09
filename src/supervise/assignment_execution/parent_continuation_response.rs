@@ -62,9 +62,21 @@ enum ParentContinuationTurn {
         requests: Vec<YieldWorkerRequestWire>,
     },
     FinalReport {
-        report: Box<ParentContinuationReport>,
+        // Internally tagged enums buffer fields through Serde's Content visitor,
+        // which cannot supply RawValue's JSON-specific newtype token. Validate
+        // the exact turn shape here; extract report bytes from the same input below.
+        #[serde(rename = "report")]
+        _report: serde::de::IgnoredAny,
         worker_report_refs: Vec<WorkerReportReference>,
     },
+}
+
+// Read only after ParentContinuationTurn has checked every field and its tag.
+// Re-reading the original JSON preserves report duplicates and whitespace;
+// converting the buffered turn to Value would lose that evidence.
+#[derive(Deserialize)]
+struct ParentContinuationRawReport {
+    report: Box<serde_json::value::RawValue>,
 }
 
 /// Intercept the forbidden field before it can deserialize any Worker payload.
@@ -100,7 +112,8 @@ pub(super) fn read_parent_continuation_final_report(
     contents: Option<&[u8]>,
     display_path: &Path,
     continuation: &ParentContinuationLaunch<'_>,
-) -> Result<ParsedReport<OrchestratorReviewReport>> {
+    allow_structural_correction: bool,
+) -> Result<(ParsedReport<OrchestratorReviewReport>, Vec<String>)> {
     let (run_id, parent_id, source_parent_attempt, parent_attempt) = continuation.binding();
     let captures = continuation
         .authored_worker_captures()?
@@ -122,7 +135,7 @@ pub(super) fn read_parent_continuation_final_report(
             })
         })
         .collect::<Result<Vec<_>>>()?;
-    read_parent_continuation_final_report_bound(
+    read_parent_continuation_final_report_bound_with_structural(
         contents,
         display_path,
         &ExpectedParentContinuationBinding {
@@ -133,14 +146,43 @@ pub(super) fn read_parent_continuation_final_report(
             completed_worker_ids: continuation.worker_ids(),
             captures: &captures,
         },
+        allow_structural_correction,
     )
 }
 
+#[cfg(test)]
 fn read_parent_continuation_final_report_bound(
     contents: Option<&[u8]>,
     display_path: &Path,
     expected: &ExpectedParentContinuationBinding<'_>,
 ) -> Result<ParsedReport<OrchestratorReviewReport>> {
+    read_parent_continuation_final_report_bound_with_structural(
+        contents,
+        display_path,
+        expected,
+        false,
+    )
+    .map(|(parsed, _)| parsed)
+}
+
+#[derive(Deserialize)]
+struct CorrectionReportIdentity {
+    id: String,
+    role: AgentRole,
+    #[serde(
+        rename = "worker_reports",
+        default,
+        deserialize_with = "refuse_worker_payload"
+    )]
+    _worker_reports: (),
+}
+
+fn read_parent_continuation_final_report_bound_with_structural(
+    contents: Option<&[u8]>,
+    display_path: &Path,
+    expected: &ExpectedParentContinuationBinding<'_>,
+    allow_structural_correction: bool,
+) -> Result<(ParsedReport<OrchestratorReviewReport>, Vec<String>)> {
     let contents =
         contents.context("parent continuation did not capture a descriptor-held final report")?;
     if contents.len() > MAX_SUPERVISOR_REPORT_BYTES {
@@ -192,6 +234,7 @@ fn read_parent_continuation_final_report_bound(
     }
     let turn: ParentContinuationTurn = serde_json::from_str(envelope.turn.get())
         .map_err(|error| anyhow::anyhow!("failed to parse parent continuation turn; final_report requires report and ordered worker_report_refs: {error}"))?;
+    let mut structural_problems = Vec::new();
     let mut report: OrchestratorReviewReport = match turn {
         ParentContinuationTurn::YieldWorkers { .. } => {
             bail!(
@@ -200,11 +243,40 @@ fn read_parent_continuation_final_report_bound(
             );
         }
         ParentContinuationTurn::FinalReport {
-            report,
-            worker_report_refs,
+            worker_report_refs, ..
         } => {
             verify_worker_report_references(&worker_report_refs, expected.captures)?;
-            report.report
+            let ParentContinuationRawReport { report } = serde_json::from_str(envelope.turn.get())
+                .context("failed to capture parent continuation report bytes")?;
+            // Even a structural retry must first prove the exact live envelope,
+            // Worker capture references and parent identity. Unknown/foreign
+            // protocol data and parent-authored Worker payloads never get authority.
+            let identity: CorrectionReportIdentity =
+                serde_json::from_str(report.get()).map_err(|error| {
+                    anyhow::anyhow!(
+                        "failed to parse parent continuation correction identity: {error}"
+                    )
+                })?;
+            if identity.id != expected.parent_id || identity.role != AgentRole::ChildOrchestrator {
+                bail!("parent continuation report declared a non-child role or id that does not match parent");
+            }
+            match serde_json::from_str::<ParentContinuationReport>(report.get()) {
+                Ok(parsed) => parsed.report,
+                Err(error) if allow_structural_correction => {
+                    structural_problems.push(format!(
+                        "bound parent final report failed structural validation: {error}"
+                    ));
+                    serde_json::from_value(json!({
+                        "id":expected.parent_id, "role":"child_orchestrator",
+                        "accepted":false, "rejected":true, "status":"failed",
+                        "remaining_risk":"Bound final report requires structural correction",
+                        "next_safe_action":"Use a fresh supervisor-authorized managed correction cycle"
+                    }))?
+                }
+                Err(error) => {
+                    return Err(error).context("failed to parse parent continuation report")
+                }
+            }
         }
     };
     if report.role != AgentRole::ChildOrchestrator {
@@ -227,10 +299,13 @@ fn read_parent_continuation_final_report_bound(
         .iter()
         .map(|capture| capture.report.clone())
         .collect();
-    Ok(ParsedReport {
-        report,
-        recovered: false,
-    })
+    Ok((
+        ParsedReport {
+            report,
+            recovered: false,
+        },
+        structural_problems,
+    ))
 }
 
 fn verify_worker_report_references(
@@ -605,5 +680,76 @@ mod tests {
             .unwrap_err()
             .to_string()
             .contains("does not match parent"));
+    }
+    #[test]
+    fn structural_correction_requires_exact_parent_envelope_and_worker_capture_references() {
+        let reports = worker_reports();
+        let captures = reports
+            .iter()
+            .map(|report| ExpectedWorkerCapture {
+                reference: WorkerReportReference::from_capture(
+                    &report.id,
+                    &serde_json::to_vec(report).unwrap(),
+                ),
+                report,
+            })
+            .collect::<Vec<_>>();
+        let completed = workers();
+        let expected = ExpectedParentContinuationBinding {
+            run_id: "run",
+            parent_id: "parent",
+            source_parent_attempt: 1,
+            parent_attempt: 2,
+            completed_worker_ids: &completed,
+            captures: &captures,
+        };
+        let mut missing_status = envelope(report_value());
+        missing_status["turn"]["report"]
+            .as_object_mut()
+            .unwrap()
+            .remove("status");
+        let parse = |value: &Value| {
+            let bytes = serde_json::to_vec(value).unwrap();
+            read_parent_continuation_final_report_bound_with_structural(
+                Some(&bytes),
+                Path::new("continuation.json"),
+                &expected,
+                true,
+            )
+        };
+        let (parsed, problems) = parse(&missing_status).unwrap();
+        assert_eq!(problems.len(), 1);
+        assert!(report_failed(&parsed.report));
+        assert!(!parsed.recovered);
+        assert_eq!(parsed.report.worker_reports, reports);
+        // Strict legacy parsing does not silently recover this report.
+        assert!(parse_value(missing_status.clone(), &completed).is_err());
+        for case in [
+            "run",
+            "parent",
+            "source",
+            "turn",
+            "foreign-report",
+            "worker-payload",
+            "capture",
+        ] {
+            let mut value = missing_status.clone();
+            match case {
+                "run" => value["run_id"] = json!("foreign-run"),
+                "parent" => value["parent_id"] = json!("foreign-parent"),
+                "source" => value["source_parent_attempt"] = json!(3),
+                "turn" => value["parent_attempt"] = json!(4),
+                "foreign-report" => value["turn"]["report"]["id"] = json!("foreign-parent"),
+                "worker-payload" => value["turn"]["report"]["worker_reports"] = json!([]),
+                "capture" => {
+                    value["turn"]["worker_report_refs"][0]["capture_sha256"] = json!("0".repeat(64))
+                }
+                _ => unreachable!(),
+            }
+            assert!(
+                parse(&value).is_err(),
+                "structural correction accepted {case}"
+            );
+        }
     }
 }

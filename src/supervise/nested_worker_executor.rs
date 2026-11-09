@@ -317,7 +317,7 @@ pub(super) fn execute_nested_worker_attempt(
     if let Some(duty) = metadata.mechanical_duty {
         projected_metadata.insert_direct_mechanical_duty(subject.id.clone(), duty);
     }
-    let rendered = render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
+    let mut rendered = render_child_orchestrator_prompt_with_incoming_root_and_field_guide(
         ChildOrchestratorPromptContext {
             plan: &prompt_plan,
             execution_target: None,
@@ -340,6 +340,9 @@ pub(super) fn execute_nested_worker_attempt(
         runtime,
         runtime,
     )?;
+    if let Some(repair_context) = &permit.correction_context {
+        rendered.prompt.push_str(repair_context);
+    }
     let command = ExternalAgentCommand::codex(
         &context.options.codex_bin,
         &preflight.worktree.path,
@@ -446,7 +449,15 @@ pub(super) fn execute_nested_worker_attempt(
             command.clone(),
             &subject,
             incoming.path(),
-            precreate_worker_execution_journals(&subject, &incoming)?,
+            if managed_parent_correction::defers_materialization(context) {
+                precreate_worker_execution_journals_for_candidate(
+                    &subject,
+                    &incoming,
+                    &preflight.worktree.path,
+                )?
+            } else {
+                precreate_worker_execution_journals(&subject, &incoming)?
+            },
         )?;
         let cancellation = preflight.managed_process_cancellation.cancellation();
         if let Some(validation) = &context.assignment_metadata.parent_validation {

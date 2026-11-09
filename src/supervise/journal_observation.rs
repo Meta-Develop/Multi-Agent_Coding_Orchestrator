@@ -73,6 +73,20 @@ pub(crate) fn validate_worker_journal_observations(
                 bail!("journal observation changed its bound worktree identity or HEAD");
             }
         }
+        if observation.phase == WorkerJournalObservationPhase::Baseline {
+            if previous.is_some()
+                || pending.is_some()
+                || entries.first() != Some(entry)
+                || observation.before != observation.after
+                || !entry.changed_paths.is_empty()
+                || !observation.declared_paths.is_empty()
+                || entry.command != ["true"]
+            {
+                bail!("invalid supervisor candidate baseline");
+            }
+            previous = Some(observation);
+            continue;
+        }
         let expected_before = previous.map_or(&empty, |last| &last.after);
         if &observation.before != expected_before {
             bail!("journal observation snapshot continuity failed");
@@ -108,7 +122,9 @@ pub(crate) fn validate_worker_journal_observations(
                     bail!("native edit observation interrupts an unfinished command");
                 }
             }
-            WorkerJournalObservationPhase::Failed => unreachable!("checked above"),
+            WorkerJournalObservationPhase::Failed | WorkerJournalObservationPhase::Baseline => {
+                unreachable!("checked above")
+            }
         }
         if observation.phase != WorkerJournalObservationPhase::Started
             && !observation.declared_paths.is_empty()
@@ -295,6 +311,14 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
             if journal_head(&repository)? != head_oid {
                 bail!("worker command changed HEAD; stop without repairing the journal");
             }
+            if let Some(status) = &status {
+                let status = status.as_ref().map_err(|error| {
+                    anyhow::anyhow!("wrapped command failed to launch: {error}")
+                })?;
+                if !matches!(status.code(), Some(0..=123)) {
+                    bail!("wrapped command has an unknown, signalled or unsupported exit");
+                }
+            }
             let mut completed = record.clone();
             let observation = completed
                 .observation
@@ -334,7 +358,13 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
         if let Some(status) = status {
             let status = status.context("wrapped command failed to launch; journal retained")?;
             if !status.success() {
-                bail!("wrapped command failed with {status}; journal retained");
+                return Err(WorkerJournalCommandExit {
+                    code: status
+                        .code()
+                        .context("wrapped command lost its numeric exit")?,
+                    detail: format!("wrapped command failed with {status}; journal retained"),
+                }
+                .into());
             }
         }
         Ok(())
@@ -443,4 +473,77 @@ fn snapshot(
     }
     binding.verify()?;
     Ok(state)
+}
+
+/// Native CLI exit contract: 0..=123 mirror an observed inner numeric exit.
+/// 125 is reserved for every wrapper/launch/observation failure. No journal or
+/// agent-authored text can supply this process outcome.
+#[derive(Debug)]
+pub struct WorkerJournalCommandExit {
+    code: i32,
+    detail: String,
+}
+impl std::fmt::Display for WorkerJournalCommandExit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.detail)
+    }
+}
+impl std::error::Error for WorkerJournalCommandExit {}
+impl WorkerJournalCommandExit {
+    pub fn code(&self) -> i32 {
+        self.code
+    }
+}
+pub(crate) fn journal_cli_error(error: anyhow::Error) -> anyhow::Error {
+    if error.is::<WorkerJournalCommandExit>() {
+        error
+    } else {
+        let exit = WorkerJournalCommandExit {
+            code: 125,
+            detail: format!("{error:#}"),
+        };
+        error.context(exit)
+    }
+}
+
+/// Called by the supervisor before launch, never by a Worker or journal reader.
+#[cfg(target_os = "linux")]
+pub(super) fn seed_worker_candidate_baseline(path: &Path, cwd: &Path) -> Result<()> {
+    let repository = Repository::open(cwd)?;
+    let binding = crate::safe_state::DirectoryBindingGuard::bind(cwd)?;
+    if repository.workdir() != Some(cwd) || fs::canonicalize(cwd)? != cwd {
+        bail!("candidate baseline requires the canonical assigned worktree");
+    }
+    let state = snapshot(&repository, &binding)?;
+    let timestamp = journal_timestamp()?;
+    let entry = WorkerExecutionJournalEntry {
+        command: vec!["true".into()],
+        cwd: cwd.to_path_buf(),
+        start_timestamp: timestamp.clone(),
+        end_timestamp: timestamp,
+        changed_paths: Vec::new(),
+        observation: Some(WorkerJournalObservation {
+            worktree: cwd.to_path_buf(),
+            worktree_identity: binding.identity().clone(),
+            head_oid: journal_head(&repository)?,
+            phase: WorkerJournalObservationPhase::Baseline,
+            before: state.clone(),
+            after: state,
+            declared_paths: Vec::new(),
+            failure: None,
+        }),
+    };
+    let mut encoded = Vec::new();
+    append_worker_execution_journal_record(&mut encoded, &entry)?;
+    let mut file = open_worker_journal_no_follow(path, true)?;
+    if file.metadata()?.len() != 0 {
+        bail!("candidate baseline refuses a spent journal");
+    }
+    use std::os::unix::fs::MetadataExt;
+    let metadata = file.metadata()?;
+    let expected = crate::safe_state::FileIdentity {
+        device: metadata.dev(),
+        file: metadata.ino(),
+    };
+    append_locked_worker_journal(path, &expected, &mut file, &encoded)
 }

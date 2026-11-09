@@ -8,7 +8,16 @@ fn main() -> Result<()> {
         return Ok(());
     }
     multi_agent_coding_orchestrator::configure_libgit2_repository_extensions()?;
-    run_cli()
+    match run_cli() {
+        Err(error) => {
+            if let Some(exit) = error.downcast_ref::<multi_agent_coding_orchestrator::supervise::WorkerJournalCommandExit>() {
+                eprintln!("{error:#}");
+                std::process::exit(exit.code());
+            }
+            Err(error)
+        }
+        result => result,
+    }
 }
 
 #[tokio::main]
