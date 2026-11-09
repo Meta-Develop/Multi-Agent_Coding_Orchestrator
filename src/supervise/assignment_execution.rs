@@ -5742,6 +5742,7 @@ fn integrate_accepted_isolated_workers(
             worker.lease().path(),
             primary_head,
             source_head,
+            None,
             &worker.report().assigned_paths,
             &captured.changed_paths,
             captured.snapshot_tree,
@@ -6058,15 +6059,17 @@ fn collect_captured_child_attempt<'a>(
                 context.worktree_creation.expected_source_head(),
                 "the pre-materialization managed child candidate",
             )?;
-            crate::external_agent::materialize_managed_child_git_commit(
-                repo,
-                &worktree.path,
-                captured_primary_head,
-                preflight.child_base_head,
-                &assignment.assigned_paths,
-                &candidate_paths,
-                candidate_tree,
-            )?;
+            outcome.previous_materialized_head =
+                crate::external_agent::materialize_managed_child_git_commit(
+                    repo,
+                    &worktree.path,
+                    captured_primary_head,
+                    preflight.child_base_head,
+                    outcome.previous_materialized_head,
+                    &assignment.assigned_paths,
+                    &candidate_paths,
+                    candidate_tree,
+                )?;
             let imported = collect_and_import_managed_child_git_commit(
                 repo,
                 &worktree.path,
