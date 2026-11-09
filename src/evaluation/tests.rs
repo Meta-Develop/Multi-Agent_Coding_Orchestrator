@@ -3233,6 +3233,7 @@ fn held_out_real_provider_refuses_configured_runtime_executable_mismatch_before_
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: SupervisorAdmissionConfig::default(),
         budget_overrides: RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

@@ -241,6 +241,7 @@ mod tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: Default::default(),
             budget_overrides: Default::default(),
             budget_max_duration_seconds: None,

@@ -595,6 +595,7 @@ pub(super) fn run_generated_follow_up_cascade(
             runtime: supervisor_template.runtime,
             allow_dirty_primary: supervisor_template.allow_dirty_primary,
             allow_live_run_collision: supervisor_template.allow_live_run_collision,
+            development_codex_network: supervisor_template.development_codex_network,
             admission_overrides: supervisor_template.admission_overrides,
             budget_overrides: supervisor_template.budget_overrides,
             budget_max_duration_seconds: supervisor_template.budget_max_duration_seconds,

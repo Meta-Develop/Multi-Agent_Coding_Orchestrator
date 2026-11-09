@@ -401,6 +401,8 @@ pub struct ExternalAgentCommand {
     /// Opt-in disable of Codex native multi_agent and goals. Not serialized.
     /// Does not change role identity, permissions, adapter, model, or effort.
     codex_native_delegation_disabled: bool,
+    /// Explicit supervisor development network choice, sealed with the command snapshot.
+    codex_development_network_enabled: bool,
     /// Private opt-in to byte-pinned delivery, not launch or permission authority.
     /// The executable capability is captured transiently from this original program context.
     read_only_target_executable_pin: Option<PathBuf>,
@@ -2861,6 +2863,7 @@ impl NestedWorktreeWritableAdmission {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WorktreeConfinementSnapshot {
+    codex_development_network_enabled: bool,
     invocation: ExternalAgentInvocation,
     program: PathBuf,
     cwd: PathBuf,
@@ -2898,6 +2901,7 @@ struct WorktreeConfinementSnapshot {
 impl WorktreeConfinementSnapshot {
     fn from_command(command: &ExternalAgentCommand, bind_assignment_process_launch: bool) -> Self {
         Self {
+            codex_development_network_enabled: command.codex_development_network_enabled,
             invocation: command.invocation,
             program: command.program.clone(),
             cwd: command.cwd.clone(),
@@ -3672,6 +3676,7 @@ impl ExternalAgentCommand {
             codex_run_account_binding: None,
             grok_run_account_binding: None,
             codex_native_delegation_disabled: false,
+            codex_development_network_enabled: false,
             read_only_target_executable_pin: None,
             codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
             selected_merge_arbiter: None,
@@ -3727,6 +3732,7 @@ impl ExternalAgentCommand {
             codex_run_account_binding: None,
             grok_run_account_binding: None,
             codex_native_delegation_disabled: false,
+            codex_development_network_enabled: false,
             read_only_target_executable_pin: None,
             codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
             selected_merge_arbiter: None,
@@ -3782,6 +3788,7 @@ impl ExternalAgentCommand {
             codex_run_account_binding: None,
             grok_run_account_binding: None,
             codex_native_delegation_disabled: false,
+            codex_development_network_enabled: false,
             read_only_target_executable_pin: None,
             codex_managed_readonly_route: CodexManagedReadonlyRoute::Off,
             selected_merge_arbiter: None,
@@ -4521,6 +4528,17 @@ impl ExternalAgentCommand {
             identity.parent = Some(parent.into());
         }
         self
+    }
+
+    /// Bind only the initial named-profile network permission for this invocation.
+    pub(crate) fn with_development_codex_network(mut self, enabled: bool) -> Self {
+        self.codex_development_network_enabled = enabled;
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn development_codex_network_enabled(&self) -> bool {
+        self.codex_development_network_enabled
     }
 
     /// Disable Codex native multi_agent and goals for this command only.
@@ -13120,6 +13138,7 @@ fn run_grok_environment_preflight(
     let (result, failure, _) = evaluate_environment_requirement(
         &auth,
         ExternalAgentInvocation::Grok,
+        false,
         &spec.cwd,
         timeout,
         cancellation,
@@ -13193,6 +13212,7 @@ fn run_grok_environment_preflight(
         let (result, failure, timed_out) = evaluate_environment_requirement(
             requirement,
             ExternalAgentInvocation::Grok,
+            false,
             &spec.cwd,
             timeout.saturating_sub(started.elapsed()),
             cancellation,
@@ -13284,6 +13304,7 @@ fn run_environment_preflight(
         let (result, failure, timed_out) = evaluate_environment_requirement(
             requirement,
             spec.invocation,
+            spec.codex_development_network_enabled,
             &spec.cwd,
             remaining,
             cancellation,
@@ -13310,6 +13331,7 @@ fn run_environment_preflight(
 fn evaluate_environment_requirement(
     requirement: &EnvironmentRequirement,
     invocation: ExternalAgentInvocation,
+    codex_network_enabled: bool,
     cwd: &Path,
     timeout: Duration,
     cancellation: &ProcessCancellation,
@@ -13483,8 +13505,21 @@ fn evaluate_environment_requirement(
             }
         }
         EnvironmentRequirement::Network { access } => {
-            let enforced_offline =
-                verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex);
+            // The outer Codex profile delegates command networking to the selected inner profile.
+            let enforced_offline = verified_confinement
+                == Some(SideEffectConfinementProfileKind::ExternalCodex)
+                && !codex_network_enabled;
+            let verified_networked_codex = codex_network_enabled
+                && matches!(
+                    invocation,
+                    ExternalAgentInvocation::CodexSupervisor
+                        | ExternalAgentInvocation::CodexConsultant
+                )
+                && verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalCodex(_)
+                );
             let verified_networked_grok = verified_confinement
                 == Some(SideEffectConfinementProfileKind::ExternalGrok)
                 && matches!(
@@ -13516,7 +13551,8 @@ fn evaluate_environment_requirement(
                     false,
                 )
             } else if *access == EnvironmentNetworkAccess::Enabled
-                && (verified_networked_grok
+                && (verified_networked_codex
+                    || verified_networked_grok
                     || verified_parent_relayed_claude
                     || verified_networked_cursor)
             {
@@ -13536,7 +13572,8 @@ fn evaluate_environment_requirement(
                     EnvironmentPreflightResult {
                         requirement: requirement.clone(),
                         status: EnvironmentPreflightStatus::Blocked,
-                        observation: None,
+                        observation: verified_networked_codex
+                            .then_some(EnvironmentPreflightObservation::Network { enabled: true }),
                     },
                     Some(environment_failure(
                         EnvironmentFailureCategory::SandboxUnavailable,

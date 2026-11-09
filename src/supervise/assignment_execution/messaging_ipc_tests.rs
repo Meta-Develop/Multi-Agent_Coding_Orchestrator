@@ -1031,6 +1031,7 @@ fn assignment_messaging_ipc_acceptance(
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

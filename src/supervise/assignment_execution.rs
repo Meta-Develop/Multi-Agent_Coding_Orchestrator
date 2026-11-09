@@ -619,6 +619,9 @@ fn bind_selected_runtime_launch(
     mechanical_duty: Option<MechanicalTerminalDuty>,
     purpose: &ChildAttemptPurpose<'_, '_>,
 ) -> Result<BoundSelectedRuntimeLaunch> {
+    if launch_runtime == SupervisorRuntime::Codex {
+        command = command.with_development_codex_network(options.development_codex_network);
+    }
     if assignment.role == AgentRole::Researcher {
         validate_researcher_assignment(assignment)?;
         if !matches!(
@@ -7060,6 +7063,10 @@ fn prepare_parent_auditor<'a>(
         &auditor_report_path,
         Duration::from_secs(plan.child_timeout_seconds),
     );
+    if launch_runtime == SupervisorRuntime::Codex {
+        auditor_command =
+            auditor_command.with_development_codex_network(options.development_codex_network);
+    }
     if launch_runtime.is_adapter_subprocess()
         || super::runtime_executables::captured_binding().is_some()
     {
@@ -9373,6 +9380,7 @@ mod decomposition_tests {
             runtime,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -9965,6 +9973,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -10464,6 +10473,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -11125,6 +11135,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -11897,6 +11908,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -12269,6 +12281,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -12747,6 +12760,7 @@ mod decomposition_tests {
             },
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -13512,6 +13526,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -13822,6 +13837,7 @@ mod decomposition_tests {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -13918,6 +13934,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: crate::supervise::RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -14284,6 +14301,7 @@ done
             runtime,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -16462,6 +16480,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -17357,6 +17376,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -17773,6 +17793,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -18074,6 +18095,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -18514,6 +18536,7 @@ done
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,
@@ -18835,6 +18858,7 @@ done
             runtime: SupervisorRuntime::Fake,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,

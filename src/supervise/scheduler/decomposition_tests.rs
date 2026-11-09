@@ -1712,6 +1712,7 @@ fn test_options(repo: &Path, run_id: &str) -> SupervisorRunOptions {
         runtime: SupervisorRuntime::Fake,
         allow_dirty_primary: true,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

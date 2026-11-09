@@ -1838,6 +1838,7 @@ fn run_autopilot_with_profile_retention_and_dispatch(
         // outer typed dirty-primary gate already handled operator worktree state.
         allow_dirty_primary: true,
         allow_live_run_collision: options.allow_live_run_collision,
+        development_codex_network: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides,
         budget_max_duration_seconds,
@@ -2398,6 +2399,7 @@ fn run_autopilot_plan_file_disabled_legacy(
             // supervise should not reject autopilot's own runtime artifacts.
             allow_dirty_primary: true,
             allow_live_run_collision: options.allow_live_run_collision,
+            development_codex_network: false,
             admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
             budget_overrides: options.budget_overrides,
             budget_max_duration_seconds: options.budget_max_duration_seconds,

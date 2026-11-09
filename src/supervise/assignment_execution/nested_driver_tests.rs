@@ -389,6 +389,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: Default::default(),
         budget_overrides: Default::default(),
         budget_max_duration_seconds: None,

@@ -18,6 +18,7 @@ fn catalog_options(runtime: SupervisorRuntime, codex_bin: &str) -> SupervisorRun
         runtime,
         allow_dirty_primary: true,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: SupervisorAdmissionConfig::default(),
         budget_overrides: RunBudgetLimits::default(),
         budget_max_duration_seconds: None,
