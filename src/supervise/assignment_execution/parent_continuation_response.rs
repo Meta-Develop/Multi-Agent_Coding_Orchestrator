@@ -62,9 +62,21 @@ enum ParentContinuationTurn {
         requests: Vec<YieldWorkerRequestWire>,
     },
     FinalReport {
-        report: Box<serde_json::value::RawValue>,
+        // Internally tagged enums buffer fields through Serde's Content visitor,
+        // which cannot supply RawValue's JSON-specific newtype token. Validate
+        // the exact turn shape here; extract report bytes from the same input below.
+        #[serde(rename = "report")]
+        _report: serde::de::IgnoredAny,
         worker_report_refs: Vec<WorkerReportReference>,
     },
+}
+
+// Read only after ParentContinuationTurn has checked every field and its tag.
+// Re-reading the original JSON preserves report duplicates and whitespace;
+// converting the buffered turn to Value would lose that evidence.
+#[derive(Deserialize)]
+struct ParentContinuationRawReport {
+    report: Box<serde_json::value::RawValue>,
 }
 
 /// Intercept the forbidden field before it can deserialize any Worker payload.
@@ -231,10 +243,11 @@ fn read_parent_continuation_final_report_bound_with_structural(
             );
         }
         ParentContinuationTurn::FinalReport {
-            report,
-            worker_report_refs,
+            worker_report_refs, ..
         } => {
             verify_worker_report_references(&worker_report_refs, expected.captures)?;
+            let ParentContinuationRawReport { report } = serde_json::from_str(envelope.turn.get())
+                .context("failed to capture parent continuation report bytes")?;
             // Even a structural retry must first prove the exact live envelope,
             // Worker capture references and parent identity. Unknown/foreign
             // protocol data and parent-authored Worker payloads never get authority.

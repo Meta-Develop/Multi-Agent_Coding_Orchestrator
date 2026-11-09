@@ -3508,7 +3508,8 @@ impl CapturedChildAttempt<'_> {
 }
 
 struct CollectedChildAttempt<'a> {
-    managed_completion: Option<managed_parent_correction::ManagedCycleCompletion>,
+    // Keep the live completion out of every collected-result stack slot.
+    managed_completion: Option<Box<managed_parent_correction::ManagedCycleCompletion>>,
     live_worker_runs: BTreeMap<String, ExternalAgentRun>,
     deferred_isolated: Option<bound_parent_turn::DeferredIsolatedIntegration>,
     attempt_report: OrchestratorReviewReport,
@@ -8494,7 +8495,7 @@ fn execute_supervisor_assignment_inner(
         let auditor_schema_path = dirs.schemas.join("auditor-report.schema.json");
 
         let mut retry_feedback: Option<ChildAttemptCorrection> = None;
-        let mut managed_completion: Option<managed_parent_correction::ManagedCycleCompletion> =
+        let mut managed_completion: Option<Box<managed_parent_correction::ManagedCycleCompletion>> =
             None;
         let mut managed_correction: Option<managed_parent_correction::ManagedCorrection> = None;
         let mut active_budget_policy = context.budget_policy.clone();

@@ -1433,7 +1433,8 @@ fn exercise_researcher_parent_review_evidence_gate(case: &str) {
         AgentRole::Researcher,
         plan.role_models[&AgentRole::ChildOrchestrator].clone(),
     );
-    let options = injected_options(&repo_path, temp.path(), "research-evidence-gate");
+    let run_id = format!("research-evidence-gate-{case}");
+    let options = injected_options(&repo_path, temp.path(), &run_id);
     let _prior = bind_priced_budget_fixture_prior(&repo_path).expect("bind fixture prior");
     let _selection = crate::supervise::scheduler::install_selected_researcher_budget_fixture(
         &plan,

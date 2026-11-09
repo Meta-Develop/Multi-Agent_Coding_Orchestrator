@@ -288,6 +288,7 @@ impl ManagedCycleCompletion {
     /// Called only after the controller has joined/revoked the inbox endpoint,
     /// collected every native Worker and final parent, and imported their evidence.
     #[allow(clippy::too_many_arguments)]
+    #[inline(never)]
     pub(super) fn seal(
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
@@ -296,7 +297,7 @@ impl ManagedCycleCompletion {
         binding: &WorkerRequestBinding,
         collected: &mut CollectedChildAttempt<'_>,
         budget_policy: &AssignmentBudgetPolicy,
-    ) -> Result<Self> {
+    ) -> Result<Box<Self>> {
         if source_attempt == 0
             || source_attempt % 2 != 1
             || collected._budget_reservation.state != DispatchBudgetReservationState::Settled
@@ -350,7 +351,7 @@ impl ManagedCycleCompletion {
         collected
             ._command
             .managed_parent_control_transport(collected.model_provenance.launch_runtime)?;
-        let completion = Self {
+        let completion = Box::new(Self {
             worker_custody,
             deferred_isolated: collected.deferred_isolated.take(),
             preflight_identity: preflight as *const _ as usize,
@@ -374,7 +375,7 @@ impl ManagedCycleCompletion {
                 .gate_tracker
                 .as_ref()
                 .map_or(0, |tracker| tracker.used),
-        };
+        });
         completion.revalidate(context, preflight, outcome)?;
         Ok(completion)
     }
@@ -442,7 +443,7 @@ impl ManagedCycleCompletion {
 
     #[allow(clippy::too_many_arguments)]
     pub(super) fn authorize(
-        self,
+        self: Box<Self>,
         context: &AssignmentExecutionContext<'_, '_>,
         preflight: &AssignmentExecutionPreflight<'_>,
         outcome: &AssignmentExecutionOutcome,
@@ -520,7 +521,7 @@ enum CorrectionReason {
 
 /// A supervisor-local consumable admission. It never refills the initial permit.
 pub(super) struct ManagedCorrection {
-    predecessor: ManagedCycleCompletion,
+    predecessor: Box<ManagedCycleCompletion>,
     correction: CorrectionReason,
     gate_used: u8,
     next_attempt: usize,
