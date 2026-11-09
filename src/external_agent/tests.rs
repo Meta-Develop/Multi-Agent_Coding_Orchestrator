@@ -5543,6 +5543,302 @@ fn staged_codex_home_lives_below_output_staging_and_is_removed_with_it() -> Resu
 
 #[cfg(target_os = "linux")]
 #[test]
+fn codex_shell_directories_are_materialized_projected_and_live_until_target_exit() -> Result<()> {
+    use std::io::{BufRead, Write};
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    use std::process::{Child, Command, Stdio};
+
+    struct OwnedShellChild(Child);
+    impl Drop for OwnedShellChild {
+        fn drop(&mut self) {
+            if !matches!(self.0.try_wait(), Ok(Some(_))) {
+                let _ = self.0.kill();
+            }
+            let _ = self.0.wait();
+        }
+    }
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("private-runtime");
+    for path in [&workspace, &runtime_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let shell = fs::canonicalize("/bin/sh")?;
+    for access in [WorkspaceAccess::ReadOnly, WorkspaceAccess::ReadWrite] {
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let root = staging.root_path().to_path_buf();
+        let codex_home = staging.stage_codex_home()?.to_path_buf();
+        let command = ExternalAgentCommand::codex(
+            &shell,
+            &workspace,
+            workspace.join("prompt.md"),
+            workspace.join("events.jsonl"),
+            staging.path()?,
+            Duration::from_secs(1),
+        )
+        .with_workspace_access(access);
+        let controls = ProtectedWorktreeControls {
+            writable_artifact_root: Some(root.clone()),
+            ..ProtectedWorktreeControls::default()
+        };
+        let profile = external_side_effect_profile(
+            &command,
+            &shell,
+            ExternalProgramTrust::TrustedSystemCodex,
+            &controls,
+        )?;
+        let mut process = with_external_runtime_context(
+            ProcessSpec::direct(
+                "shell directory regression",
+                &shell,
+                ["-c", "true"],
+                &workspace,
+                128,
+            ),
+            BTreeMap::from([("PATH".to_string(), TRUSTED_PATH.to_string())]),
+            profile,
+            ExternalAgentInvocation::CodexSupervisor,
+            None,
+            None,
+            Some(&codex_home),
+        );
+        staging.prepare_codex_shell_environment(&mut process)?;
+        let missing_unit_home = runtime_root.join("absent-unit-control-directory");
+        assert!(!missing_unit_home.exists());
+        let EnvironmentMode::ClearAndSet(environment) =
+            crate::process_runner::private_runtime_environment_for_test(
+                &process,
+                &missing_unit_home,
+            )?
+        else {
+            bail!("shell environment was not sanitized");
+        };
+        assert_eq!(environment["CODEX_HOME"], codex_home.to_str().unwrap());
+        assert!(!process.private_runtime_home);
+        assert!(staging
+            .prepare_codex_shell_environment(&mut process)
+            .is_err());
+
+        let filesystem = codex_filesystem_permissions(&command, &controls);
+        let write_rule =
+            |path: &Path| format!("{}=\"write\"", toml_basic_string(path.to_str().unwrap()));
+        assert!(filesystem.contains(&write_rule(&root)));
+        assert!(filesystem.contains(if access == WorkspaceAccess::ReadOnly {
+            "\":workspace_roots\"={\".\"=\"read\"}"
+        } else {
+            "\":workspace_roots\"={\".\"=\"write\"}"
+        }));
+        assert!(!filesystem.contains(&write_rule(&runtime_root)));
+        assert!(!filesystem.contains("\"/\"=\"write\""));
+        let SideEffectConfinementProfile::ExternalCodex(profile) = process.side_effects.clone()
+        else {
+            bail!("shell confinement changed");
+        };
+        let outer = crate::process_runner::external_codex_systemd_properties_for_test(
+            profile, &shell, &workspace,
+        )?;
+        assert!(outer.contains(&format!("--property=BindPaths={}", root.display())));
+        assert!(outer.contains(&format!("--property=ReadWritePaths={}", root.display())));
+
+        for key in ["HOME", "TMPDIR"] {
+            let path = Path::new(&environment[key]);
+            assert_eq!(fs::canonicalize(path)?, path);
+            assert_eq!(path.parent(), Some(root.as_path()));
+            assert_ne!(path, codex_home);
+            let metadata = fs::symlink_metadata(path)?;
+            assert!(metadata.is_dir() && !metadata.file_type().is_symlink());
+            assert_eq!(metadata.uid(), fs::metadata(&runtime_root)?.uid());
+            assert_eq!(metadata.mode() & 0o777, 0o700);
+            assert!(!path.join("auth.json").exists());
+        }
+        assert_ne!(environment["HOME"], environment["TMPDIR"]);
+
+        // A real providerless shell consumes the final runner environment. The permission
+        // checks above cover its ancestor projection; this is not a native Codex qualification.
+        staging.preserve_unquiescent = true;
+        let mut child = OwnedShellChild(
+            Command::new(&shell)
+                .args([
+                    "-c",
+                    r#"set -eu
+for directory in "$HOME" "$TMPDIR"; do
+    test "$(cd "$directory" && pwd -P)" = "$directory"
+    printf 'fixture\n' > "$directory/fixture"
+    IFS= read -r actual < "$directory/fixture"
+    test "$actual" = fixture
+done
+printf 'ready\n'
+IFS= read -r finish
+test "$finish" = finish
+"#,
+                ])
+                .env_clear()
+                .envs(&environment)
+                .current_dir(&workspace)
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .spawn()?,
+        );
+        let mut ready = String::new();
+        std::io::BufReader::new(child.0.stdout.take().context("shell stdout")?)
+            .read_line(&mut ready)?;
+        assert_eq!(ready, "ready\n");
+        assert!(
+            staging.cleanup().is_err(),
+            "live shell state must be retained"
+        );
+        for key in ["HOME", "TMPDIR"] {
+            assert_eq!(
+                fs::read(Path::new(&environment[key]).join("fixture"))?,
+                b"fixture\n"
+            );
+        }
+        child
+            .0
+            .stdin
+            .take()
+            .context("shell stdin")?
+            .write_all(b"finish\n")?;
+        assert!(child.0.wait()?.success());
+        // Only fresh target quiescence clears the same guard in production.
+        staging.preserve_unquiescent = false;
+        staging.cleanup()?;
+        assert!(!root.exists());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_shell_directories_refuse_stale_symlink_and_rebound_staging_paths() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("private-runtime");
+    let foreign = temp.path().join("foreign");
+    for path in [&workspace, &runtime_root, &foreign] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    fs::write(foreign.join("sentinel"), b"preserve")?;
+    for (name, symlink_case) in [
+        ("shell-home", false),
+        ("shell-home", true),
+        ("shell-tmp", false),
+        ("shell-tmp", true),
+    ] {
+        let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+        let root = staging.root_path().to_path_buf();
+        let mut process =
+            ProcessSpec::direct("refusal", "/bin/sh", ["-c", "true"], &workspace, 128)
+                .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+                .with_private_runtime_home(true)
+                .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+                    ExternalCodexProfile::read_only(&workspace).with_writable_artifact_root(&root),
+                ));
+        let stale = root.join(name);
+        if symlink_case {
+            symlink(&foreign, &stale)?;
+        } else {
+            fs::create_dir(&stale)?;
+        }
+        assert!(staging
+            .prepare_codex_shell_environment(&mut process)
+            .is_err());
+        assert_eq!(
+            staging.shell_directories.len(),
+            usize::from(name == "shell-tmp"),
+            "partial setup must retain ownership of its created HOME"
+        );
+        assert_eq!(fs::read(foreign.join("sentinel"))?, b"preserve");
+        assert!(
+            process.private_runtime_home,
+            "refused preparation must not disable injection"
+        );
+        if symlink_case {
+            fs::remove_file(&stale)?;
+        } else {
+            fs::remove_dir(&stale)?;
+        }
+        staging.cleanup()?;
+    }
+
+    let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+    let root = staging.root_path().to_path_buf();
+    let mut process = ProcessSpec::direct("refusal", "/bin/sh", ["-c", "true"], &workspace, 128)
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+        .with_private_runtime_home(true)
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_only(&workspace).with_writable_artifact_root(&root),
+        ));
+    let held = runtime_root.join("held-staging");
+    fs::rename(&root, &held)?;
+    fs::create_dir(&root)?;
+    fs::set_permissions(&root, fs::Permissions::from_mode(0o700))?;
+    assert!(staging
+        .prepare_codex_shell_environment(&mut process)
+        .is_err());
+    assert_eq!(
+        fs::read_dir(&root)?.count(),
+        0,
+        "replacement root must remain untouched"
+    );
+    fs::remove_dir(&root)?;
+    fs::rename(&held, &root)?;
+    staging.cleanup()?;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn codex_shell_directories_require_sanitization_projection_and_preserve_unquiescent_drop(
+) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let workspace = temp.path().join("workspace");
+    let runtime_root = temp.path().join("private-runtime");
+    for path in [&workspace, &runtime_root] {
+        fs::create_dir(path)?;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
+    }
+    let mut staging = ExternalOutputStaging::create_under(&runtime_root, &workspace)?;
+    let root = staging.root_path().to_path_buf();
+    let mut process = ProcessSpec::direct("refusal", "/bin/sh", ["-c", "true"], &workspace, 128)
+        .with_environment(EnvironmentMode::ClearAndSet(BTreeMap::new()))
+        .with_private_runtime_home(true)
+        .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
+            ExternalCodexProfile::read_only(&workspace),
+        ));
+    assert!(staging
+        .prepare_codex_shell_environment(&mut process)
+        .is_err());
+    process.side_effects = SideEffectConfinementProfile::ExternalCodex(
+        ExternalCodexProfile::read_only(&workspace).with_writable_artifact_root(&root),
+    );
+    process.environment = EnvironmentMode::Inherit;
+    assert!(staging
+        .prepare_codex_shell_environment(&mut process)
+        .is_err());
+    assert!(staging.shell_directories.is_empty());
+    process.environment = EnvironmentMode::ClearAndSet(BTreeMap::new());
+    staging.prepare_codex_shell_environment(&mut process)?;
+    let home = staging.shell_directories[0].path().to_path_buf();
+    staging.preserve_unquiescent = true;
+    assert!(staging.cleanup().is_err());
+    drop(staging);
+    assert!(
+        home.is_dir(),
+        "Drop must retain state when target quiescence is unknown"
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn supervisor_simulation_exposes_the_staged_codex_home_and_removes_it_after_exit() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 

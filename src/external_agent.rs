@@ -9275,6 +9275,24 @@ fn run_external_agent_runtime_inner(
         }
     };
 
+    if matches!(runtime, ExternalExecutionRuntime::Verified)
+        && matches!(
+            target_spec.invocation,
+            ExternalAgentInvocation::CodexSupervisor | ExternalAgentInvocation::CodexConsultant
+        )
+    {
+        if let Err(error) = output_staging.prepare_codex_shell_environment(&mut process_spec) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(target_spec.invocation)),
+                format!("failed to prepare private Codex shell directories: {error:#}"),
+            );
+            return report;
+        }
+    }
+
     if let Some(pin) = read_only_target_executable_pin {
         process_spec = match process_spec.with_pinned_direct_executable(pin) {
             Ok(prepared) => prepared,
@@ -9455,6 +9473,10 @@ fn run_external_agent_runtime_inner(
             return report;
         }
     };
+    // The shell directories must survive every return/panic while the target may live.
+    if !output_staging.shell_directories.is_empty() {
+        output_staging.preserve_unquiescent = true;
+    }
     report.stdout.target_launch_attempted = true;
     let completed_context = CompletedTargetContext {
         runtime,
@@ -10179,6 +10201,9 @@ fn run_external_agent_runtime_inner(
         binding.attach_command_binding(&mut worker_journal_artifacts, &target_spec.cwd);
     }
     report.replace_worker_journal_artifacts(worker_journal_artifacts);
+    if !output_staging.shell_directories.is_empty() {
+        output_staging.preserve_unquiescent = !report.scratch_quiescence_verified();
+    }
     match output_staging.cleanup() {
         Ok(ExternalOutputCleanup::Quarantined(operation)) => {
             if let Err(error) = persist_machine_global_retention_receipt(&spec.json_log, &operation)
@@ -12327,6 +12352,7 @@ fn persist_machine_global_retention_receipt(
 struct ExternalOutputStaging {
     preserve_unquiescent: bool,
     root_path: PathBuf,
+    root: SecureOutputRoot,
     reservation: Option<ReservedOutputFile>,
     /// Exact parent-created Grok prompt leaf; never a writable staging-root grant.
     worker_effective_prompt: Option<ReservedOutputFile>,
@@ -12334,6 +12360,9 @@ struct ExternalOutputStaging {
     /// the unit already binds it read-write, and it outlives the unit so the parent can read
     /// the Codex rollout before the whole staging root is removed or quarantined.
     codex_home: Option<SecureOutputRoot>,
+    /// Fresh shell HOME/TMPDIR below the artifact root admitted by both sandbox layers.
+    /// Held until target quiescence, then removed or quarantined with output staging.
+    shell_directories: Vec<SecureOutputRoot>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     bound_store: Option<MachineGlobalStore>,
     bound_root_reservation: Option<ReservedDirectory>,
@@ -12390,17 +12419,20 @@ impl ExternalOutputStaging {
             )
             .context("failed to reserve output staging under the reviewed machine-global root")?;
         let root_path = root_reservation.path().to_path_buf();
-        let prepared = (|| -> Result<ReservedOutputFile> {
+        let prepared = (|| -> Result<(SecureOutputRoot, ReservedOutputFile)> {
             let root = SecureOutputRoot::open_private(&root_path)?;
             root.reject_inside(writable_workspace)?;
-            root.reserve(OsStr::new("last-message.raw"))
+            let reservation = root.reserve(OsStr::new("last-message.raw"))?;
+            Ok((root, reservation))
         })();
         match prepared {
-            Ok(reservation) => Ok(Self {
+            Ok((root, reservation)) => Ok(Self {
                 root_path,
+                root,
                 reservation: Some(reservation),
                 worker_effective_prompt: None,
                 codex_home: None,
+                shell_directories: Vec::new(),
                 machine_global_retention: Some(binding),
                 bound_store: Some(store),
                 bound_root_reservation: Some(root_reservation),
@@ -12463,17 +12495,20 @@ impl ExternalOutputStaging {
         }
         let root_path =
             root_path.context("private output staging name collision limit was exhausted")?;
-        let prepared = (|| -> Result<ReservedOutputFile> {
+        let prepared = (|| -> Result<(SecureOutputRoot, ReservedOutputFile)> {
             let root = SecureOutputRoot::open_private(&root_path)?;
             root.reject_inside(writable_workspace)?;
-            root.reserve(OsStr::new("last-message.raw"))
+            let reservation = root.reserve(OsStr::new("last-message.raw"))?;
+            Ok((root, reservation))
         })();
         match prepared {
-            Ok(reservation) => Ok(Self {
+            Ok((root, reservation)) => Ok(Self {
                 root_path,
+                root,
                 reservation: Some(reservation),
                 worker_effective_prompt: None,
                 codex_home: None,
+                shell_directories: Vec::new(),
                 machine_global_retention: None,
                 bound_store: None,
                 bound_root_reservation: None,
@@ -12531,6 +12566,44 @@ impl ExternalOutputStaging {
         Ok(self.codex_home.insert(home).path())
     }
 
+    /// Materializes shell state beneath the artifact root already projected into both the
+    /// outer unit and Codex's inner filesystem profile. The unit RuntimeDirectory contains
+    /// control files and possibly auth; it is deliberately not an inner writable root.
+    fn prepare_codex_shell_environment(&mut self, spec: &mut ProcessSpec) -> Result<()> {
+        let SideEffectConfinementProfile::ExternalCodex(profile) = &spec.side_effects else {
+            bail!("private Codex shell directories require ExternalCodex confinement");
+        };
+        if !spec.private_runtime_home
+            || !profile.writable_artifact_roots().contains(&self.root_path)
+        {
+            bail!("private Codex shell directories require the admitted output staging root");
+        }
+        let EnvironmentMode::ClearAndSet(environment) = &mut spec.environment else {
+            bail!("private Codex shell directories require a sanitized environment");
+        };
+        if !self.shell_directories.is_empty() {
+            bail!("private output staging already holds Codex shell directories");
+        }
+        self.root.verify_path_identity()?;
+        for (key, name) in [("HOME", "shell-home"), ("TMPDIR", "shell-tmp")] {
+            // create_child refuses stale directories and symlinks and holds the new inode.
+            // Record cleanup ownership before any subsequent fallible operation.
+            let directory = self.root.create_child(OsStr::new(name))?;
+            self.shell_directories.push(directory);
+            let directory = self.shell_directories.last().expect("just inserted");
+            directory.verify_path_identity()?;
+            let path = directory
+                .path()
+                .to_str()
+                .context("private Codex shell directory is not valid UTF-8")?;
+            environment.insert(key.to_string(), path.to_string());
+        }
+        // Keep CODEX_HOME and late-published auth unchanged, but prevent the runner from
+        // overwriting these visible shell paths with its unprojected control directory.
+        spec.private_runtime_home = false;
+        Ok(())
+    }
+
     /// Borrows the staged output leaf together with the parent-owned Codex home (when staged)
     /// so target completion can publish output and read the rollout from held descriptors.
     fn completion_handles(&mut self) -> Result<CompletedTargetStaging<'_>> {
@@ -12564,6 +12637,10 @@ impl ExternalOutputStaging {
     }
 
     fn cleanup(&mut self) -> Result<ExternalOutputCleanup> {
+        if self.preserve_unquiescent {
+            bail!("private output staging must remain until target quiescence is verified");
+        }
+        self.root.verify_path_identity()?;
         let Some(binding) = self.machine_global_retention.as_ref() else {
             let attribution = MachineGlobalBypassAttribution {
                 actor: "maco-external-agent".to_string(),
@@ -12608,6 +12685,7 @@ impl ExternalOutputStaging {
                 self.worker_effective_prompt.take();
                 // The staged Codex home travels with the quarantined staging root.
                 self.codex_home.take();
+                self.shell_directories.clear();
                 self.bound_root_reservation.take();
                 self.bound_store.take();
                 self.cleanup_completed = true;
@@ -12631,6 +12709,10 @@ impl ExternalOutputStaging {
         if let Some(codex_home) = self.codex_home.take() {
             remove_staged_codex_home(codex_home)?;
         }
+        for directory in self.shell_directories.drain(..) {
+            remove_staged_codex_home(directory)?;
+        }
+        self.root.verify_path_identity()?;
         fs::remove_dir(&self.root_path).with_context(|| {
             format!(
                 "failed to remove private output staging root {}",
@@ -12669,9 +12751,8 @@ impl Drop for ExternalOutputStaging {
     }
 }
 
-/// Removes the parent-owned Codex home together with every session, log, and state file the
-/// contained Codex process wrote below it. The held directory identity is re-verified first so
-/// a rebound pathname can never redirect the recursive removal.
+/// Removes a parent-owned private directory after target quiescence. Re-verify its held
+/// identity first so a rebound pathname cannot redirect recursive removal.
 fn remove_staged_codex_home(codex_home: SecureOutputRoot) -> Result<()> {
     codex_home
         .verify_path_identity()
