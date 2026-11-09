@@ -1659,18 +1659,32 @@ pub(super) fn worker_technical_failure(
             .validation_results
             .iter()
             .any(|validation| validation_failed(validation) && !licensed_validation(validation))
-        || worker.commands_run.iter().any(|command| {
-            command.timed_out
-                || command.error.is_some()
-                || !command.environment_failures.is_empty()
-                || !command.sandbox_denials.is_empty()
-                || ((command.status != ReviewStatus::Succeeded
-                    || command.exit_code.is_some_and(|code| code != 0))
-                    && !licensed.iter().any(|failure| {
-                        command.stdout.contains(&failure.failure_signature)
-                            || command.stderr.contains(&failure.failure_signature)
-                    }))
-        })
+        || worker
+            .commands_run
+            .iter()
+            .enumerate()
+            .any(|(index, command)| {
+                command.error.is_some()
+                    || !command.environment_failures.is_empty()
+                    || !command.sandbox_denials.is_empty()
+                    || ((command.timed_out
+                        || ((command.status != ReviewStatus::Succeeded
+                            || command.exit_code.is_some_and(|code| code != 0))
+                            && !licensed.iter().any(|failure| {
+                                command.stdout.contains(&failure.failure_signature)
+                                    || command.stderr.contains(&failure.failure_signature)
+                            })))
+                        && !worker.commands_run[index + 1..].iter().any(|later| {
+                            later.command == command.command
+                                && later.cwd.as_os_str() == command.cwd.as_os_str()
+                                && later.status == ReviewStatus::Succeeded
+                                && later.exit_code == Some(0)
+                                && !later.timed_out
+                                && later.error.is_none()
+                                && later.environment_failures.is_empty()
+                                && later.sandbox_denials.is_empty()
+                        }))
+            })
         || worker.findings.iter().any(|finding| {
             finding.severity == FindingSeverity::Error && !licensed_signature(&finding.message)
         })

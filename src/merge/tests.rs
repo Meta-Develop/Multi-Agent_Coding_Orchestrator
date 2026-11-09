@@ -7,6 +7,122 @@ use std::sync::{mpsc, Mutex};
 
 static VALIDATION_ENVIRONMENT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
+#[cfg(unix)]
+#[test]
+fn trusted_owner_root_uid_is_always_accepted() {
+    for mapping in ["30033 0 1", "0 100000 65536", "", "malformed"] {
+        for overflow in ["65534", "invalid"] {
+            let owners = trusted_owner_namespace(mapping, overflow, 30033);
+            for ancestor in [None, Some(Path::new("/")), Some(Path::new("/usr"))] {
+                assert!(trusted_executable_owner(0, ancestor, owners));
+            }
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_owner_overflow_requires_valid_unmapped_root() {
+    for mapping in ["30033 0 1", " 30033 0 1\n", "30033 0 1\n40000 100000 10\n"] {
+        let owners = trusted_owner_namespace(mapping, "65534\n", 30033);
+        assert_eq!(owners, Some((65534, 30033)));
+        for ancestor in [None, Some(Path::new("/")), Some(Path::new("/usr"))] {
+            assert!(trusted_executable_owner(65534, ancestor, owners));
+            assert!(!trusted_executable_owner(12345, ancestor, owners));
+        }
+    }
+    for mapping in [
+        "0 100000 65536",
+        "30033 0 1\n0 100000 65536",
+        "",
+        "\n",
+        "malformed",
+        "30033 0",
+        "30033 0 1 extra",
+        "30033 invalid 1",
+        "30033 0 0",
+        "30033 0 -1",
+        "4294967295 0 2",
+        "30033 4294967295 2",
+        "30033 0 1\nmalformed",
+    ] {
+        let owners = trusted_owner_namespace(mapping, "65534", 30033);
+        assert_eq!(owners, None, "mapping: {mapping:?}");
+        for ancestor in [None, Some(Path::new("/")), Some(Path::new("/usr"))] {
+            assert!(!trusted_executable_owner(65534, ancestor, owners));
+            assert!(!trusted_executable_owner(12345, ancestor, owners));
+        }
+    }
+    for overflow in ["", "invalid", "65534 extra", "4294967296"] {
+        let owners = trusted_owner_namespace("30033 0 1", overflow, 30033);
+        assert_eq!(owners, None);
+        assert!(!trusted_executable_owner(65534, None, owners));
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_owner_effective_uid_exception_is_only_for_root_ancestor() {
+    let owners = trusted_owner_namespace("30033 0 1", "65534", 30033);
+    assert!(trusted_executable_owner(
+        30033,
+        Some(Path::new("/")),
+        owners
+    ));
+    for ancestor in [None, Some(Path::new("/usr")), Some(Path::new("/usr/bin"))] {
+        assert!(!trusted_executable_owner(30033, ancestor, owners));
+    }
+    for (mapping, overflow) in [
+        ("0 100000 65536", "65534"),
+        ("", "65534"),
+        ("malformed", "65534"),
+        ("30033 0 1", "invalid"),
+    ] {
+        let owners = trusted_owner_namespace(mapping, overflow, 30033);
+        for ancestor in [None, Some(Path::new("/")), Some(Path::new("/usr"))] {
+            assert!(!trusted_executable_owner(30033, ancestor, owners));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn trusted_owner_system_resolver_returns_checked_target_instead_of_replaceable_symlink() {
+    use std::os::unix::fs::{symlink, MetadataExt, PermissionsExt};
+
+    let temp = tempfile::tempdir_in("target").expect("target fixture directory");
+    let target = temp.path().join("trusted-program");
+    let replacement = temp.path().join("replacement");
+    let alias = temp.path().join("program");
+    fs::write(&target, b"trusted fixture").expect("write target");
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("chmod target");
+    fs::write(&replacement, b"replacement fixture").expect("write replacement");
+    symlink(target.file_name().unwrap(), &alias).expect("create alias");
+
+    // Supply a simulated namespace; this regression never reads /proc.
+    let overflow = fs::metadata(&target).expect("target metadata").uid();
+    let owners = trusted_owner_namespace("30033 0 1", &overflow.to_string(), 30033);
+    let resolved = crate::process_runner::trusted_system_executable_with_owners(
+        &[alias.to_str().expect("fixture path")],
+        owners,
+    )
+    .expect("trusted target");
+    assert_eq!(
+        resolved,
+        fs::canonicalize(&target).expect("canonical target")
+    );
+    fs::remove_file(&alias).expect("remove original alias");
+    symlink(replacement.file_name().unwrap(), &alias).expect("replace alias");
+    assert_eq!(
+        fs::read(&resolved).expect("read resolved target"),
+        b"trusted fixture"
+    );
+    assert_eq!(
+        fs::read(&alias).expect("read replaced alias"),
+        b"replacement fixture"
+    );
+}
+
 const ARBITRATION_PATCH_A: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..2222222 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,2 @@\n base\n+side-a\n";
 const ARBITRATION_PATCH_B: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..3333333 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,2 @@\n base\n+side-b\n";
 const ARBITRATION_PATCH_BOTH: &[u8] = b"diff --git a/shared.txt b/shared.txt\nindex 1111111..4444444 100644\n--- a/shared.txt\n+++ b/shared.txt\n@@ -1 +1,3 @@\n base\n+side-a\n+side-b\n";

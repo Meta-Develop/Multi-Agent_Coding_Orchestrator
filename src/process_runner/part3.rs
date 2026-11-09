@@ -2101,7 +2101,14 @@ pub(crate) fn trusted_system_executable(
 ) -> std::io::Result<PathBuf> {
     #[cfg(unix)]
     {
-        find_trusted_unix_executable(name, candidates).ok_or_else(|| {
+        #[cfg(not(test))]
+        let executable = find_trusted_unix_executable(name, candidates);
+        #[cfg(test)]
+        let executable = trusted_system_executable_with_owners(
+            candidates,
+            crate::merge::trusted_executable_namespace_owners(),
+        );
+        executable.ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::NotFound,
                 format!(
@@ -2118,6 +2125,25 @@ pub(crate) fn trusted_system_executable(
             "fixed trusted executable resolution is not implemented on this platform",
         ))
     }
+}
+
+#[cfg(all(test, unix))]
+pub(crate) fn trusted_system_executable_with_owners(
+    candidates: &[&str],
+    namespace_owners: Option<(u32, u32)>,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    candidates.iter().find_map(|candidate| {
+        let canonical = fs::canonicalize(candidate).ok()?;
+        let metadata = canonical.metadata().ok()?;
+        (metadata.is_file()
+            && crate::merge::trusted_executable_owner(metadata.uid(), None, namespace_owners)
+            && metadata.permissions().mode() & 0o111 != 0
+            && metadata.permissions().mode() & 0o022 == 0)
+            // Do not execute a replaceable alias after validating its target.
+            .then_some(canonical)
+    })
 }
 
 #[cfg(target_os = "linux")]

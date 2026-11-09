@@ -1866,25 +1866,9 @@ pub(super) fn inspect_primary_scope_candidate(
 }
 
 // Decomposition technical success does not derive from the Worker's raw bit.
-// No licensed-failure exceptions authorize decomposition evidence. Unify with
-// reporting::worker_technical_failure(worker, &[]) when that helper lands.
+// No licensed-failure exceptions authorize decomposition evidence.
 pub(super) fn decomposition_worker_technical_failure(worker: &WorkerReport) -> bool {
-    worker.rejected
-        || worker.status != ReviewStatus::Succeeded
-        || !worker.environment_failures.is_empty()
-        || worker.validation_results.iter().any(validation_failed)
-        || worker.commands_run.iter().any(|command| {
-            command.status != ReviewStatus::Succeeded
-                || command.exit_code.is_some_and(|code| code != 0)
-                || command.timed_out
-                || command.error.is_some()
-                || !command.environment_failures.is_empty()
-                || !command.sandbox_denials.is_empty()
-        })
-        || worker
-            .findings
-            .iter()
-            .any(|finding| finding.severity == FindingSeverity::Error)
+    worker_technical_failure(worker, &[])
 }
 
 pub(super) fn bind_supervisor_decomposition_candidate(

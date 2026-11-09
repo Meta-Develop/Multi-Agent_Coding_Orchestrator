@@ -668,6 +668,13 @@ fn admitted_direct_worker_prompt_has_leaf_authority_and_exact_scope() {
     })
     .expect("render admitted direct worker prompt");
     assert_native_edit_journal_reporting_contract(&prompt);
+    for contract in [
+        worker_cacheable_prefix().expect("worker prefix"),
+        prompt.clone(),
+    ] {
+        assert!(contract.contains("- files_changed lists every path the cumulative candidate changes against the assignment base, including changes kept from an earlier attempt of this assignment."));
+        assert!(contract.contains("- A command that failed or timed out counts against the assignment unless that identical command from the same directory later succeeds, so after a repair run the identical command again."));
+    }
 
     assert!(prompt.contains("admitted direct terminal worker"));
     assert!(prompt.contains("Do not launch workers, create delegated subtasks"));
