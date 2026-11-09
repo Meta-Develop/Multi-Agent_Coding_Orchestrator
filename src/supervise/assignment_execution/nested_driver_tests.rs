@@ -199,6 +199,41 @@ impl Drop for GrokBinaryEnvironmentGuard {
     }
 }
 
+// A native peer needs a report template, never simulated journal captures.
+// The controller already seeded the real journal against this exact candidate;
+// deterministic_fake_child_run would truncate that held baseline before launch.
+pub(super) fn managed_process_report_template(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    metadata: &AssignmentMetadata,
+    claim_token: u64,
+    semantic_intent_token: Option<u64>,
+) -> Result<ExternalAgentRun> {
+    if assignment.role != AgentRole::Worker {
+        return deterministic_fake_child_run(
+            command,
+            assignment,
+            metadata,
+            claim_token,
+            semantic_intent_token,
+        );
+    }
+    let report: WorkerReport = serde_json::from_value(json!({
+        "id": assignment.id, "role": "worker",
+        "assigned_paths": assignment.assigned_paths,
+        "semantic_symbols": assignment.semantic_symbols,
+        "semantic_modules": assignment.semantic_modules,
+        "claim_token": claim_token, "semantic_intent_token": semantic_intent_token,
+        "no_further_delegation": true,
+        "accepted": true, "rejected": false, "status": "succeeded",
+        "remaining_risk": "offline report template; native commands and journal are collected separately"
+    }))?;
+    Ok(deterministic_fake_run(
+        command,
+        serde_json::to_vec(&report)?,
+    ))
+}
+
 // Real managed resources and the existing prepare/collect boundary, with an
 // injected deterministic runner. No provider process or native subagent runs.
 pub(super) fn driver_fixture(case: &str) -> Result<()> {
@@ -310,6 +345,37 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             "auditor":{"model":"gpt-6.1-sol", "reasoning_effort":"high"}
         }
     }))?;
+    if outer {
+        // The default lenses are automatic and have no concrete effort. Author
+        // the same explicit Auditor profile in the plan used by both the prior
+        // fixture and actual selected review launches, retaining each lens scope.
+        let auditor = plan
+            .role_models
+            .get(&AgentRole::Auditor)
+            .context("outer fixture Auditor profile")?;
+        for lens in &mut plan.review_lenses {
+            let ReviewLensBackendConfig::Model {
+                backend_id,
+                model,
+                reasoning_effort,
+                ..
+            } = &mut lens.backend
+            else {
+                bail!("outer fixture requires its model review lenses");
+            };
+            *backend_id = "codex".into();
+            *model = auditor
+                .model
+                .clone()
+                .context("outer fixture Auditor model")?;
+            *reasoning_effort = Some(
+                auditor
+                    .reasoning_effort
+                    .clone()
+                    .context("outer fixture Auditor effort")?,
+            );
+        }
+    }
     if scheduler.is_some() {
         plan.semantic_coordination = SemanticCoordinationMode::Block;
     }
@@ -899,7 +965,12 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             crate::external_agent::prepare_managed_child_git_boundary_for_test(&command.cwd)
                 .expect("isolated parent fixture requires its private Git boundary");
         }
-        let mut run = deterministic_fake_child_run(
+        let template = if managed_process {
+            managed_process_report_template
+        } else {
+            deterministic_fake_child_run
+        };
+        let mut run = template(
             &simulated,
             &fake_subject,
             &metadata,

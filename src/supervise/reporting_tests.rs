@@ -645,13 +645,23 @@ fn worker_journal_failed_command_retains_observed_mutation() {
 fn worker_journal_enosys_launch_failure_is_terminal_and_never_completed() {
     let _error = Openat2Error::force(libc::ENOSYS).with_statx_enosys();
     let (_temp, worktree, path, identity) = observed_fixture();
-    let record = observed_entry(&worktree, &["/no-such-maco-test-command"]);
+    let missing = worktree.join("missing-command");
+    assert!(!missing.exists());
+    let record = observed_entry(&worktree, &[missing.to_str().unwrap()]);
     let error = run_worker_execution_journal_command(&path, &identity, &record, false).unwrap_err();
-    assert!(error.to_string().contains("failed to launch"));
-    assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
-    assert!(!error
-        .to_string()
-        .contains("WorkerJournalObservationRequired"));
+    // A launch failure is now a cause of the preserved terminal failure.
+    let causes = error.chain().map(ToString::to_string).collect::<Vec<_>>();
+    assert_eq!(causes.len(), 2, "{error:#}");
+    assert_eq!(
+        causes[0],
+        "journal observation failed; terminal failure preserved; stop"
+    );
+    assert!(
+        causes[1].starts_with("wrapped command failed to launch: "),
+        "{error:#}"
+    );
+    assert!(!format!("{error:#}").contains("WorkerJournalPrelaunchRejected"));
+    assert!(!format!("{error:#}").contains("WorkerJournalObservationRequired"));
     let bytes = fs::read(&path).unwrap();
     let records = bytes
         .split(|byte| *byte == b'\n')
@@ -660,13 +670,40 @@ fn worker_journal_enosys_launch_failure_is_terminal_and_never_completed() {
         .collect::<Vec<_>>();
     assert_eq!(records.len(), 2);
     assert_eq!(
-        records[1].observation.as_ref().unwrap().phase,
-        WorkerJournalObservationPhase::Failed
+        records[0].observation.as_ref().unwrap().phase,
+        WorkerJournalObservationPhase::Started
     );
+    let failed = records[1].observation.as_ref().unwrap();
+    assert_eq!(failed.phase, WorkerJournalObservationPhase::Failed);
+    assert_eq!(failed.failure.as_deref(), Some(causes[1].as_str()));
+    assert_eq!(failed.before, failed.after);
     assert!(records[1].changed_paths.is_empty());
-    assert!(parse_worker_execution_journal(&bytes, &path).is_err());
-    assert!(run_worker_execution_journal_command(&path, &identity, &record, false).is_err());
-    assert_eq!(fs::read(&path).unwrap(), bytes);
+    let parse_error = parse_worker_execution_journal(&bytes, &path).unwrap_err();
+    assert!(parse_error
+        .to_string()
+        .contains("terminal observation failure"));
+    assert!(parse_error.to_string().contains(&causes[1]));
+    let retry = observed_entry(&worktree, &["/bin/sh", "-c", "touch should-not-run"]);
+    for observe_changes in [false, true] {
+        let retry_error =
+            run_worker_execution_journal_command(&path, &identity, &retry, observe_changes)
+                .unwrap_err();
+        assert!(retry_error
+            .to_string()
+            .contains("terminal observation failure"));
+        assert_eq!(fs::read(&path).unwrap(), bytes);
+        assert!(!worktree.join("should-not-run").exists());
+    }
+    verify_worker_journal_identity(&fs::metadata(&path).unwrap(), &identity).unwrap();
+    let cli_error = journal_cli_error(error);
+    assert_eq!(
+        cli_error
+            .downcast_ref::<WorkerJournalCommandExit>()
+            .unwrap()
+            .code(),
+        125
+    );
+    assert_eq!(cli_error.to_string(), causes.join(": "));
 }
 
 #[test]

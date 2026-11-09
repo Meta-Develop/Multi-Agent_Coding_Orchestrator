@@ -498,11 +498,11 @@ pub(crate) fn journal_cli_error(error: anyhow::Error) -> anyhow::Error {
     if error.is::<WorkerJournalCommandExit>() {
         error
     } else {
-        WorkerJournalCommandExit {
+        let exit = WorkerJournalCommandExit {
             code: 125,
             detail: format!("{error:#}"),
-        }
-        .into()
+        };
+        error.context(exit)
     }
 }
 

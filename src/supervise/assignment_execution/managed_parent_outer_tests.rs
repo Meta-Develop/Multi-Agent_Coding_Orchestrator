@@ -197,8 +197,13 @@ impl Fixture {
                 "assigned_paths":worker.assigned_paths, "task":worker.task}))?
         };
         subject.runtime = Some(SupervisorRuntime::Codex);
-        let template =
-            deterministic_fake_child_run(&simulated, &subject, metadata, claim.token.get(), None)?;
+        let template = super::nested_driver_tests::managed_process_report_template(
+            &simulated,
+            &subject,
+            metadata,
+            claim.token.get(),
+            None,
+        )?;
         let run = super::managed_parent_process_tests::run(
             &self.case,
             command,
@@ -1010,9 +1015,10 @@ pub(super) fn bind_fixture_prior(
         .limitations
         .push("synthetic fixture; not measured model or account evidence".into());
     for lens in &plan.review_lenses {
-        let effort: crate::selection::ReasoningEffort = serde_json::from_value(json!(
-            resolve_review_lens_reasoning_effort(lens, None).resolved
-        ))
+        let effort: crate::selection::ReasoningEffort = serde_json::from_value(json!(lens
+            .backend
+            .reasoning_effort()
+            .context("fixture requires an explicit lens effort")?))
         .context("fixture lens effort")?;
         if !prior
             .class_fit

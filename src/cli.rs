@@ -5723,7 +5723,7 @@ mod cli_integration_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn worker_journal_append_cli_refuses_unsafe_mode_locked_file_and_capture_overflow() {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
         use std::os::unix::io::AsRawFd;
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().canonicalize().unwrap().join("worker.jsonl");
@@ -5749,12 +5749,108 @@ mod cli_integration_tests {
             error.downcast_ref::<std::io::Error>().unwrap().kind(),
             std::io::ErrorKind::TimedOut
         );
-        assert!(fs::read(&path).unwrap().is_empty());
+        let exit = error
+            .downcast_ref::<supervise::WorkerJournalCommandExit>()
+            .expect("the CLI must retain its typed wrapper failure");
+        assert_eq!(exit.code(), 125);
+        let io_error = error.downcast_ref::<std::io::Error>().unwrap();
+        let chain: Vec<_> = error.chain().collect();
+        assert_eq!(chain.len(), 2, "{error:?}");
+        assert_eq!(chain[0].to_string(), exit.to_string());
+        assert!(std::ptr::eq(
+            chain[1].downcast_ref::<std::io::Error>().unwrap(),
+            io_error
+        ));
+        assert_eq!(error.to_string(), io_error.to_string());
+        assert!(!error.to_string().contains("WorkerJournalPrelaunchRejected"));
+        assert!(!error
+            .to_string()
+            .contains("WorkerJournalObservationRequired"));
+        let bytes = fs::read(&path).unwrap();
+        assert!(bytes.is_empty());
+        assert!(supervise::parse_worker_execution_journal(&bytes, &path)
+            .unwrap()
+            .is_empty());
+        let metadata = fs::symlink_metadata(&path).unwrap();
+        assert!(metadata.is_file());
+        assert_eq!(
+            (metadata.dev(), metadata.ino()),
+            (identity.device, identity.file)
+        );
+        assert_eq!(metadata.mode() & 0o7777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+        assert!(!path.parent().unwrap().join("worktree/p").exists());
+        let contender = fs::File::open(&path).unwrap();
+        // SAFETY: both descriptors are live and flock takes no pointer arguments.
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            -1
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
         drop(locked);
+        // SAFETY: the test owns this live descriptor; the original lock is released.
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+            0
+        );
+        // SAFETY: unlock the test-owned descriptor before checking capture overflow.
+        assert_eq!(
+            unsafe { libc::flock(contender.as_raw_fd(), libc::LOCK_UN) },
+            0
+        );
+        drop(contender);
         let original = vec![b' '; 1024 * 1024];
         fs::write(&path, &original).unwrap();
         assert!(invoke_worker_journal_append(&path, &identity, "patch", "p").is_err());
         assert_eq!(fs::read(&path).unwrap(), original);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn worker_journal_cli_error_preserves_numeric_exit_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().canonicalize().unwrap();
+        let path = root.join("worker.jsonl");
+        let identity = precreated_journal(&path);
+        let error = supervise::run_worker_execution_journal_command_with_clock(
+            &path,
+            &identity,
+            &supervise::WorkerExecutionJournalEntry {
+                command: vec!["/bin/sh".into(), "-c".into(), "exit 7".into()],
+                cwd: root.join("worktree"),
+                start_timestamp: "2026-09-30T00:00:00Z".into(),
+                end_timestamp: "2026-09-30T00:00:01Z".into(),
+                changed_paths: Vec::new(),
+                observation: None,
+            },
+            false,
+            false,
+        )
+        .unwrap_err();
+        let exit = error
+            .downcast_ref::<supervise::WorkerJournalCommandExit>()
+            .unwrap();
+        assert_eq!(exit.code(), 7);
+        let original = exit as *const supervise::WorkerJournalCommandExit;
+        let detail = error.to_string();
+        let alternate = format!("{error:#}");
+        let error = supervise::journal_cli_error(error);
+        let exit = error
+            .downcast_ref::<supervise::WorkerJournalCommandExit>()
+            .unwrap();
+        assert!(std::ptr::eq(original, exit));
+        assert_eq!(exit.code(), 7);
+        assert_eq!(error.to_string(), detail);
+        assert_eq!(format!("{error:#}"), alternate);
+        assert_eq!(error.chain().count(), 1);
+        let records =
+            supervise::parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[1].command, ["/bin/sh", "-c", "exit 7"]);
+        assert!(records[1].observation.is_some());
     }
 
     #[test]
