@@ -31,6 +31,7 @@ const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
 const ACCOUNT_UPDATE_MAX_MESSAGES: usize = 64;
 const MODERATION_METADATA_MAX_MESSAGES: usize = 64;
+const WARNING_MAX_MESSAGES: usize = 64;
 const RETRY_NOTICE_MAX_MESSAGES: usize = 16;
 const RETRY_NOTICE_MAX_BYTES: usize = 16 * 1024;
 const WORKER_REQUEST_TOOL: &str = "maco_worker_request";
@@ -2397,6 +2398,7 @@ where
     let mut turn_started_seen = false;
     let mut account_rate_limit_notices = 0usize;
     let mut moderation_metadata_notices = 0usize;
+    let mut warning_notices = 0usize;
     let mut token_usage = None;
     let mut cache_write_tokens = 0;
     let mut reroute_message = None;
@@ -3419,6 +3421,25 @@ where
                     });
                 }
             }
+            "warning" => {
+                if object.contains_key("id") {
+                    return Err(AppServerError::Unexpected {
+                        phase: "warning",
+                        message: "warning must be a notification without an id".to_string(),
+                    });
+                }
+                required_map_text(params, "message", "warning")?;
+                if params.get("threadId").is_some_and(|id| !id.is_null()) {
+                    require_exact_text(&message, &["params", "threadId"], thread_id, "warning")?;
+                }
+                warning_notices += 1;
+                if warning_notices > WARNING_MAX_MESSAGES {
+                    return Err(AppServerError::Malformed {
+                        phase: "warning",
+                        message: "warning notifications exceeded their bound".to_string(),
+                    });
+                }
+            }
             method if is_bounded_progress_notification(method) => {
                 validate_turn_correlation(params, thread_id, turn_id, "turn progress")?;
                 if let Some(item_id) = params.get("itemId").and_then(Value::as_str) {
@@ -3710,9 +3731,14 @@ fn is_bounded_progress_notification(method: &str) -> bool {
             | "item/agentMessage/delta"
             | "item/plan/delta"
             | "item/reasoning/summaryTextDelta"
+            | "item/reasoning/summaryPartAdded"
             | "item/reasoning/textDelta"
             | "item/commandExecution/outputDelta"
+            | "item/commandExecution/terminalInteraction"
             | "item/fileChange/outputDelta"
+            | "item/fileChange/patchUpdated"
+            | "item/mcpToolCall/progress"
+            | "thread/compacted"
     )
 }
 
@@ -7402,6 +7428,183 @@ mod tests {
         .expect_err("turn cancellation");
         assert_eq!(error, AppServerError::Cancelled { phase: "turn" });
         assert!(sent_interrupt(&transport));
+    }
+
+    fn long_turn_progress_notices() -> [Value; 5] {
+        [
+            json!({"method":"item/commandExecution/terminalInteraction","params":{
+                "threadId":"thread-1","turnId":"turn-1","itemId":"command-1",
+                "processId":"22256","stdin":""
+            }}),
+            json!({"method":"item/fileChange/patchUpdated","params":{
+                "threadId":"thread-1","turnId":"turn-1","itemId":"command-1",
+                "changes":[]
+            }}),
+            json!({"method":"item/mcpToolCall/progress","params":{
+                "threadId":"thread-1","turnId":"turn-1","itemId":"command-1",
+                "message":"Working"
+            }}),
+            json!({"method":"item/reasoning/summaryPartAdded","params":{
+                "threadId":"thread-1","turnId":"turn-1","itemId":"command-1",
+                "summaryIndex":0
+            }}),
+            json!({"method":"thread/compacted","params":{
+                "threadId":"thread-1","turnId":"turn-1"
+            }}),
+        ]
+    }
+
+    #[test]
+    fn mid_turn_long_running_progress_preserves_completion_and_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages()).unwrap();
+        for notice in long_turn_progress_notices() {
+            let method = notice["method"].as_str().unwrap().to_string();
+            let mut messages = command_observation_messages();
+            messages.insert(5, notice);
+            let outcome = run_command_observation_messages(messages).expect(&method);
+            assert_eq!(outcome.status, TurnTerminalStatus::Completed, "{method}");
+            assert_eq!(
+                outcome.completed_items, baseline.completed_items,
+                "{method}"
+            );
+            assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+            assert_eq!(outcome.token_usage, baseline.token_usage);
+            assert_eq!(outcome.final_message, baseline.final_message);
+            assert_eq!(
+                outcome.command_execution_evidence, baseline.command_execution_evidence,
+                "{method}"
+            );
+        }
+    }
+
+    #[test]
+    fn mid_turn_long_running_progress_rejects_foreign_correlation() {
+        for notice in long_turn_progress_notices() {
+            for field in ["threadId", "turnId"] {
+                let mut notice = notice.clone();
+                notice["params"][field] = json!("foreign");
+                let mut messages = command_observation_messages();
+                messages.insert(5, notice);
+                assert!(matches!(
+                    run_command_observation_messages(messages),
+                    Err(AppServerError::Unexpected {
+                        phase: "turn progress",
+                        ..
+                    })
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn mid_turn_long_running_progress_rejects_inactive_items() {
+        for notice in long_turn_progress_notices() {
+            if notice["params"].get("itemId").is_none() {
+                continue;
+            }
+            // Before item/started and after item/completed are both inactive.
+            for position in [4, 6] {
+                let mut messages = command_observation_messages();
+                messages.insert(position, notice.clone());
+                assert!(matches!(
+                    run_command_observation_messages(messages),
+                    Err(AppServerError::Unexpected { phase: "turn progress", message })
+                        if message == "progress referenced an inactive item"
+                ));
+            }
+        }
+    }
+
+    #[test]
+    fn mid_turn_warning_is_bounded_and_preserves_evidence() {
+        let baseline = run_command_observation_messages(command_observation_messages()).unwrap();
+        for thread_id in [None, Some(Value::Null), Some(json!("thread-1"))] {
+            let mut notice = json!({"method":"warning","params":{"message":"Heads up"}});
+            if let Some(thread_id) = thread_id {
+                notice["params"]["threadId"] = thread_id;
+            }
+            let mut messages = command_observation_messages();
+            messages.splice(
+                5..5,
+                std::iter::repeat_n(notice.clone(), WARNING_MAX_MESSAGES),
+            );
+            let outcome = run_command_observation_messages(messages.clone()).unwrap();
+            assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+            assert_eq!(outcome.token_usage, baseline.token_usage);
+            assert_eq!(outcome.final_message, baseline.final_message);
+            assert_eq!(
+                outcome.command_execution_evidence,
+                baseline.command_execution_evidence
+            );
+            messages.insert(5, notice);
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Malformed {
+                    phase: "warning",
+                    ..
+                })
+            ));
+        }
+    }
+
+    #[test]
+    fn mid_turn_warning_rejects_foreign_thread_and_malformed_notices() {
+        for notice in [
+            json!({"method":"warning","params":{"message":"Heads up","threadId":"other-thread"}}),
+            json!({"method":"warning","params":{"message":"Heads up","threadId":7}}),
+            json!({"method":"warning","params":{}}),
+            json!({"method":"warning","params":{"message":null}}),
+            json!({"id":77,"method":"warning","params":{"message":"Heads up"}}),
+        ] {
+            for position in [3, 5] {
+                let mut messages = command_observation_messages();
+                messages.insert(position, notice.clone());
+                assert!(matches!(
+                    run_command_observation_messages(messages),
+                    Err(AppServerError::Unexpected {
+                        phase: "warning",
+                        ..
+                    } | AppServerError::Malformed {
+                        phase: "warning",
+                        ..
+                    })
+                ));
+            }
+        }
+        let baseline = run_command_observation_messages(command_observation_messages()).unwrap();
+        let mut messages = command_observation_messages();
+        messages.insert(
+            3,
+            json!({"method":"warning","params":{"message":"Heads up"}}),
+        );
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.completed_items, baseline.completed_items);
+        assert_eq!(outcome.messages_received, baseline.messages_received + 1);
+        assert_eq!(outcome.token_usage, baseline.token_usage);
+        assert_eq!(outcome.final_message, baseline.final_message);
+        assert_eq!(
+            outcome.command_execution_evidence,
+            baseline.command_execution_evidence
+        );
+    }
+
+    #[test]
+    fn mid_turn_context_compaction_item_completes_its_lifecycle() {
+        let mut messages = base_messages();
+        for method in ["item/started", "item/completed"] {
+            messages.push(json!({"method":method,"params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":"compaction-1","type":"contextCompaction"}
+            }}));
+        }
+        messages.push(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1","turn":{"id":"turn-1","status":"completed"}
+        }}));
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.completed_items, 1);
+        assert_eq!(outcome.item_outcomes[0].item_type, "contextCompaction");
     }
 
     fn assert_mid_turn_fault_sends_interrupt(

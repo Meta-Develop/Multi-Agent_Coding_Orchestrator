@@ -2343,6 +2343,82 @@ fn protected_alias_scan_ignores_special_entries_but_preserves_writable_checks() 
 
 #[cfg(target_os = "linux")]
 #[test]
+fn sandbox_scan_accepts_single_component_dangling_symlink() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let root = temp.path().join("worktree");
+    let cache = root.join("target/zig-global-cache/o/cache-key");
+    fs::create_dir_all(&cache).expect("cache tree");
+    fs::write(root.join(".gitignore"), "target/\n").expect("ignored build output");
+    std::os::unix::fs::symlink("0123456789abcdef0123456789abcdef", cache.join("lld.id"))
+        .expect("dangling cache value");
+
+    for writable in [false, true] {
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        let mut writable_links = BTreeMap::new();
+        scan_sandbox_tree(&root, writable, &mut remaining, &mut writable_links)
+            .expect("inert cache value is permitted on read-only and writable trees");
+        assert!(writable_links.is_empty());
+    }
+    let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+    let mut regular_files = Vec::new();
+    scan_sandbox_regular_files(&root, true, &mut remaining, |path, _| {
+        regular_files.push(path.to_path_buf());
+        Ok(())
+    })
+    .expect("hard-link inventory already skips symlinks");
+    assert_eq!(regular_files, vec![root.join(".gitignore")]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_scan_refuses_other_dangling_symlinks() {
+    for target in [
+        "../x",
+        "/abs/x",
+        "a/b",
+        "missing/",
+        "./missing",
+        "missing/.",
+    ] {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let link = temp.path().join("link");
+        std::os::unix::fs::symlink(target, &link).expect("dangling link");
+        let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+        let mut writable_links = BTreeMap::new();
+        let error = scan_sandbox_tree(temp.path(), true, &mut remaining, &mut writable_links)
+            .expect_err("only one normal component without a slash is inert");
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound, "{target}");
+        assert!(
+            error
+                .to_string()
+                .contains("sandbox symlink must resolve to a regular file or directory"),
+            "{target}: {error}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn sandbox_scan_preserves_resolving_sibling_symlink_checks() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let sibling = temp.path().join("sibling");
+    let link = temp.path().join("link");
+    fs::write(&sibling, "regular sibling").expect("sibling file");
+    std::os::unix::fs::symlink("sibling", &link).expect("sibling link");
+    let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+    let mut writable_links = BTreeMap::new();
+    scan_sandbox_tree(temp.path(), true, &mut remaining, &mut writable_links)
+        .expect("resolving regular sibling remains permitted");
+
+    fs::remove_file(&sibling).expect("replace sibling");
+    fs::create_dir(&sibling).expect("sibling directory");
+    let mut remaining = MAX_SANDBOX_ENTRY_SCAN;
+    scan_sandbox_tree(temp.path(), true, &mut remaining, &mut writable_links)
+        .expect("resolving sibling directory remains permitted");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn sandbox_scan_skips_child_entries_that_vanish_but_keeps_root_and_other_errors_closed() {
     let temp = tempfile::tempdir().expect("tempdir");
     let root = temp.path().join("agents");

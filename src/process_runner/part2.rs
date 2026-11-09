@@ -2126,15 +2126,28 @@ fn scan_sandbox_tree(
             ));
         }
         if file_type.is_symlink() {
-            let target = fs::metadata(&path).map_err(|error| {
-                std::io::Error::new(
-                    error.kind(),
-                    format!(
-                        "sandbox symlink must resolve to a regular file or directory {}: {error}",
-                        path.display()
-                    ),
-                )
-            })?;
+            let target = match fs::metadata(&path) {
+                Ok(target) => target,
+                Err(error) => {
+                    if error.kind() == std::io::ErrorKind::NotFound {
+                        let link = fs::read_link(&path)?;
+                        // A missing sibling named by one normal component is inert.
+                        if matches!(
+                            link.components().next(),
+                            Some(std::path::Component::Normal(name)) if link.as_os_str() == name
+                        ) {
+                            continue;
+                        }
+                    }
+                    return Err(std::io::Error::new(
+                        error.kind(),
+                        format!(
+                            "sandbox symlink must resolve to a regular file or directory {}: {error}",
+                            path.display()
+                        ),
+                    ));
+                }
+            };
             if !target.is_file() && !target.is_dir() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::PermissionDenied,
