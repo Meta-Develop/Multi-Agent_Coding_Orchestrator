@@ -268,6 +268,8 @@ Rules:
 - Do not stage, commit, push, merge, or otherwise publish changes.
 {journal_contract}
 - Validate, or record why not.
+- files_changed lists every path the cumulative candidate changes against the assignment base, including changes kept from an earlier attempt of this assignment.
+- A command that failed or timed out counts against the assignment unless that identical command from the same directory later succeeds, so after a repair run the identical command again.
 - Return exactly one WorkerReport JSON object: assignment_kind, target_path, files_changed, commands_run, validation_results, findings, bloated_file_flags, decomposition_completion, remaining_risk, next_safe_action. Do not wrap it in Markdown, a code fence, or prose.
 - Use environment_failures=[] without typed failures; otherwise status=failed, accepted=false, rejected=true. Never include secrets.
 - Optional field_guide_entries: finding/context only, no date/source_run/role/policy/provenance; trusted supervisor appends accepted audited suggestions.
@@ -345,6 +347,8 @@ Rules:
 - Do not stage, commit, push, merge, or otherwise publish changes.
 {journal_contract}
 - Validate the bounded change, or report exactly why validation could not run.
+- files_changed lists every path the cumulative candidate changes against the assignment base, including changes kept from an earlier attempt of this assignment.
+- A command that failed or timed out counts against the assignment unless that identical command from the same directory later succeeds, so after a repair run the identical command again.
 - Use tools to execute the assignment before returning the final WorkerReport. The JSON output contract applies to the final response; it does not replace tool execution. Return status=succeeded only after completing and verifying the work, or status=failed/rejected with observed evidence if blocked. Never end with a pending or not-started report.
 - Return exactly one WorkerReport JSON object matching the declared worker schema. Do not return an OrchestratorReviewReport, prose, Markdown, or a code fence.
 - Set assignment_kind to ordinary, target_path to null, and decomposition_completion to null.

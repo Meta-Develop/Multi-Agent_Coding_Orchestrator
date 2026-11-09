@@ -488,6 +488,116 @@ fn reviewed_worker_raw_false_acceptance_does_not_fail_final_reporting() {
 }
 
 #[test]
+fn worker_command_failure_requires_later_identical_clean_success() {
+    let clean = injected_command_record();
+    for cause in ["status", "exit", "timeout", "status-and-exit"] {
+        let mut failed = clean.clone();
+        match cause {
+            "status" => failed.status = ReviewStatus::Failed,
+            "exit" => failed.exit_code = Some(1),
+            "timeout" => failed.timed_out = true,
+            "status-and-exit" => {
+                failed.status = ReviewStatus::Failed;
+                failed.exit_code = Some(1);
+            }
+            _ => unreachable!(),
+        }
+        assert_worker_command_technical_failure(vec![failed.clone(), clean.clone()], false);
+        assert_worker_command_technical_failure(vec![failed.clone()], true);
+        assert_worker_command_technical_failure(vec![clean.clone(), failed.clone()], true);
+        let mut different = clean.clone();
+        different.command.push("different-argument".into());
+        assert_worker_command_technical_failure(vec![failed.clone(), different], true);
+        for cwd in ["other-directory", "./."] {
+            let mut different = clean.clone();
+            different.cwd = PathBuf::from(cwd);
+            assert_worker_command_technical_failure(vec![failed.clone(), different], true);
+        }
+        assert_worker_command_technical_failure(vec![failed.clone(), clean.clone(), failed], true);
+    }
+}
+
+fn assert_worker_command_technical_failure(commands: Vec<CommandRunRecord>, expected: bool) {
+    let assignment = injected_assignment(true);
+    let plan = injected_plan(assignment.clone(), 0);
+    let mut parent = injected_child_report(&assignment);
+    parent.worker_reports[0].commands_run = commands;
+    parent
+        .audit_reports
+        .push(injected_auditor_report(&assignment, &parent));
+    attach_parent_computed_review_lens_aggregate(&plan, &assignment, &mut parent);
+    let worker = &parent.worker_reports[0];
+    assert_eq!(
+        worker_technical_failure(worker, &[]),
+        expected,
+        "{worker:?}"
+    );
+    assert_eq!(reviewed_worker_failed(&parent, worker), expected);
+    assert_eq!(decomposition_worker_technical_failure(worker), expected);
+}
+
+#[test]
+fn worker_command_supersession_requires_clean_evidence() {
+    let clean = injected_command_record();
+    let mut failed = clean.clone();
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    for cause in [
+        "sandbox",
+        "environment",
+        "error",
+        "missing-exit",
+        "timeout",
+        "status",
+    ] {
+        let mut unclean = clean.clone();
+        match cause {
+            "sandbox" => unclean.sandbox_denials.push(denial_fixture(
+                SandboxDenialBoundary::InnerCodex,
+                "maco_external_codex_inner_v1",
+                Some("AGENTS.md"),
+                SandboxDenialRetryability::RequiresDeclaredException,
+            )),
+            "environment" => unclean
+                .environment_failures
+                .push(EnvironmentFailure::probe_failed("fixture failure".into())),
+            "error" => unclean.error = Some("fixture error".into()),
+            "missing-exit" => unclean.exit_code = None,
+            "timeout" => unclean.timed_out = true,
+            "status" => unclean.status = ReviewStatus::Failed,
+            _ => unreachable!(),
+        }
+        assert_worker_command_technical_failure(vec![failed.clone(), unclean.clone()], true);
+        if matches!(cause, "sandbox" | "environment" | "error") {
+            assert_worker_command_technical_failure(vec![unclean, clean.clone()], true);
+        }
+    }
+}
+
+#[test]
+fn worker_command_license_does_not_excuse_timeout() {
+    let assignment = injected_assignment(true);
+    let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
+    let mut failed = injected_command_record();
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    failed.stderr = "fixture licensed failure".into();
+    let licensed = [LicensedDependentFailure {
+        dependent_id: "fixture-dependent".into(),
+        validation_name: "fixture-validation".into(),
+        failure_signature: failed.stderr.clone(),
+        paths: Vec::new(),
+        interfaces: Vec::new(),
+    }];
+    worker.commands_run = vec![failed];
+    assert!(!worker_technical_failure(&worker, &licensed));
+    worker.commands_run[0].timed_out = true;
+    assert!(worker_technical_failure(&worker, &licensed));
+    worker.commands_run.push(injected_command_record());
+    assert!(!worker_technical_failure(&worker, &licensed));
+}
+
+#[test]
 fn reviewed_worker_acceptance_requires_authoritative_review_and_technical_success() {
     let assignment = injected_assignment(true);
     let plan = injected_plan(assignment.clone(), 0);
