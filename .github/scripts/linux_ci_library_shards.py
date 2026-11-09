@@ -344,7 +344,10 @@ def run_shard(runner: Sequence[str], shard: str, list_only: bool = False) -> int
     enumerated = time.monotonic()
     partitions = partition_inventory(inventory)
     selected = partitions[shard]
-    command = test_command(runner, selected)
+    # Stream nested failures before a stalled body can prevent the final summary.
+    command = test_command(
+        [*runner, "--nocapture"] if shard == "supervise-nested" else runner, selected
+    )
     # Verify libtest itself selects precisely these names using the execution
     # filters. Ignored tests remain listed, but keep libtest's default skip policy.
     observed = enumerate_tests(runner, selected)

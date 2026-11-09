@@ -4,8 +4,11 @@
 from __future__ import annotations
 
 import importlib.util
+import io
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from unittest import mock
 
 
 def load_library_shards():
@@ -134,6 +137,51 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
     def test_empty_selected_test_command_refuses(self) -> None:
         with self.assertRaises(ValueError):
             self.shards.test_command(["cargo", "test", "--locked", "--lib", "--"], [])
+
+    def test_only_nested_shard_streams_all_filters_and_preserves_failure_exit(self) -> None:
+        runner = ["cargo", "test", "--locked", "--lib", "--"]
+        inventory = sorted({
+            *self.shards.SUPERVISE_DIAGNOSTICS,
+            *self.shards.SUPERVISE_CAUSAL_DIAGNOSTICS,
+            *self.shards.SAFETY_PREFLIGHTS["supervise-core"],
+            *self.shards.REST_SAFETY_PREFLIGHTS,
+            "autopilot::keep", "supervise::core::keep",
+            "supervise::assignment_execution::bound_parent_turn_tests::keep",
+            "supervise::assignment_execution::decomposition_tests::keep",
+            "supervise::assignment_execution::managed_parent_controller_tests::keep",
+            "supervise::assignment_execution::nested_driver_tests::keep",
+            "supervise::assignment_execution::managed_parent_correction::tests::keep",
+            "supervise::assignment_execution::managed_parent_outer_tests::keep",
+            "supervise::assignment_execution::managed_parent_outer_tests::production_journal_cli_helper",
+            "supervise::tests::keep", "supervise::tests::budget::keep",
+            "supervise::tests::licensed_breakage::keep",
+            "supervise::tests::plan_runtime::keep",
+            "external_agent::keep", "worktree::keep", "future_module::keep",
+        })
+        parts = self.shards.partition_inventory(inventory)
+        executed = []
+        for shard, selected in parts.items():
+            with (
+                self.subTest(shard=shard),
+                redirect_stdout(io.StringIO()),
+                mock.patch.object(self.shards, "enumerate_tests", side_effect=[inventory, selected]) as enumerate_tests,
+                mock.patch.object(self.shards, "run_safety_preflights", return_value=0),
+                mock.patch.object(self.shards, "run_supervise_diagnostics", return_value=0),
+                mock.patch.object(self.shards, "run_supervise_causal_diagnostics", return_value=0),
+                mock.patch.object(self.shards.subprocess, "run") as run,
+            ):
+                run.return_value.returncode = 101
+                self.assertEqual(self.shards.run_shard(runner, shard), 101)
+                self.assertEqual(enumerate_tests.call_args_list, [
+                    mock.call(runner), mock.call(runner, selected),
+                ])
+                options = ["--nocapture", "--exact"] if shard == "supervise-nested" else ["--exact"]
+                command = run.call_args.args[0]
+                executed.extend(command[command.index("--", len(runner)) + 1:])
+                run.assert_called_once_with([*runner, *options, "--", *selected], check=False)
+        self.assertCountEqual(executed, inventory)
+        self.assertEqual(len(executed), len(set(executed)))
+        self.assertEqual(runner, ["cargo", "test", "--locked", "--lib", "--"])
 
     def test_inventory_parsing_duplicate_and_malformed(self) -> None:
         with self.assertRaises(ValueError):

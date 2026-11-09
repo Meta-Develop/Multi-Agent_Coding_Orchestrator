@@ -5248,6 +5248,27 @@ pub(super) fn install_selected_nested_review_fixture<'a>(
             ));
         }
     }
+    // Authored Workers can use a different effort from the coordinating child
+    // and its Auditors. Keep that profile in the same synthetic account catalog;
+    // the real selector must still validate the exact requested Worker binding.
+    if let Some(worker) = plan.role_models.get(&AgentRole::Worker) {
+        if let Some(effort) = worker.reasoning_effort.as_deref() {
+            let model = worker
+                .model
+                .as_ref()
+                .context("nested review fixture resolved Worker model")?;
+            if !catalog.contains(model) || ReasoningEffort::parse(effort).is_none() {
+                bail!(
+                    "nested review fixture Worker is absent from its supplied model/effort catalog"
+                );
+            }
+            models.insert((
+                model.clone(),
+                enforce_role_reasoning_effort_floor(AgentRole::Worker, Some(effort.to_string()))
+                    .context("fixture Worker effort floor")?,
+            ));
+        }
+    }
     let uniform = models.len() == 1 && plan.review_lenses.len() == 3;
     super::prior_input::require_binding_repo(&repo)?;
     let prior = super::prior_input::current_provenance()
