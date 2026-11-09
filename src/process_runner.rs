@@ -1762,6 +1762,11 @@ impl ExternalClaudeProfile {
         self
     }
 
+    pub(crate) fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
+    }
+
     pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_root(root);
         self
@@ -1831,6 +1836,11 @@ impl ExternalCodexProfile {
 
     pub(crate) fn with_writable_artifact_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_writable_artifact_root(root);
+        self
+    }
+
+    pub(crate) fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
         self
     }
 
@@ -1937,6 +1947,11 @@ impl ExternalCursorProfile {
         }
     }
 
+    pub(crate) fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
+    }
+
     pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {
         self.config = self.config.with_visible_read_only_root(root);
         self
@@ -1998,6 +2013,11 @@ impl ExternalGrokProfile {
         Self {
             config: WorkspaceSandboxConfig::new(workspace_root, WorkspaceAccess::ReadWrite),
         }
+    }
+
+    pub(crate) fn with_resource_limits(mut self, limits: ProcessResourceLimits) -> Self {
+        self.config = self.config.with_resource_limits(limits);
+        self
     }
 
     pub(crate) fn with_visible_read_only_root(mut self, root: impl Into<PathBuf>) -> Self {

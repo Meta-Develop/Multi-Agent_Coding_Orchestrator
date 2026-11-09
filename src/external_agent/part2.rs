@@ -1935,6 +1935,7 @@ struct ProtectedWorktreeControls {
     exact_writable_artifact_files: Vec<ExactWritableArtifactFile>,
     writable_artifact_root: Option<PathBuf>,
     worker_read_only_roots: Vec<PathBuf>,
+    worker_memory_max_bytes: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -3189,15 +3190,25 @@ impl ProtectedWorktreeControls {
 }
 
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
-    protected_worktree_controls_with_worker_roots(
+    protected_worktree_controls_with_worker_settings(
         spec,
         std::env::var_os("MACO_WORKER_READ_ONLY_ROOTS").as_deref(),
+        std::env::var_os("MACO_WORKER_MEMORY_MAX_BYTES").as_deref(),
     )
 }
 
+#[cfg(test)]
 fn protected_worktree_controls_with_worker_roots(
     spec: &ExternalAgentCommand,
     worker_roots: Option<&OsStr>,
+) -> Result<ProtectedWorktreeControls> {
+    protected_worktree_controls_with_worker_settings(spec, worker_roots, None)
+}
+
+fn protected_worktree_controls_with_worker_settings(
+    spec: &ExternalAgentCommand,
+    worker_roots: Option<&OsStr>,
+    worker_memory_max_bytes: Option<&OsStr>,
 ) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
@@ -3233,7 +3244,40 @@ fn protected_worktree_controls_with_worker_roots(
         validate_exact_writable_artifact_files(spec, &controls)?;
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     controls.worker_read_only_roots = validate_worker_read_only_roots(spec, &controls, worker_roots)?;
+    controls.worker_memory_max_bytes = validate_worker_memory_max_bytes(spec, worker_memory_max_bytes)?;
     Ok(controls)
+}
+
+fn receives_worker_launch_settings(spec: &ExternalAgentCommand) -> bool {
+    spec.workspace_access == WorkspaceAccess::ReadWrite
+        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree
+        && !matches!(
+            spec.invocation,
+            ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
+        )
+        && spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|identity| identity.role == "worker")
+}
+
+fn validate_worker_memory_max_bytes(
+    spec: &ExternalAgentCommand,
+    configured: Option<&OsStr>,
+) -> Result<Option<u64>> {
+    if !receives_worker_launch_settings(spec) {
+        return Ok(None);
+    }
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let memory_max_bytes = configured
+        .to_str()
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| (16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(value))
+        .context("MACO_WORKER_MEMORY_MAX_BYTES must be a decimal byte count from 16777216 through 17179869184 (16 MiB through 16 GiB)")?;
+    Ok(Some(memory_max_bytes))
 }
 
 fn validate_worker_read_only_roots(
@@ -3241,17 +3285,7 @@ fn validate_worker_read_only_roots(
     controls: &ProtectedWorktreeControls,
     configured: Option<&OsStr>,
 ) -> Result<Vec<PathBuf>> {
-    if spec.workspace_access != WorkspaceAccess::ReadWrite
-        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
-        || matches!(
-            spec.invocation,
-            ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
-        )
-        || spec
-            .agent_lifecycle
-            .as_ref()
-            .is_none_or(|identity| identity.role != "worker")
-    {
+    if !receives_worker_launch_settings(spec) {
         return Ok(Vec::new());
     }
     let Some(configured) = configured.filter(|value| !value.is_empty()) else {
@@ -5937,6 +5971,15 @@ impl ExternalProviderProfile {
         }
     }
 
+    fn with_resource_limits(self, limits: crate::process_runner::ProcessResourceLimits) -> Self {
+        match self {
+            Self::Codex(profile) => Self::Codex(profile.with_resource_limits(limits)),
+            Self::Claude(profile) => Self::Claude(profile.with_resource_limits(limits)),
+            Self::Grok(profile) => Self::Grok(profile.with_resource_limits(limits)),
+            Self::Cursor(profile) => Self::Cursor(profile.with_resource_limits(limits)),
+        }
+    }
+
     fn with_writable_artifact_root(self, root: impl Into<PathBuf>) -> Self {
         match self {
             Self::Codex(profile) => Self::Codex(profile.with_writable_artifact_root(root.into())),
@@ -6013,6 +6056,12 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::GeminiCli
         | ExternalAgentInvocation::DeepSeek => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
+            if let Some(memory_max_bytes) = protected_controls.worker_memory_max_bytes {
+                profile = profile.with_resource_limits(crate::process_runner::ProcessResourceLimits {
+                    memory_max_bytes,
+                    ..Default::default()
+                });
+            }
             for root in &protected_controls.worker_read_only_roots {
                 // Output staging replaces the declared artifact root after the
                 // initial admission check. Validate against the final roots too.
