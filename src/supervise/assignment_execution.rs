@@ -3036,7 +3036,9 @@ fn prepare_child_attempt_with_purpose<'a>(
     }
     let attempt_prompt = match retry_feedback {
         Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
-        Some(ChildAttemptCorrection::Gate(denial)) => prompt_with_gate_correction(&prompt, denial)?,
+        Some(ChildAttemptCorrection::Gate(denial, auditor_findings)) => {
+            prompt_with_gate_correction(&prompt, denial, auditor_findings)?
+        }
         None => prompt,
     };
     let source_inputs = assignment_metadata
@@ -6691,7 +6693,7 @@ fn decide_child_attempt(
                 if eligible_warning {
                     *warning_streak = warning_streak_state;
                 }
-                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial, Vec::new()));
                 return Ok(ChildAttemptDisposition::Retry);
             }
         } else if matches!(
@@ -7898,26 +7900,8 @@ fn parent_auditor_rejection_kind(
         .audit_reports
         .iter()
         .filter(|report| {
-            if !is_parent_auditor_id(assignment, &report.id) || report.rejection_kind.is_none() {
-                return false;
-            }
-            // The parent-computed verdict owns admission, including rejecting
-            // reports whose status/flags alone would look inconsistent.
-            if let Some(aggregate) = child_report.review_lens_aggregate.as_ref() {
-                report
-                    .id
-                    .strip_prefix(&format!("{}-review-auditor-lens-", assignment.id))
-                    .and_then(|index| index.parse::<usize>().ok())
-                    .and_then(|index| aggregate.lens_verdicts.get(index))
-                    .is_some_and(|verdict| {
-                        verdict.effective_verdict == ReviewLensVerdictStatus::Reject
-                    })
-            } else {
-                // Legacy single-auditor reports have no stacked verdict.
-                !report.accepted
-                    && (report.rejected || report.status == ReviewStatus::Rejected)
-                    && matches!(report.status, ReviewStatus::Rejected | ReviewStatus::Failed)
-            }
+            report.rejection_kind.is_some()
+                && parent_auditor_report_rejected(assignment, child_report, report)
         })
         .collect::<Vec<_>>();
     if !rejecting.is_empty()
@@ -7930,6 +7914,31 @@ fn parent_auditor_rejection_kind(
         Some(AuditorRejectionKind::ImplementationDefect)
     } else {
         None
+    }
+}
+
+fn parent_auditor_report_rejected(
+    assignment: &OrchestratorAssignment,
+    child_report: &OrchestratorReviewReport,
+    report: &AuditorReport,
+) -> bool {
+    if !is_parent_auditor_id(assignment, &report.id) {
+        return false;
+    }
+    // The parent-computed verdict owns admission, including rejecting
+    // reports whose status/flags alone would look inconsistent.
+    if let Some(aggregate) = child_report.review_lens_aggregate.as_ref() {
+        report
+            .id
+            .strip_prefix(&format!("{}-review-auditor-lens-", assignment.id))
+            .and_then(|index| index.parse::<usize>().ok())
+            .and_then(|index| aggregate.lens_verdicts.get(index))
+            .is_some_and(|verdict| verdict.effective_verdict == ReviewLensVerdictStatus::Reject)
+    } else {
+        // Legacy single-auditor reports have no stacked verdict.
+        !report.accepted
+            && (report.rejected || report.status == ReviewStatus::Rejected)
+            && matches!(report.status, ReviewStatus::Rejected | ReviewStatus::Failed)
     }
 }
 
@@ -8066,7 +8075,15 @@ fn decide_parent_auditor_gate(
                     &mut outcome.health_signals,
                 )?;
             if let Some(authorized_denial) = authorized_denial {
-                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial));
+                let findings = child_report
+                    .audit_reports
+                    .iter()
+                    .filter(|report| {
+                        parent_auditor_report_rejected(assignment, &child_report, report)
+                    })
+                    .flat_map(|report| report.findings.iter().cloned())
+                    .collect();
+                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial, findings));
                 return Ok(ParentAuditorGateDisposition::Retry);
             }
         }
