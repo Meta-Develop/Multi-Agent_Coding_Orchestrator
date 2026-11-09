@@ -155,3 +155,29 @@ install_github_hosted_ci_codex_install_verified_artifact() {
     install_github_hosted_ci_codex_verify_installed_version
   fi
 }
+
+ensure_authenticated_archive() {
+  local archive="$1"
+  local download_url="$2"
+  local expected_bytes="$3"
+  local expected_sha256="$4"
+  local asset_api_url="$5"
+  if [[ -f "${archive}" ]]; then
+    [[ "$(stat -c '%s' "${archive}")" == "${expected_bytes}" ]] || \
+      die "refusing: cached archive size does not match pinned release asset"
+    printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c --status || \
+      die "refusing: cached archive SHA256 does not match pinned release asset"
+    return 0
+  fi
+  if ! curl -fsSL --proto '=https' --tlsv1.2 --retry 5 --retry-delay 2 --retry-all-errors -o "${archive}" "${download_url}"; then
+    # Use the same official asset by ID when the release download route fails.
+    # No token is needed for public assets; -o replaces any partial first download.
+    printf '%s\n' 'release download failed; trying pinned GitHub asset API' >&2
+    curl -fsSL --proto '=https' --tlsv1.2 -H 'Accept: application/octet-stream' -o "${archive}" "${asset_api_url}" || \
+      die "refusing: pinned release asset download failed on both routes"
+  fi
+  [[ "$(stat -c '%s' "${archive}")" == "${expected_bytes}" ]] || \
+    die "refusing: downloaded archive size does not match pinned release asset"
+  printf '%s  %s\n' "${expected_sha256}" "${archive}" | sha256sum -c --status || \
+    die "refusing: downloaded archive SHA256 does not match pinned release asset"
+}
