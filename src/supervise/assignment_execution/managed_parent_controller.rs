@@ -107,6 +107,14 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
         .map(|(_, worker_id)| worker_id.to_string())
         .collect::<Vec<_>>();
     require_exact_authored_workers(preflight, &requested)?;
+    let initial_review_source = with_supervisor_artifacts(context.artifacts, |writer, _| {
+        super::super::target_containment::ReviewAttemptSource::bind(
+            writer,
+            &parent.prepared.attempt_artifacts,
+            &parent.prepared.command,
+            parent.prepared.launch_runtime,
+        )
+    })?;
     if bound.selects_isolated_route(context, preflight, source_attempt, &turn)? {
         // Persist the quiescent initial turn before any Worker can run or
         // materialize. No fallible evidence import may follow owner release.
@@ -125,7 +133,13 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
             schema_path,
             worker_schema_path,
             auditor_schema_path,
-        );
+        )
+        .map(|mut collected| {
+            collected
+                .review_preceding_sources
+                .push(initial_review_source);
+            collected
+        });
     }
 
     // A serial Worker refusal still leaves the quiescent initial parent owned
@@ -147,7 +161,14 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
     let imported = import_initial_parent_evidence(context, parent);
     match (prepared_final, imported) {
         (Ok(prepared_final), Ok(())) => {
-            collect_prepared_managed_parent_final(context, outcome, preflight, prepared_final)
+            collect_prepared_managed_parent_final(context, outcome, preflight, prepared_final).map(
+                |mut collected| {
+                    collected
+                        .review_preceding_sources
+                        .push(initial_review_source);
+                    collected
+                },
+            )
         }
         (Ok(_prepared_final), Err(import_error)) => {
             Err(import_error).context("managed parent initial evidence import failed")

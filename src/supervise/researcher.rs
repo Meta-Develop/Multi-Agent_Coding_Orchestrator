@@ -5,6 +5,18 @@ mod command;
 #[cfg(test)]
 mod replay_tests;
 
+/// Project only the literal Bash argv already recognized by command evidence
+/// reconciliation. Unknown syntax is unavailable, never shell-evaluated.
+pub(super) fn observed_command_argv(host_command: &str) -> Option<Vec<String>> {
+    let script = command::submitted_command(host_command)?;
+    let flag = if host_command.starts_with("/bin/bash -lc ") {
+        "-lc"
+    } else {
+        "-c"
+    };
+    Some(vec!["/bin/bash".to_owned(), flag.to_owned(), script])
+}
+
 pub(super) fn validate_researcher_assignment(assignment: &OrchestratorAssignment) -> Result<()> {
     if assignment.role_category != Some(RoleCategory::ReadOnlyResearcher)
         || !assignment.worker_assignments.is_empty()
@@ -753,6 +765,8 @@ mod tests {
             cwd: "/tmp/research-worktree".to_string(),
             status: Status::InProgress,
             exit_code: None,
+            aggregated_output: None,
+            review_redacted: false,
         };
         let completed = CommandExecutionSnapshot {
             status: Status::Completed,

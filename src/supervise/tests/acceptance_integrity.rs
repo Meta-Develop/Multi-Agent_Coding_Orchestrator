@@ -5062,6 +5062,8 @@ fn exercise_authored_researcher_collection(persist_final: bool) {
         cwd: repo_path.to_string_lossy().into_owned(),
         status: CommandExecutionStatus::InProgress,
         exit_code: None,
+        aggregated_output: None,
+        review_redacted: false,
     };
     external_run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
         thread_id: "researcher-thread".to_string(),

@@ -362,3 +362,247 @@ fn select_worker_operations(
     }
     Ok(selected)
 }
+
+pub(super) struct NativeReviewSources<'a> {
+    pub assignment: &'a OrchestratorAssignment,
+    pub sources: &'a [super::super::target_containment::ReviewAttemptSource],
+    pub source_attempt: usize,
+    pub journals: &'a WorkerExecutionJournalEvidenceSet,
+    pub candidate: &'a SupervisorCandidateInspection,
+    pub required_for_acceptance: bool,
+    pub repo: &'a Path,
+    pub evidence_only_source: Option<&'a EvidenceOnlyReauditSource>,
+}
+
+/// Bind existing native receipts to the exact candidate under review. This
+/// adds no probes, execution permission, completion grant, or model-authored
+/// input. Narrow lenses never serialize validation_bindings.
+pub(super) fn execution_evidence(
+    writer: &ArtifactRunWriter,
+    sources: NativeReviewSources<'_>,
+) -> Result<(Value, Value)> {
+    let NativeReviewSources {
+        assignment,
+        sources,
+        source_attempt,
+        journals,
+        candidate,
+        required_for_acceptance,
+        repo,
+        evidence_only_source,
+    } = sources;
+    if source_attempt == 0
+        || sources.is_empty()
+        || sources
+            .iter()
+            .any(|source| !source.matches_assignment(assignment))
+        || candidate.binding.agent_id != assignment.id
+        || candidate.binding.clone().canonicalized()? != candidate.binding
+    {
+        bail!("native review source assignment, attempt, or candidate binding mismatch");
+    }
+    let mut targets = Vec::new();
+    let mut physical_turns = BTreeSet::new();
+    for source in sources {
+        let mut target = super::super::target_containment::bound_review_evidence(writer, source)?;
+        if !physical_turns.insert(target["binding"]["attempt"].as_u64()) {
+            bail!("native review repeats a parent physical turn");
+        }
+        target["source_attempt"] = json!(source_attempt);
+        target["execution_epoch"] = json!("current_assignment_execution");
+        // Current candidate binding identifies the review subject. Commands in
+        // an earlier parent turn do not attest to the later Worker candidate.
+        target["candidate_at_execution"] = json!("unknown; not observed by command capture");
+        targets.push(target);
+    }
+    let historical = evidence_only_source
+        .filter(|_| required_for_acceptance && !assignment.worker_assignments.is_empty())
+        .map(|source| historical_worker_evidence(repo, assignment, source, candidate))
+        .transpose()?;
+    let worker_operations = if let Some((operations, historical_targets)) = historical {
+        targets.extend(historical_targets);
+        operations
+    } else {
+        for (worker, journal) in journals {
+            if !journal.evidence_relative_path.starts_with("nested") {
+                continue;
+            }
+            let expected = PathBuf::from("nested")
+                .join(&assignment.id)
+                .join(format!("attempt-{source_attempt}"))
+                .join(worker)
+                .join("journals")
+                .join(format!("{worker}.jsonl"));
+            if journal.evidence_relative_path != expected
+                || !assignment
+                    .worker_assignments
+                    .iter()
+                    .any(|assigned| assigned.id == *worker && assigned.role == AgentRole::Worker)
+            {
+                bail!("native review journal belongs to a foreign Worker or parent attempt");
+            }
+            // Keep the journal's separate authentication and occurrence controls.
+            writer.read_authenticated(&expected, MAX_SUPERVISOR_REPORT_BYTES)?;
+            let mut target = super::super::target_containment::nested_review_evidence(
+                writer,
+                &assignment.id,
+                worker,
+                source_attempt,
+            )?;
+            target["source_attempt"] = json!(source_attempt);
+            target["candidate_at_execution"] = json!("unknown; not observed by command capture");
+            targets.push(target);
+        }
+        for worker in &assignment.worker_assignments {
+            if !journals
+                .get(&worker.id)
+                .is_some_and(|journal| journal.evidence_relative_path.starts_with("nested"))
+            {
+                targets.push(json!({
+                    "worker_id": worker.id,
+                    "commands_status": "unavailable_independent_native_capture",
+                    "review_complete": false,
+                    "acceptance_authority": false,
+                }));
+            }
+        }
+        worker_evidence(writer, journals)?
+    };
+    Ok((
+        worker_operations,
+        json!({
+            "version": 1,
+            "assignment_id": assignment.id,
+            "source_attempt": source_attempt,
+            "candidate_binding": candidate.binding,
+            "required_for_acceptance": required_for_acceptance,
+            "review_complete": targets.iter().all(|target|
+                target["review_complete"].as_bool() == Some(true)),
+            "targets": targets,
+            "acceptance_authority": false,
+        }),
+    ))
+}
+
+/// Re-audit reuses the finalized owning run's descriptive evidence. Each link
+/// uses the existing authenticated source verifier and the unchanged candidate;
+/// no historical command or grant is reconstructed.
+fn historical_worker_evidence(
+    repo: &Path,
+    assignment: &OrchestratorAssignment,
+    source: &EvidenceOnlyReauditSource,
+    candidate: &SupervisorCandidateInspection,
+) -> Result<(Value, Vec<Value>)> {
+    if candidate.binding != source.operation.preserved_candidate_binding {
+        bail!("historical Worker evidence belongs to a changed candidate");
+    }
+    let mut operation = source.operation.clone();
+    for _ in 0..MAX_EVIDENCE_ONLY_REAUDITS {
+        let reader =
+            ArtifactRunReader::open(repo, RunArtifactFamily::Supervise, &operation.source_run_id)?;
+        let plan_bytes = reader.read("assignments/supervisor-plan.json")?;
+        let loaded = parse_supervisor_plan_with_consultant_in_repo(
+            std::str::from_utf8(&plan_bytes)?,
+            Some(repo),
+        )?;
+        let verified = verify_evidence_only_reaudit_source(
+            repo,
+            &operation,
+            assignment,
+            loaded.plan_metadata.task_routing_assessment.as_ref(),
+        )?;
+        if verified.report.worker_reports != source.report.worker_reports
+            || operation.preserved_candidate_binding != candidate.binding
+        {
+            bail!("historical Worker report lineage or candidate binding changed");
+        }
+        let manifest_path =
+            PathBuf::from("reports").join(format!("{}.candidate.json", assignment.id));
+        let manifest: Value = serde_json::from_slice(&reader.read(&manifest_path)?)?;
+        if manifest["run_id"] != operation.source_run_id.as_str()
+            || manifest["assignment_id"] != assignment.id
+            || manifest["candidate_binding"] != serde_json::to_value(&candidate.binding)?
+        {
+            bail!("historical Worker candidate manifest does not match its source");
+        }
+        if let Some(predecessor) = loaded.plan_metadata.evidence_only_reaudit {
+            if predecessor.assignment_id != assignment.id
+                || predecessor.preserved_candidate_binding != candidate.binding
+                || predecessor.attempt.checked_add(1) != Some(operation.attempt)
+            {
+                bail!("historical Worker re-audit lineage is inconsistent");
+            }
+            operation = predecessor;
+            continue;
+        }
+        let attempt = manifest["attempt"]
+            .as_u64()
+            .and_then(|attempt| usize::try_from(attempt).ok())
+            .filter(|attempt| *attempt > 0)
+            .context("historical Worker candidate has no source attempt")?;
+        let source_count = assignment
+            .worker_assignments
+            .len()
+            .checked_mul(2)
+            .context("historical Worker source count overflow")?;
+        let budget = ((WORKER_REVIEW_EVIDENCE_BYTES - 2) / source_count.max(1)).saturating_sub(1);
+        let mut operations = Vec::new();
+        let mut targets = Vec::new();
+        for worker in &assignment.worker_assignments {
+            let root = PathBuf::from("nested")
+                .join(&assignment.id)
+                .join(format!("attempt-{attempt}"))
+                .join(&worker.id);
+            let report_path = root.join("report.json");
+            let report_bytes = reader.read(&report_path)?;
+            let report = read_worker_report(Some(&report_bytes), &report_path)?.report;
+            if worker.role != AgentRole::Worker
+                || report.id != worker.id
+                || !verified
+                    .report
+                    .worker_reports
+                    .iter()
+                    .any(|held| held == &report)
+            {
+                bail!("historical Worker report differs from its owning source capture");
+            }
+            let journal = root.join("journals").join(format!("{}.jsonl", worker.id));
+            let journal_bytes = reader.read(&journal)?;
+            parse_worker_execution_journal(&journal_bytes, &journal)?;
+            let transcript = root.join("stdout.jsonl");
+            let transcript_bytes = reader.read(&transcript)?;
+            for (path, bytes, kind) in [
+                (&journal, &journal_bytes, "worker_journal"),
+                (&transcript, &transcript_bytes, "worker_native_transcript"),
+            ] {
+                let mut evidence = select_worker_operations(&worker.id, kind, path, bytes, budget)?;
+                evidence["execution_epoch"] = json!("historical_worker_execution");
+                evidence["source_run_id"] = json!(operation.source_run_id);
+                evidence["source_candidate_binding"] = json!(candidate.binding);
+                operations.push(evidence);
+            }
+            let mut target = super::super::target_containment::historical_nested_review_evidence(
+                &reader,
+                &assignment.id,
+                &worker.id,
+                attempt,
+            )?;
+            target["execution_epoch"] = json!("historical_worker_execution");
+            target["source_attempt"] = json!(attempt);
+            target["source_candidate_binding"] = json!(candidate.binding);
+            target["worker_report_sha256"] =
+                json!(crate::artifacts::state_auth::sha256_hex(&report_bytes));
+            target["candidate_at_execution"] = json!("unknown; not observed by command capture");
+            targets.push(target);
+        }
+        if verified.report.worker_reports.len() != assignment.worker_assignments.len() {
+            bail!("historical Worker source does not cover the authored Worker inventory");
+        }
+        let operations = Value::Array(operations);
+        if serde_json::to_vec(&operations)?.len() > WORKER_REVIEW_EVIDENCE_BYTES {
+            bail!("historical Worker evidence exceeds the finite review packet budget");
+        }
+        return Ok((operations, targets));
+    }
+    bail!("historical Worker evidence exceeds the authenticated re-audit lineage bound")
+}

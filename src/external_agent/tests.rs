@@ -1058,6 +1058,57 @@ fn read_only_researcher_app_server_selection_is_narrow_and_uses_read_permissions
         should_use_read_only_terminal_app_server(&auditor, ExternalExecutionRuntime::Verified),
         cfg!(target_os = "linux")
     );
+    let worker = spec
+        .clone()
+        .with_agent_lifecycle("/registry", "worker", "reaudit-run", "reaudit-worker")
+        .with_codex_native_delegation_disabled();
+    assert_eq!(
+        should_use_read_only_terminal_app_server(&worker, ExternalExecutionRuntime::Verified),
+        cfg!(target_os = "linux")
+    );
+    assert_eq!(
+        worker.uses_live_app_server_budget(),
+        cfg!(target_os = "linux")
+    );
+    assert!(!should_use_read_only_terminal_app_server(
+        &worker,
+        ExternalExecutionRuntime::NonpublishableSimulation
+    ));
+    let mut delegating_worker = worker.clone();
+    delegating_worker.codex_native_delegation_disabled = false;
+    assert!(!should_use_read_only_terminal_app_server(
+        &delegating_worker,
+        ExternalExecutionRuntime::Verified
+    ));
+    let parent = worker.clone().with_agent_lifecycle(
+        "/registry",
+        "child_orchestrator",
+        "reaudit-run",
+        "reaudit-parent",
+    );
+    assert_eq!(
+        should_use_read_only_terminal_app_server(&parent, ExternalExecutionRuntime::Verified),
+        cfg!(target_os = "linux")
+    );
+    assert_eq!(
+        parent.uses_live_app_server_budget(),
+        cfg!(target_os = "linux")
+    );
+    for managed in [
+        parent.clone().with_codex_managed_worker_requests(),
+        parent.clone().with_codex_managed_readonly_continuation(),
+    ] {
+        assert!(!should_use_read_only_terminal_app_server(
+            &managed,
+            ExternalExecutionRuntime::Verified,
+        ));
+    }
+    let mut delegating_parent = parent.clone();
+    delegating_parent.codex_native_delegation_disabled = false;
+    assert!(!should_use_read_only_terminal_app_server(
+        &delegating_parent,
+        ExternalExecutionRuntime::Verified,
+    ));
     for role in ["worker", "child_orchestrator", "Researcher", "Auditor"] {
         let mut other = spec.clone();
         other.agent_lifecycle.as_mut().unwrap().role = role.to_string();
@@ -12825,6 +12876,8 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
         cwd: "/private-observed-cwd".to_string(),
         status: CommandExecutionStatus::InProgress,
         exit_code: None,
+        aggregated_output: None,
+        review_redacted: false,
     };
     let evidence = CommandExecutionEvidence {
         thread_id: "thread-1".to_string(),
@@ -12869,7 +12922,7 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
         bytes_received: 1024,
     };
     // The same host-only attachment used by the live app-server path, before stdout replacement.
-    report.retain_codex_command_execution_evidence(&outcome);
+    report.retain_codex_command_execution_evidence(&outcome, &CredentialRedactor::default());
     replace_report_stdout(&mut report, CapturedOutput::default());
     assert_eq!(report.codex_command_execution_evidence(), Some(&evidence));
     let mut injected = refused_external_run_before_launch(&command, "injected fixture".to_string());
@@ -12908,6 +12961,45 @@ fn codex_command_execution_evidence_is_private_retained_and_not_forgeable_from_r
     forged["stdout"]["text"] = serde_json::json!("claimed commandExecution exitCode=0");
     let decoded: ExternalAgentRun = serde_json::from_value(forged)?;
     assert!(decoded.codex_command_execution_evidence().is_none());
+
+    // Apply the same admitted secret patterns as raw capture, before private
+    // command output can be projected into a review request.
+    let secret = "synthetic-token-for-review";
+    let mut sensitive = outcome.clone();
+    if let CommandExecutionObservation::Complete {
+        started, completed, ..
+    } = &mut sensitive.command_execution_evidence.observations[0]
+    {
+        started.command = format!("printf {secret}");
+        completed.command = started.command.clone();
+        completed.aggregated_output = Some(format!("result {secret}"));
+    } else {
+        panic!("missing complete fixture observation");
+    }
+    report.retain_codex_command_execution_evidence(
+        &sensitive,
+        &CredentialRedactor {
+            patterns: vec![secret.as_bytes().to_vec()],
+        },
+    );
+    let CommandExecutionObservation::Complete {
+        started, completed, ..
+    } = &report
+        .codex_command_execution_evidence()
+        .unwrap()
+        .observations[0]
+    else {
+        panic!("missing retained observation");
+    };
+    assert!(started.review_redacted);
+    assert!(completed.review_redacted);
+    assert!(!started.command.contains(secret));
+    assert!(!completed.command.contains(secret));
+    assert!(!completed
+        .aggregated_output
+        .as_deref()
+        .unwrap()
+        .contains(secret));
     Ok(())
 }
 
@@ -16812,4 +16904,145 @@ fn rp714_gemini_bootstrap_preserves_typed_attribution_refusal() -> Result<()> {
         .unwrap()
         .contains("other bootstrap error"));
     Ok(())
+}
+
+/// Explicit protocol replay only: the caller supplies every native event and
+/// its controlled physical fixture. Generic injected runs gain no observations.
+#[cfg(unix)]
+pub(crate) fn retain_review_protocol_fixture(
+    spec: &ExternalAgentCommand,
+    run: &mut ExternalAgentRun,
+    messages: Vec<serde_json::Value>,
+) -> Result<codex_app_server::AppServerOutcome> {
+    struct Transport {
+        incoming: std::collections::VecDeque<Vec<u8>>,
+        sent: Vec<serde_json::Value>,
+    }
+    impl codex_app_server::JsonLineTransport for Transport {
+        fn receive(
+            &mut self,
+            _: Duration,
+            limit: usize,
+            destination: &mut Vec<u8>,
+        ) -> Result<codex_app_server::TransportRead, String> {
+            destination.clear();
+            let Some(line) = self.incoming.pop_front() else {
+                return Ok(codex_app_server::TransportRead::Eof);
+            };
+            if line.len() > limit {
+                return Err("fixture line exceeds driver bound".into());
+            }
+            destination.extend(line);
+            Ok(codex_app_server::TransportRead::Line)
+        }
+        fn send(&mut self, line: &[u8]) -> Result<(), String> {
+            self.sent
+                .push(serde_json::from_slice(line).map_err(|error| error.to_string())?);
+            Ok(())
+        }
+    }
+    let read_only =
+        should_use_read_only_terminal_app_server(spec, ExternalExecutionRuntime::Verified)
+            || classify_managed_readonly_app_server(spec, ExternalExecutionRuntime::Verified)
+                .map_err(anyhow::Error::msg)?
+                .is_some();
+    let worker = classify_managed_worker_app_server(spec, ExternalExecutionRuntime::Verified)
+        .map_err(anyhow::Error::msg)?;
+    assert!(
+        read_only || worker,
+        "fixture must use a production capturing route"
+    );
+    assert_eq!(run.cwd, spec.cwd);
+    assert!(run
+        .process_tree
+        .is_some_and(ProcessTreeEvidence::is_verified_empty));
+    assert!(run
+        .side_effects
+        .is_some_and(SideEffectConfinementEvidence::is_verified));
+    let lines = messages
+        .iter()
+        .map(serde_json::to_vec)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut raw = Vec::new();
+    for line in &lines {
+        raw.extend_from_slice(line);
+        raw.push(b'\n');
+    }
+    let mut transport = Transport {
+        incoming: lines.into(),
+        sent: Vec::new(),
+    };
+    let turn = codex_app_server::AppServerTurn {
+        cwd: spec.cwd.to_string_lossy().into_owned(),
+        permission_profile: "maco_external_codex".into(),
+        prompt: fs::read_to_string(&spec.prompt)?,
+        model: spec.model.clone(),
+        minimum_effort: (spec
+            .agent_lifecycle
+            .as_ref()
+            .is_some_and(|id| id.role == "auditor"))
+        .then(|| spec.reasoning_effort.clone().unwrap_or_default()),
+        output_schema: load_codex_app_server_output_schema(spec)?,
+    };
+    let cancellation = ProcessCancellation::new();
+    let outcome = if worker {
+        run_managed_worker_app_server_turn(&mut transport, &turn, spec, &cancellation)
+    } else {
+        run_read_only_terminal_app_server_turn(&mut transport, &turn, spec, &cancellation)
+    }
+    .map_err(anyhow::Error::msg)?;
+    assert!(transport.incoming.is_empty());
+    assert_eq!(outcome.messages_received, messages.len());
+    assert!(outcome.bytes_received > 0);
+    assert!(outcome.protocol_error.is_none(), "{outcome:?}");
+    assert!(!cancellation.is_cancelled());
+    assert_eq!(transport.sent[0]["method"], "initialize");
+    assert!(transport
+        .sent
+        .iter()
+        .any(|message| message["method"] == "thread/start"));
+    assert!(transport
+        .sent
+        .iter()
+        .any(|message| message["method"] == "turn/start"));
+    assert_eq!(
+        outcome.final_message.as_deref().map(str::as_bytes),
+        run.output_last_message.as_deref()
+    );
+
+    // Same retention and redaction as record_completed_app_server_target.
+    run.retain_codex_command_execution_evidence(&outcome, &CredentialRedactor::default());
+    replace_report_stdout(
+        run,
+        CapturedOutput::from_captured_bytes_for_test(&CapturedBytes::from_bytes_for_test(&raw)),
+    );
+    run.stdout.target_launch_attempted = true;
+    // This opt-in protocol fixture has one consistent declared version.
+    // These are synthetic fixture facts, not executable qualification.
+    let permissions = run
+        .codex_permissions
+        .as_mut()
+        .expect("controlled Codex fixture");
+    permissions.codex_version = "0.162.0".into();
+    permissions.minimum_version = "0.144.4".into();
+    let home = SecureOutputRoot::open_private(spec.output_last_message.parent().unwrap())?;
+    run.codex_parent_evidence = Some(codex_parent_evidence_from_app_server_run(
+        &CodexParentEvidenceInputs {
+            codex_version: Some((0, 162, 0)),
+            cwd: &spec.cwd,
+            requested_model: spec.model.as_deref(),
+            requested_effort: spec.reasoning_effort.as_deref(),
+        },
+        Some(&outcome),
+        &home,
+    ));
+    run.retain_app_server_parent_evidence_for_test();
+    assert_eq!(
+        run.codex_command_execution_evidence(),
+        Some(&outcome.command_execution_evidence)
+    );
+    assert!(run.authenticated_app_server_usage_complete());
+    assert!(run.authenticated_app_server_evidence().is_some());
+    fs::write(&spec.json_log, &raw)?;
+    Ok(outcome)
 }

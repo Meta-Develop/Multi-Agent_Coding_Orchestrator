@@ -927,7 +927,7 @@ pub(crate) struct AutoReviewEvidence {
     pub(crate) structured_policy_decision: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum TurnTerminalStatus {
     Completed,
@@ -996,6 +996,13 @@ pub(crate) struct CommandExecutionSnapshot {
     // Explicit null is meaningful; an absent field is not evidence of a null exit code.
     #[serde(deserialize_with = "deserialize_observed_exit_code")]
     pub(crate) exit_code: Option<i32>,
+    // Native item output only. Missing/null remains unavailable; never fill it
+    // from agent messages, report claims, or a turn's item summary.
+    #[serde(default)]
+    pub(crate) aggregated_output: Option<String>,
+    // Set only by the host's admitted credential redactor, never protocol text.
+    #[serde(skip)]
+    pub(crate) review_redacted: bool,
 }
 
 fn deserialize_observed_exit_code<'de, D>(deserializer: D) -> Result<Option<i32>, D::Error>
@@ -6136,8 +6143,18 @@ mod tests {
     }
 
     #[test]
+    fn native_output_field_exceeding_protocol_line_bound_is_not_complete_capture() {
+        let mut messages = command_observation_messages();
+        messages[5]["params"]["item"]["aggregatedOutput"] =
+            json!("x".repeat(AppServerLimits::default().max_line_bytes));
+        assert!(run_command_observation_messages(messages).is_err());
+    }
+
+    #[test]
     fn command_observations_preserve_exact_correlated_snapshots_privately() {
-        let messages = command_observation_messages();
+        let mut messages = command_observation_messages();
+        messages[5]["params"]["item"]["aggregatedOutput"] =
+            json!("first native line\nsecond native line\n");
         let outcome = run_command_observation_messages(messages.clone()).expect("valid transcript");
         let evidence = &outcome.command_execution_evidence;
         assert_eq!(evidence.thread_id, "thread-1");
@@ -6160,7 +6177,13 @@ mod tests {
         assert_eq!(completed.cwd, started.cwd);
         assert_eq!(completed.status, CommandExecutionStatus::Completed);
         assert_eq!(completed.exit_code, Some(0));
+        assert_eq!(
+            completed.aggregated_output.as_deref(),
+            Some("first native line\nsecond native line\n")
+        );
+        assert_eq!(started.aggregated_output, None);
         let debug = format!("{evidence:?}");
+        assert!(!debug.contains("first native line"));
         assert!(!debug.contains("private-command"));
         assert!(!debug.contains("private cwd"));
     }
@@ -6335,13 +6358,15 @@ mod tests {
                 ("cwd", json!("/forged")),
                 ("status", json!("failed")),
                 ("exitCode", json!(9)),
+                ("aggregatedOutput", json!("forged output")),
                 ("id", json!("forged")),
                 ("type", json!("agentMessage")),
                 ("threadId", json!("forged")),
                 ("turnId", json!("forged")),
                 ("method", json!("forged")),
             ] {
-                let messages = command_observation_messages();
+                let mut messages = command_observation_messages();
+                messages[index]["params"]["item"]["aggregatedOutput"] = json!("native");
                 let mut transport = FakeTransport::from_values(messages.clone());
                 let raw = messages[index].to_string().replacen(
                     &format!("\"{key}\":"),

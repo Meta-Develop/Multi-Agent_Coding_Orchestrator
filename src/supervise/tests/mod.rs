@@ -2265,3 +2265,94 @@ fn sample_auditor_report_json(id: &str) -> String {
 }}"#
     )
 }
+
+/// Controlled protocol fixtures opt in explicitly. Empty items model an
+/// observed zero-command turn, never an absent capture or a production witness.
+#[cfg(unix)]
+pub(crate) fn retained_review_turn_fixture(
+    command: &ExternalAgentCommand,
+    run: &mut ExternalAgentRun,
+    items: Vec<Value>,
+    input: u64,
+    output: u64,
+) {
+    let model = command.model.as_deref().unwrap_or("fixture-model");
+    let thread = "review-fixture-thread";
+    let turn = "review-fixture-turn";
+    let mut messages = vec![
+        json!({"id":1,"result":{}}),
+        json!({"id":2,"result":{
+            "thread":{"id":thread},"model":model,"reasoningEffort":command.reasoning_effort,
+            "approvalPolicy":"on-request","approvalsReviewer":"user",
+            "activePermissionProfile":{"id":"maco_external_codex"},"cwd":command.cwd
+        }}),
+        json!({"id":3,"result":{"turn":{"id":turn,"status":"inProgress"}}}),
+        json!({"method":"turn/started","params":{"threadId":thread,
+            "turn":{"id":turn,"status":"inProgress"}}}),
+    ];
+    messages.extend(items);
+    messages.push(json!({"method":"item/started","params":{
+        "threadId":thread,"turnId":turn,
+        "item":{"id":"fixture-report","type":"agentMessage","text":""}
+    }}));
+    messages.push(json!({"method":"item/completed","params":{
+        "threadId":thread,"turnId":turn,
+        "item":{"id":"fixture-report","type":"agentMessage",
+            "text":String::from_utf8(run.output_last_message.clone().unwrap()).unwrap()}
+    }}));
+    let usage = json!({"inputTokens":input,"outputTokens":output,"cachedInputTokens":0,
+        "reasoningOutputTokens":0,"totalTokens":input+output});
+    messages.push(json!({"method":"thread/tokenUsage/updated","params":{
+        "threadId":thread,"turnId":turn,
+        "tokenUsage":{"last":usage,"total":usage,"modelContextWindow":null}
+    }}));
+    messages.push(json!({"method":"turn/completed","params":{
+        "threadId":thread,"turn":{"id":turn,"status":"completed"}
+    }}));
+    let expected_commands = messages
+        .iter()
+        .filter(|m| {
+            m["method"] == "item/completed" && m["params"]["item"]["type"] == "commandExecution"
+        })
+        .count();
+    let outcome = crate::external_agent::retain_review_protocol_fixture(command, run, messages)
+        .expect("source-bound protocol driver/retention");
+    assert_eq!(
+        outcome.command_execution_evidence.observations.len(),
+        expected_commands
+    );
+    assert_eq!(outcome.completed_items, expected_commands + 1);
+    assert_eq!(outcome.token_usage.unwrap().input_tokens, input);
+    assert_eq!(outcome.token_usage.unwrap().output_tokens, output);
+}
+
+/// Explicit fixture observation; this does not execute or authorize the script.
+#[cfg(unix)]
+pub(crate) fn review_command_items(
+    command: &ExternalAgentCommand,
+    id: &str,
+    script: &str,
+    exit: i32,
+    output: Option<&str>,
+) -> Vec<Value> {
+    [
+        ("item/started", "inProgress", None, None),
+        (
+            "item/completed",
+            if exit == 0 { "completed" } else { "failed" },
+            Some(exit),
+            output,
+        ),
+    ]
+    .into_iter()
+    .map(|(method, status, exit, output)| {
+        json!({
+            "method":method,"params":{
+                "threadId":"review-fixture-thread","turnId":"review-fixture-turn",
+                "item":{"id":id,"type":"commandExecution","command":script,
+                    "cwd":command.cwd,"status":status,"exitCode":exit,"aggregatedOutput":output}
+            }
+        })
+    })
+    .collect()
+}
