@@ -5078,6 +5078,7 @@ fn unverified_child_attempt_launches_neither_retry_nor_parent_auditor() {
         runtime: SupervisorRuntime::Codex,
         allow_dirty_primary: false,
         allow_live_run_collision: false,
+        development_codex_network: false,
         admission_overrides: crate::supervise::SupervisorAdmissionConfig::default(),
         budget_overrides: crate::supervise::RunBudgetLimits::default(),
         budget_max_duration_seconds: None,

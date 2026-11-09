@@ -55,6 +55,7 @@ fn authenticated_source_head_binds_real_child_base_at_admission() {
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,

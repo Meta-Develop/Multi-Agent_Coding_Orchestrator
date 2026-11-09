@@ -1540,7 +1540,7 @@ fn codex_permission_evidence(
         ),
         permission_profile: "maco_external_codex".to_string(),
         workspace_access: spec.workspace_access,
-        network_enabled: false,
+        network_enabled: spec.codex_development_network_enabled,
         argv_digest: argv_digest.to_string(),
         executable_identity: identity.display(),
     }
@@ -7235,7 +7235,10 @@ fn codex_hardened_argv_with_service_tier(
         OsString::from("-c"),
         OsString::from("default_permissions=\"maco_external_codex\""),
         OsString::from("-c"),
-        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from(format!(
+            "permissions.maco_external_codex.network={{enabled={}}}",
+            spec.codex_development_network_enabled
+        )),
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),
@@ -7310,7 +7313,10 @@ fn codex_app_server_argv(
         OsString::from("-c"),
         OsString::from("default_permissions=\"maco_external_codex\""),
         OsString::from("-c"),
-        OsString::from("permissions.maco_external_codex.network={enabled=false}"),
+        OsString::from(format!(
+            "permissions.maco_external_codex.network={{enabled={}}}",
+            spec.codex_development_network_enabled
+        )),
         OsString::from("-c"),
         OsString::from(filesystem_permissions),
         OsString::from("-c"),

@@ -1396,6 +1396,7 @@ fn run_supervise_command(command: SuperviseSubcommand) -> Result<()> {
                 runtime,
                 allow_dirty_primary: args.allow_dirty_primary,
                 allow_live_run_collision: args.force_live_run,
+                development_codex_network: args.development_codex_network,
                 admission_overrides,
                 budget_overrides,
                 budget_max_duration_seconds,
@@ -1991,6 +1992,10 @@ struct RunSuperviseArgs {
     /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
+    /// Enable the Codex named profile's network for this development invocation and its children.
+    /// Filesystem, approval, model, and delegation controls remain unchanged; omitted on resume means off.
+    #[arg(long)]
+    development_codex_network: bool,
     /// Additional canonical executable for a distinct non-Fake runtime in this Linux supervise run.
     /// Requires a canonical absolute primary --runtime-bin; resume must match the frozen allowlist.
     #[arg(

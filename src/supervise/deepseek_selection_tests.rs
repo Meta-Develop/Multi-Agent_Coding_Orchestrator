@@ -215,6 +215,7 @@ fn codex_parent_selects_prior_backed_deepseek_researcher_and_binds_canonical_lau
             runtime: SupervisorRuntime::Codex,
             allow_dirty_primary: false,
             allow_live_run_collision: false,
+            development_codex_network: false,
             admission_overrides: SupervisorAdmissionConfig::default(),
             budget_overrides: RunBudgetLimits::default(),
             budget_max_duration_seconds: None,

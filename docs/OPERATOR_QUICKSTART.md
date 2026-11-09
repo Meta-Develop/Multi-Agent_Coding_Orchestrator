@@ -978,3 +978,20 @@ isolation and all MACO gates remain in force. The subsequent
 `e2e-mixed-r40s1` and `e2e-codex-r40s1` reports both recorded `success=true`
 and `accepted=true` on `91f416b7`, including the script relocation and
 stricter routing comparison documented here.
+
+### Development Codex network opt-in
+
+For an isolated development trial that needs the Codex named permission
+profile's network capability, add `--development-codex-network` to `maco supervise run`.
+It applies to that invocation's Codex assignments, nested Workers, parent
+continuation turns, review lenses, and generated follow-up runs. It defaults
+to off and must be supplied again when using `maco supervise run` to resume; query commands
+do not enable it.
+
+This changes only `permissions.maco_external_codex.network.enabled`. The filesystem grants,
+private HOME/TMP, shell environment allowlist, approvals, native-agent
+controls, runtime/model binding, and review/test requirements retain their
+existing behavior. Permission evidence records the selected network value
+and the argv digest. Network capability grants no authority for unrelated
+service writes or publication. This development option does not establish
+functional success or release qualification.

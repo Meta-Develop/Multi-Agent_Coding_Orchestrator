@@ -990,6 +990,31 @@ fn worktree_target_liveness_evidence_has_actionable_human_rendering() {
 }
 
 #[test]
+fn supervise_development_codex_network_requires_an_explicit_flag() {
+    for enabled in [false, true] {
+        let mut argv = vec![
+            "maco",
+            "supervise",
+            "run",
+            "plan.json",
+            "--machine-global-config",
+            "/tmp/maco-machine-global.json",
+            "--machine-global-runtime-root-id",
+            "runtime",
+        ];
+        if enabled {
+            argv.push("--development-codex-network");
+        }
+        let parsed = Cli::try_parse_from(argv).expect("development network flag parses");
+        let supervise = expect_supervise_command(parsed.command);
+        let SuperviseSubcommand::Run(args) = supervise.command else {
+            panic!("expected supervise run command");
+        };
+        assert_eq!(args.development_codex_network, enabled);
+    }
+}
+
+#[test]
 fn supervise_run_requires_complete_machine_global_binding() {
     let complete = Cli::try_parse_from([
         "maco",

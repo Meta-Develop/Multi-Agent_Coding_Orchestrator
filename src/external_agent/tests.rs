@@ -6926,6 +6926,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         let (result, failure, timed_out) = evaluate_environment_requirement(
             &requirement,
             ExternalAgentInvocation::CodexSupervisor,
+            false,
             Path::new("/workspace"),
             Duration::from_secs(1),
             &cancellation,
@@ -6952,6 +6953,7 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
     let (result, failure, _) = evaluate_environment_requirement(
         &disabled_network,
         ExternalAgentInvocation::CodexSupervisor,
+        false,
         Path::new("/workspace"),
         Duration::from_secs(1),
         &cancellation,
@@ -6970,6 +6972,151 @@ fn environment_preflight_classifies_static_blockers_without_launching_probes() {
         failure.map(|failure| failure.category),
         Some(EnvironmentFailureCategory::SandboxUnavailable)
     );
+}
+
+#[test]
+fn environment_preflight_uses_selected_codex_network_permission() {
+    let base = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    );
+    assert!(!base.codex_development_network_enabled);
+    let profile =
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only("/workspace"));
+    for invocation in [
+        ExternalAgentInvocation::CodexSupervisor,
+        ExternalAgentInvocation::CodexConsultant,
+    ] {
+        for enabled in [false, true] {
+            let mut command = if enabled {
+                base.clone().with_development_codex_network(true)
+            } else {
+                base.clone()
+            };
+            command.invocation = invocation;
+            for access in [
+                EnvironmentNetworkAccess::Disabled,
+                EnvironmentNetworkAccess::Enabled,
+            ] {
+                let requires_network = access == EnvironmentNetworkAccess::Enabled;
+                let requirement = EnvironmentRequirement::network(access);
+                let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
+                let (result, failure, timed_out) = evaluate_environment_requirement(
+                    &requirement,
+                    command.invocation,
+                    command.codex_development_network_enabled,
+                    &command.cwd,
+                    command.timeout,
+                    &ProcessCancellation::new(),
+                    &BTreeMap::new(),
+                    &profile,
+                    None,
+                    None,
+                    Some(EnvironmentVersion::new(0, 162, 0)),
+                    Some(SideEffectConfinementProfileKind::ExternalCodex),
+                    None,
+                    None,
+                    &mut process_evidence,
+                );
+                assert_eq!(result.requirement, requirement);
+                assert_eq!(
+                    result.observation,
+                    Some(EnvironmentPreflightObservation::Network { enabled })
+                );
+                if enabled == requires_network {
+                    assert_eq!(result.status, EnvironmentPreflightStatus::Satisfied);
+                    assert!(failure.is_none());
+                } else {
+                    assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
+                    let failure = failure.expect("conflicting network requirement must block");
+                    assert_eq!(failure.requirement, Some(requirement));
+                    assert_eq!(
+                        failure.category,
+                        if enabled {
+                            EnvironmentFailureCategory::SandboxUnavailable
+                        } else {
+                            EnvironmentFailureCategory::NetworkForbidden
+                        }
+                    );
+                }
+                assert!(!timed_out);
+                assert!(!process_evidence.started);
+                assert!(!process_evidence.unconfirmed_child);
+            }
+        }
+    }
+}
+
+#[test]
+fn environment_preflight_codex_network_opt_in_requires_matching_verified_profile() {
+    let profile =
+        SideEffectConfinementProfile::ExternalCodex(ExternalCodexProfile::read_only("/workspace"));
+    let wrong_profile = SideEffectConfinementProfile::StrictOfflineWorkspace(
+        StrictOfflineWorkspaceProfile::read_only("/workspace"),
+    );
+    for (invocation, selected_profile, verified_confinement) in [
+        (ExternalAgentInvocation::CodexSupervisor, &profile, None),
+        (
+            ExternalAgentInvocation::CodexSupervisor,
+            &profile,
+            Some(SideEffectConfinementProfileKind::ExternalGrok),
+        ),
+        (
+            ExternalAgentInvocation::CodexSupervisor,
+            &wrong_profile,
+            Some(SideEffectConfinementProfileKind::ExternalCodex),
+        ),
+        (
+            ExternalAgentInvocation::Grok,
+            &profile,
+            Some(SideEffectConfinementProfileKind::ExternalCodex),
+        ),
+    ] {
+        for access in [
+            EnvironmentNetworkAccess::Disabled,
+            EnvironmentNetworkAccess::Enabled,
+        ] {
+            let requires_network = access == EnvironmentNetworkAccess::Enabled;
+            let requirement = EnvironmentRequirement::network(access);
+            let mut process_evidence = EnvironmentPreflightProcessEvidence::default();
+            let (result, failure, timed_out) = evaluate_environment_requirement(
+                &requirement,
+                invocation,
+                true,
+                Path::new("/workspace"),
+                Duration::from_secs(1),
+                &ProcessCancellation::new(),
+                &BTreeMap::new(),
+                selected_profile,
+                None,
+                None,
+                Some(EnvironmentVersion::new(0, 162, 0)),
+                verified_confinement,
+                None,
+                None,
+                &mut process_evidence,
+            );
+            assert_eq!(result.status, EnvironmentPreflightStatus::Blocked);
+            assert_eq!(result.observation, None);
+            assert_eq!(
+                failure
+                    .expect("unverified or mismatched profile must block")
+                    .category,
+                if requires_network {
+                    EnvironmentFailureCategory::NetworkForbidden
+                } else {
+                    EnvironmentFailureCategory::SandboxUnavailable
+                }
+            );
+            assert!(!timed_out);
+            assert!(!process_evidence.started);
+            assert!(!process_evidence.unconfirmed_child);
+        }
+    }
 }
 
 #[test]
@@ -10940,6 +11087,7 @@ fn assert_grok_configuration_preflight(
     let (result, failure, timed_out) = evaluate_environment_requirement(
         &grok_auth_environment_requirement(),
         ExternalAgentInvocation::Grok,
+        false,
         Path::new("/workspace"),
         Duration::from_secs(1),
         &ProcessCancellation::new(),
@@ -11387,6 +11535,97 @@ fn codex_app_server_argv_preserves_the_external_codex_ceiling() {
     assert!(!actual
         .windows(2)
         .any(|arguments| arguments == ["--enable", "multi_agent"]));
+}
+
+#[test]
+fn development_codex_network_changes_only_the_named_profile_network() -> Result<()> {
+    let base = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "/run/prompt.md",
+        "/run/events.jsonl",
+        "/run/report.json",
+        Duration::from_secs(1),
+    )
+    .with_codex_native_delegation_disabled();
+    let identity = ExternalProgramIdentity {
+        length: 0,
+        modified: None,
+        sha256: "fixture".to_string(),
+        #[cfg(unix)]
+        device: 0,
+        #[cfg(unix)]
+        inode: 0,
+    };
+    for access in [WorkspaceAccess::ReadOnly, WorkspaceAccess::ReadWrite] {
+        let command = base.clone().with_workspace_access(access);
+        let controls = ProtectedWorktreeControls {
+            writable_artifact_root: Some(PathBuf::from("/run")),
+            ..ProtectedWorktreeControls::default()
+        };
+        let enabled = command.clone().with_development_codex_network(true);
+        let bound = WorktreeConfinementSnapshot::from_command(&command, true);
+        assert!(!bound.matches_command(&enabled, true));
+        for (before, after) in [
+            (
+                codex_app_server_argv(&command, &controls),
+                codex_app_server_argv(&enabled, &controls),
+            ),
+            (
+                command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+                command_argv_with_controls_and_service_tier_input(&enabled, &controls, None)?,
+            ),
+        ] {
+            let disabled =
+                OsString::from("permissions.maco_external_codex.network={enabled=false}");
+            let opt_in = OsString::from("permissions.maco_external_codex.network={enabled=true}");
+            assert_eq!(before.iter().filter(|arg| **arg == disabled).count(), 1);
+            let expected = before
+                .iter()
+                .map(|arg| {
+                    if *arg == disabled {
+                        opt_in.clone()
+                    } else {
+                        arg.clone()
+                    }
+                })
+                .collect::<Vec<_>>();
+            assert_eq!(after, expected);
+            let before_digest = argv_digest(&before)?;
+            let after_digest = argv_digest(&after)?;
+            assert_ne!(before_digest, after_digest);
+            let evidence =
+                codex_permission_evidence((0, 162, 0), &command, &before_digest, &identity);
+            assert!(!evidence.network_enabled);
+            let enabled_evidence =
+                codex_permission_evidence((0, 162, 0), &enabled, &after_digest, &identity);
+            assert!(enabled_evidence.network_enabled);
+            assert_eq!(
+                enabled_evidence,
+                CodexPermissionEvidence {
+                    network_enabled: true,
+                    argv_digest: after_digest,
+                    ..evidence
+                }
+            );
+            assert_eq!(
+                before,
+                if before[0] == OsStr::new("app-server") {
+                    codex_app_server_argv(
+                        &enabled.clone().with_development_codex_network(false),
+                        &controls,
+                    )
+                } else {
+                    command_argv_with_controls_and_service_tier_input(
+                        &enabled.clone().with_development_codex_network(false),
+                        &controls,
+                        None,
+                    )?
+                }
+            );
+        }
+    }
+    Ok(())
 }
 
 #[test]

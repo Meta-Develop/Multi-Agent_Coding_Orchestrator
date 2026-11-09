@@ -723,6 +723,9 @@ pub struct SupervisorRunOptions {
     pub run_id: RunId,
     pub parent_node: Option<String>,
     pub codex_bin: PathBuf,
+    /// Explicit per-invocation development opt-in for the Codex named profile's network.
+    /// Never inferred from a plan, ambient environment, or a previous run.
+    pub development_codex_network: bool,
     pub runtime: SupervisorRuntime,
     pub allow_dirty_primary: bool,
     /// Launch-only override for a live same-repository supervise/autopilot

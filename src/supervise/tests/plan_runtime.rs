@@ -3536,7 +3536,9 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
     assignment.assigned_paths = vec![verification_target.clone()];
     assignment.worker_assignments[0].assigned_paths = vec![verification_target];
     let plan = injected_plan(assignment.clone(), 0);
-    let options = injected_options(&repo_path, temp.path(), "verified-selector-triple-dispatch");
+    let mut options =
+        injected_options(&repo_path, temp.path(), "verified-selector-triple-dispatch");
+    options.development_codex_network = true;
     let run_id = options.run_id.clone();
     let (_selector_fixture, catalog) = bind_test_selector_triple_catalog()
         .expect("construct selector-backed Codex catalog with a deterministic runner-up");
@@ -3558,6 +3560,7 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
         use std::net::TcpStream;
         use std::time::Duration;
 
+        assert!(command.development_codex_network_enabled());
         let name = command
             .output_last_message
             .file_name()
