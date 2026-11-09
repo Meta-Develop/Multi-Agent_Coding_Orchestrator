@@ -2074,7 +2074,13 @@ pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> R
 }
 
 /// Materializes one supervisor-captured worktree candidate into the fixed
-/// managed-child private ref when the child left that ref at its captured base.
+/// managed-child private ref when it holds the captured base or the supervisor's
+/// recorded materialization from an earlier attempt of this assignment.
+///
+/// Only supervisor-held state may supply `previous_materialized_head`. A matching
+/// head must have the captured base as its single parent. Its exact candidate
+/// tree is reused; a changed candidate resets that head with a compare-and-swap
+/// before materializing again. Any other non-base head is left for import.
 ///
 /// The caller must retain the managed-worktree write lease that protected the
 /// candidate capture for this complete operation. This function independently
@@ -2084,11 +2090,13 @@ pub(crate) fn prepare_managed_child_git_boundary_for_test(workspace: &Path) -> R
 /// tree exactly matches the supervisor-captured tree. The ordinary Git commit
 /// path is intentional: repository-projected attribution and the validated
 /// commit-msg hook remain authoritative and are never bypassed.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn materialize_managed_child_git_commit(
     primary_repo: &Path,
     workspace: &Path,
     captured_primary_head: Oid,
     captured_base: Oid,
+    previous_materialized_head: Option<Oid>,
     claimed_paths: &[PathBuf],
     candidate_paths: &[PathBuf],
     candidate_tree: Oid,
@@ -2158,9 +2166,37 @@ pub(crate) fn materialize_managed_child_git_commit(
 
     let initial_private_head = boundary.revalidate()?;
     if initial_private_head != captured_base {
-        // A child-created private commit remains subject to the existing fsck
-        // and import path. Never overwrite it or synthesize a second commit.
-        return Ok(None);
+        if Some(initial_private_head) != previous_materialized_head {
+            // A child-created private commit remains subject to the existing fsck
+            // and import path. Never overwrite it or synthesize a second commit.
+            return Ok(None);
+        }
+        let private = open_managed_child_private_repository(&boundary)?;
+        let previous = private
+            .find_commit(initial_private_head)
+            .context("managed child previous materialized head is not a commit")?;
+        if previous.parent_count() != 1 || previous.parent_id(0).ok() != Some(captured_base) {
+            bail!("managed child previous materialized head does not have the captured base as its single parent");
+        }
+        if previous.tree_id() == candidate_tree {
+            return Ok(Some(initial_private_head));
+        }
+        run_managed_child_git_command(
+            &boundary,
+            vec![
+                OsString::from("update-ref"),
+                OsString::from(MANAGED_CHILD_PRIVATE_REF),
+                OsString::from(captured_base.to_string()),
+                OsString::from(initial_private_head.to_string()),
+            ],
+            StdinMode::Null,
+            "reset previous managed child materialization",
+        )?;
+        require_managed_child_private_base(
+            &boundary,
+            captured_base,
+            "after previous materialization reset",
+        )?;
     }
     let base_tree = primary
         .find_commit(captured_base)

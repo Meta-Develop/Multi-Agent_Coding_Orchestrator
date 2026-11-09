@@ -4102,6 +4102,7 @@ fi
         &child,
         base,
         base,
+        None,
         &paths,
         &paths,
         candidate_tree,
@@ -4189,6 +4190,7 @@ fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Res
         &child,
         base,
         base,
+        None,
         &candidate_paths,
         &candidate_paths,
         candidate_tree,
@@ -4217,6 +4219,260 @@ fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Res
         snapshot_managed_git_tree(&common.join("refs"))?,
         shared_refs_before
     );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_correction_materializes_new_exact_tree_and_imports() -> Result<()> {
+    skip_without_containment!(ok);
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    let base = boundary.revalidate()?;
+    let shared_refs_before = snapshot_managed_git_tree(&common.join("refs"))?;
+    let claims = [
+        PathBuf::from("DELETE.md"),
+        PathBuf::from("RELEASE_NOTES.md"),
+    ];
+    let first_paths = [PathBuf::from("RELEASE_NOTES.md")];
+    fs::write(child.join("RELEASE_NOTES.md"), "first candidate\n")?;
+    let first_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[("RELEASE_NOTES.md", Some(b"first candidate\n"), 0o100644)],
+    )?;
+    let first = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        base,
+        None,
+        &claims,
+        &first_paths,
+        first_tree,
+    )?
+    .context("first candidate did not materialize")?;
+    let imported =
+        collect_and_import_managed_child_git_commit(&primary, &child, base, base, &claims)?;
+    assert_eq!(imported.head_oid, first);
+    assert_eq!(imported.head_tree_oid, first_tree);
+
+    fs::write(child.join("RELEASE_NOTES.md"), "corrected candidate\n")?;
+    fs::remove_file(child.join("DELETE.md"))?;
+    let corrected_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[
+            ("DELETE.md", None, 0o100644),
+            ("RELEASE_NOTES.md", Some(b"corrected candidate\n"), 0o100644),
+        ],
+    )?;
+    let corrected = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        base,
+        Some(first),
+        &claims,
+        &claims,
+        corrected_tree,
+    )?
+    .context("corrected candidate did not materialize")?;
+    assert_ne!(corrected, first);
+    assert_eq!(boundary.revalidate()?, corrected);
+    let imported =
+        collect_and_import_managed_child_git_commit(&primary, &child, base, base, &claims)?;
+    assert_eq!(imported.head_oid, corrected);
+    assert_eq!(imported.head_tree_oid, corrected_tree);
+    assert_eq!(imported.final_changed_paths, claims);
+    let repository = crate::git_repository::open(&primary)?;
+    let commit = repository.find_commit(corrected)?;
+    assert_eq!(commit.parent_count(), 1);
+    assert_eq!(commit.parent_id(0)?, base);
+    assert_eq!(commit.tree_id(), corrected_tree);
+    assert_eq!(
+        crate::git_repository::open(&child)?.head()?.target(),
+        Some(base)
+    );
+    assert_eq!(
+        snapshot_managed_git_tree(&common.join("refs"))?,
+        shared_refs_before
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_preserves_unrecorded_private_commit() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    let base = boundary.revalidate()?;
+    let recorded = create_private_root_commit(
+        &git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"recorded candidate\n",
+        "previous candidate",
+    )?;
+    let child_head = create_private_root_commit(
+        &git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"child commit\n",
+        "child candidate",
+    )?;
+    assert_ne!(recorded, child_head);
+    let private = open_managed_child_private_repository(&boundary)?;
+    let child_tree = private.find_commit(child_head)?.tree_id();
+    fs::write(child.join("RELEASE_NOTES.md"), "uncommitted candidate\n")?;
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[(
+            "RELEASE_NOTES.md",
+            Some(b"uncommitted candidate\n"),
+            0o100644,
+        )],
+    )?;
+    let paths = [PathBuf::from("RELEASE_NOTES.md")];
+    for previous in [None, Some(recorded)] {
+        assert_eq!(
+            materialize_managed_child_git_commit(
+                &primary,
+                &child,
+                base,
+                base,
+                previous,
+                &paths,
+                &paths,
+                candidate_tree,
+            )?,
+            None
+        );
+        assert_eq!(boundary.revalidate()?, child_head);
+        let imported =
+            collect_and_import_managed_child_git_commit(&primary, &child, base, base, &paths)?;
+        assert_eq!(imported.head_oid, child_head);
+        assert_eq!(imported.head_tree_oid, child_tree);
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_reuses_recorded_exact_tree() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    let base = boundary.revalidate()?;
+    let head = create_private_root_commit(
+        &git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"unchanged candidate\n",
+        "previous candidate",
+    )?;
+    fs::write(child.join("RELEASE_NOTES.md"), "unchanged candidate\n")?;
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[("RELEASE_NOTES.md", Some(b"unchanged candidate\n"), 0o100644)],
+    )?;
+    let paths = [PathBuf::from("RELEASE_NOTES.md")];
+    let private_before = snapshot_managed_git_tree(&git.private_git_dir)?;
+    assert_eq!(
+        materialize_managed_child_git_commit(
+            &primary,
+            &child,
+            base,
+            base,
+            Some(head),
+            &paths,
+            &paths,
+            candidate_tree,
+        )?,
+        Some(head)
+    );
+    assert_eq!(boundary.revalidate()?, head);
+    assert_eq!(
+        snapshot_managed_git_tree(&git.private_git_dir)?,
+        private_before
+    );
+    let imported =
+        collect_and_import_managed_child_git_commit(&primary, &child, base, base, &paths)?;
+    assert_eq!(imported.head_oid, head);
+    assert_eq!(imported.head_tree_oid, candidate_tree);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn managed_child_materialization_rejects_recorded_head_with_wrong_parents() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let git = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    let base = boundary.revalidate()?;
+    let first = create_private_root_commit(
+        &git,
+        base,
+        &[base],
+        "RELEASE_NOTES.md",
+        b"first candidate\n",
+        "first candidate",
+    )?;
+    let candidate_tree = expected_managed_candidate_tree(
+        &git,
+        base,
+        &[("RELEASE_NOTES.md", Some(b"wrong parents\n"), 0o100644)],
+    )?;
+    fs::write(child.join("RELEASE_NOTES.md"), "wrong parents\n")?;
+    let paths = [PathBuf::from("RELEASE_NOTES.md")];
+    for parents in [vec![], vec![first], vec![base, first]] {
+        let head = create_private_root_commit(
+            &git,
+            base,
+            &parents,
+            "RELEASE_NOTES.md",
+            b"wrong parents\n",
+            "invalid recorded candidate",
+        )?;
+        let private_before = snapshot_managed_git_tree(&git.private_git_dir)?;
+        let error = materialize_managed_child_git_commit(
+            &primary,
+            &child,
+            base,
+            base,
+            Some(head),
+            &paths,
+            &paths,
+            candidate_tree,
+        )
+        .expect_err("recorded head must be a single commit on the captured base");
+        assert!(error
+            .to_string()
+            .contains("captured base as its single parent"));
+        assert_eq!(boundary.revalidate()?, head);
+        assert_eq!(
+            snapshot_managed_git_tree(&git.private_git_dir)?,
+            private_before
+        );
+    }
     Ok(())
 }
 
@@ -4269,6 +4525,7 @@ fn source_rooted_child_materializes_only_repair_commit_on_pr_head() -> Result<()
         &child,
         primary_head,
         source_head,
+        None,
         &repair_paths,
         &repair_paths,
         candidate_tree,
@@ -4364,6 +4621,7 @@ fn managed_child_materialization_refuses_unclaimed_and_symlink_candidates_before
             &child,
             base,
             base,
+            None,
             &claims,
             std::slice::from_ref(&candidate_path),
             candidate_tree,

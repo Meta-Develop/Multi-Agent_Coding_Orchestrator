@@ -4657,6 +4657,7 @@ struct AssignmentExecutionOutcome {
     usage_incomplete: bool,
     report: Option<OrchestratorReviewReport>,
     candidate_inspection: Option<SupervisorCandidateInspection>,
+    previous_materialized_head: Option<Oid>,
     findings: Vec<Finding>,
     claim_tokens: Vec<ClaimToken>,
     claimed_paths: Vec<PathBuf>,
