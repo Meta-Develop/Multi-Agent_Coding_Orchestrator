@@ -43,7 +43,12 @@ pub(super) fn dispatch_and_collect_managed_parent_attempt<'budget>(
     correction: Option<&super::managed_parent_correction::ManagedCorrection>,
 ) -> Result<CollectedChildAttempt<'budget>> {
     let (binding, permit) = if let Some(correction) = correction {
-        require_read_only_native_off(&prepared, "managed corrective parent")?;
+        if prepared.command.workspace_access != WorkspaceAccess::ReadOnly {
+            bail!("managed corrective parent requires a read-only workspace");
+        }
+        // Full transport verification needs this cycle's live inbox. The
+        // dispatch helper attaches it and verifies the sealed command before
+        // command admission or runner entry; no predecessor launch is reused.
         let (binding, permit) = correction.admit(
             context,
             preflight,

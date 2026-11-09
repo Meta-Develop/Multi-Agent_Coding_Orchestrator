@@ -653,7 +653,10 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                     repo: &repo,
                     current_run: Some(&run_id),
                     runtime: options.runtime,
-                    execution_runtime: SupervisorExecutionRuntime::Verified,
+                    // Only selector observations are synthetic. The execution
+                    // context below remains Verified and must collect native
+                    // confinement, host commands, journals and settled captures.
+                    execution_runtime: SupervisorExecutionRuntime::NonpublishableSimulation,
                     runtime_model_catalog: &acquisition,
                     admission_policy_input: &admission,
                     quota: Default::default(),

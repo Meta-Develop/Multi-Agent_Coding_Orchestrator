@@ -2,10 +2,13 @@ use super::*;
 
 fn artifact_hashes(
     context: &AssignmentExecutionContext<'_, '_>,
-) -> Result<BTreeMap<PathBuf, String>> {
+    case: &str,
+) -> Result<BTreeMap<PathBuf, Option<String>>> {
     [
         "evidence/incoming/parent.attempt-1.json",
         "evidence/incoming/parent.attempt-2.json",
+        "logs/parent.attempt-1.jsonl",
+        "logs/parent.attempt-2.jsonl",
         "nested/parent/attempt-1/worker/report.json",
         "nested/parent/attempt-1/worker/journals/worker.jsonl",
         "nested/parent/attempt-1/worker-two/report.json",
@@ -13,9 +16,25 @@ fn artifact_hashes(
     ]
     .into_iter()
     .map(|name| {
+        let path = context.run_dir.join(name);
+        // The collector intentionally persists no raw report for a structurally
+        // invalid response. Preserve that exact absence, plus both real stdout
+        // captures and every other required artifact; unrelated I/O errors fail.
+        if case == "correction-structural" && name == "evidence/incoming/parent.attempt-2.json" {
+            return match fs::symlink_metadata(&path) {
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok((PathBuf::from(name), None))
+                }
+                Err(error) => Err(error)
+                    .with_context(|| format!("failed to inspect predecessor artifact {name}")),
+                Ok(_) => bail!("structurally invalid predecessor report was persisted: {name}"),
+            };
+        }
+        let bytes = fs::read(&path)
+            .with_context(|| format!("failed to read required predecessor artifact {name}"))?;
         Ok((
             PathBuf::from(name),
-            crate::artifacts::state_auth::sha256_hex(&fs::read(context.run_dir.join(name))?),
+            Some(crate::artifacts::state_auth::sha256_hex(&bytes)),
         ))
     })
     .collect()
@@ -91,7 +110,7 @@ pub(in super::super) fn exercise(
         *calls.lock().unwrap(),
         ["parent", "worker", "worker-two", "parent"]
     );
-    let old_artifacts = artifact_hashes(context)?;
+    let old_artifacts = artifact_hashes(context, case)?;
     let mut completion = collected
         .managed_completion
         .take()
@@ -210,7 +229,7 @@ pub(in super::super) fn exercise(
             4,
             "correction Worker was launched"
         );
-        assert_eq!(artifact_hashes(context)?, old_artifacts);
+        assert_eq!(artifact_hashes(context, case)?, old_artifacts);
         return Ok(());
     }
     let authority = authorized?;
@@ -345,16 +364,28 @@ pub(in super::super) fn exercise(
         ]
     );
     assert_eq!(
-        artifact_hashes(context)?,
+        artifact_hashes(context, case)?,
         old_artifacts,
         "spent evidence changed"
     );
     for turn in [1, 2, 3, 4] {
-        let value: Value = serde_json::from_slice(&fs::read(
-            context
-                .run_dir
-                .join(format!("evidence/incoming/parent.attempt-{turn}.json")),
-        )?)?;
+        let bytes = if case == "correction-structural" && turn == 2 {
+            // This invalid report remains in its original descriptor-held live
+            // capture, never in the collector's validated-report namespace.
+            authority
+                .predecessor
+                .live_run
+                .output_last_message()
+                .context("structural predecessor lost its held final report")?
+                .to_vec()
+        } else {
+            fs::read(
+                context
+                    .run_dir
+                    .join(format!("evidence/incoming/parent.attempt-{turn}.json")),
+            )?
+        };
+        let value: Value = serde_json::from_slice(&bytes)?;
         assert_eq!(value["parent_attempt"], json!(turn));
         if turn % 2 == 0 {
             assert_eq!(value["source_parent_attempt"], json!(turn - 1));
