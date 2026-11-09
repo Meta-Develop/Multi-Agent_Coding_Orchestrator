@@ -2493,12 +2493,7 @@ fn run_managed_child_git_command_allow_status(
             .context("managed child materialization workspace is not UTF-8")?
             .to_string(),
     );
-    let mut profile = StrictOfflineWorkspaceProfile::read_only(&boundary.workspace)
-        .with_writable_artifact_root(boundary.private_git_dir())
-        .with_visible_read_only_root(boundary.shared_object_dir());
-    if let Some(hook) = &boundary.metadata.active_commit_hook {
-        profile = profile.with_visible_read_only_file(hook);
-    }
+    let profile = managed_child_materialization_git_profile(boundary)?;
     crate::merge::run_required_direct(
         label,
         crate::merge::resolve_trusted_executable("git")?,
@@ -2511,6 +2506,40 @@ fn run_managed_child_git_command_allow_status(
         MATERIALIZATION_GIT_STDIN_BYTES,
         profile,
     )
+}
+
+fn managed_child_materialization_git_profile(
+    boundary: &ManagedChildGitBoundary,
+) -> Result<StrictOfflineWorkspaceProfile> {
+    let mut profile = StrictOfflineWorkspaceProfile::read_only(&boundary.workspace)
+        .with_writable_artifact_root(boundary.private_git_dir())
+        .with_visible_read_only_root(boundary.shared_object_dir());
+    if let Some(hook) = &boundary.metadata.active_commit_hook {
+        profile = profile.with_visible_read_only_file(hook);
+        // The dispatcher falls back to the primary checkout because ignored controls
+        // are absent from linked worktrees. Only the supervisor needs this file.
+        let primary_root = boundary
+            .metadata
+            .common_config
+            .parent()
+            .and_then(Path::parent)
+            .context("managed child Git common directory has no primary checkout root")?;
+        let guard_path = primary_root.join(".agents/scripts/check-human-authorship");
+        if let Some(guard) =
+            canonical_optional_active_git_hook(&guard_path, "primary human-authorship guard")?
+        {
+            if guard != guard_path {
+                bail!("primary human-authorship guard path contains a symlink");
+            }
+            if guard.starts_with(boundary.private_git_dir())
+                || boundary.private_git_dir().starts_with(&guard)
+            {
+                bail!("primary human-authorship guard overlaps writable private Git metadata");
+            }
+            profile = profile.with_visible_read_only_file(guard);
+        }
+    }
+    Ok(profile)
 }
 
 /// Validates and imports one managed child's private commit closure.

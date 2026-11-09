@@ -3417,6 +3417,246 @@ fn selected_writable_grok_prepares_private_git_and_retains_it_through_collection
 
 #[cfg(target_os = "linux")]
 #[test]
+fn managed_child_materialization_profile_exposes_only_primary_authorship_guard() -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    let guard = primary.join(".agents/scripts/check-human-authorship");
+    fs::create_dir_all(guard.parent().context("guard parent")?)?;
+    fs::write(&guard, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    fs::write(primary.join(".agents/private-sibling"), "private\n")?;
+    prepare_managed_child_git_boundary_for_test(&child)?;
+    let mut boundary = bind_existing_managed_child_git_boundary(&child)?;
+    assert!(!boundary.metadata.common_read_only_files.contains(&guard));
+    assert!(!child
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let expected = StrictOfflineWorkspaceProfile::read_only(&child)
+        .with_writable_artifact_root(boundary.private_git_dir())
+        .with_visible_read_only_root(boundary.shared_object_dir());
+    let hook_profile = expected
+        .clone()
+        .with_visible_read_only_file(common.join("hooks/commit-msg"));
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile.clone().with_visible_read_only_file(&guard)
+    );
+
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o644))?;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile
+    );
+    fs::remove_file(&guard)?;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        hook_profile
+    );
+    fs::write(&guard, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    boundary.metadata.active_commit_hook = None;
+    assert_eq!(
+        managed_child_materialization_git_profile(&boundary)?,
+        expected
+    );
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_profile_rejects_unsafe_authorship_guards() -> Result<()> {
+    use std::os::unix::fs::{symlink, PermissionsExt};
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, _common, _child_git_dir) =
+        create_linked_git_metadata_fixture(temp.path())?;
+    let scripts = primary.join(".agents/scripts");
+    fs::create_dir_all(&scripts)?;
+    let guard = scripts.join("check-human-authorship");
+    let target = temp.path().join("outside-guard");
+    fs::write(&target, "#!/bin/sh\nexit 0\n")?;
+    fs::set_permissions(&target, fs::Permissions::from_mode(0o755))?;
+    prepare_managed_child_git_boundary_for_test(&child)?;
+    let mut boundary = bind_existing_managed_child_git_boundary(&child)?;
+
+    symlink(&target, &guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("non-symlink regular file"));
+    fs::remove_file(&guard)?;
+    fs::create_dir(&guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("non-symlink regular file"));
+    fs::remove_dir(&guard)?;
+    fs::hard_link(&target, &guard)?;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("hard-link alias"));
+    fs::remove_file(&guard)?;
+    fs::rename(&target, &guard)?;
+    boundary.metadata.private_git_dir = scripts;
+    let error = managed_child_materialization_git_profile(&boundary).unwrap_err();
+    assert!(error.to_string().contains("overlaps writable private Git"));
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_runs_primary_authorship_guard() -> Result<()> {
+    skip_without_containment!(ok);
+    check_managed_child_materialization_primary_guard(true)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn managed_child_materialization_missing_primary_authorship_guard_fails_closed() -> Result<()> {
+    skip_without_containment!(ok);
+    check_managed_child_materialization_primary_guard(false)
+}
+
+#[cfg(target_os = "linux")]
+fn check_managed_child_materialization_primary_guard(with_guard: bool) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let temp = tempfile::tempdir()?;
+    let (primary, child, common, _child_git_dir) = create_linked_git_metadata_fixture(temp.path())?;
+    fs::remove_file(child.join("fixture-codex"))?;
+    let hook = common.join("hooks/commit-msg");
+    fs::write(
+        &hook,
+        format!(
+            r#"#!/usr/bin/env bash
+set -euo pipefail
+installed_guard_dir='{}'
+"#,
+            primary.join(".agents/scripts").display()
+        ) + r#"self="$(cd "$(dirname "$0")" && pwd -P)/$(basename "$0")"
+previous="$self.human-authorship-previous"
+if [[ -x "$previous" ]]; then
+  "$previous" "$@"
+fi
+
+resolve_guard() {
+  local name="$1"
+  local repo_root
+  local primary
+  local common_dir
+  local fallback
+
+  repo_root="$(git rev-parse --show-toplevel)"
+  primary="$repo_root/.agents/scripts/$name"
+  if [[ -x "$primary" ]]; then
+    printf '%s\n' "$primary"
+    return 0
+  fi
+
+  if ! common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    printf 'human-authorship-guard dispatcher: cannot resolve Git common directory for %s\n' \
+      "$name" >&2
+    return 1
+  fi
+  fallback="$(dirname "$common_dir")/.agents/scripts/$name"
+  if [[ -x "$fallback" ]]; then
+    printf '%s\n' "$fallback"
+    return 0
+  fi
+
+  if [[ -x "$installed_guard_dir/$name" ]]; then
+    printf '%s\n' "$installed_guard_dir/$name"
+    return 0
+  fi
+
+  printf 'human-authorship-guard dispatcher: missing executable guard %s; checked %s, %s and %s\n' \
+    "$name" "$primary" "$fallback" "$installed_guard_dir/$name" >&2
+  return 1
+}
+
+guard="$(resolve_guard check-human-authorship)"
+exec "$guard" "$@"
+"#,
+    )?;
+    let guard = primary.join(".agents/scripts/check-human-authorship");
+    let guard_contents = r#"#!/bin/sh
+set -eu
+test "$(git config --local --get user.name)" = 'Fixture Owner'
+test "$(git config --local --get user.email)" = 'fixture@example.invalid'
+for ident in GIT_AUTHOR_IDENT GIT_COMMITTER_IDENT; do
+  git var "$ident" | awk '{ if ($1 != "Fixture" || $2 != "Owner" || $3 != "<fixture@example.invalid>") exit 1 }'
+done
+temporary="$(mktemp)"
+trap 'rm -f "$temporary"' EXIT
+awk 'NR == 1 { if ($0 != "Materialize verified managed child candidate") exit 1; print "checked" }' "$1" > "$temporary"
+test "$(cat "$temporary")" = checked
+if printf 'tamper\n' >> "$0" 2>/dev/null; then
+  exit 1
+fi
+"#;
+    if with_guard {
+        fs::create_dir_all(guard.parent().context("guard parent")?)?;
+        fs::write(&guard, guard_contents)?;
+        fs::set_permissions(&guard, fs::Permissions::from_mode(0o755))?;
+    }
+    assert!(!child
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let metadata = managed_worktree_git_metadata(&child)?.context("managed Git metadata")?;
+    let boundary = bind_existing_managed_child_git_boundary(&child)?;
+    // Without commondir, Git's common directory is the private GIT_DIR.
+    // Neither earlier dispatcher candidate exists, so only installed_guard_dir works.
+    assert!(!boundary.private_git_dir().join("commondir").exists());
+    assert!(!boundary
+        .private_git_dir()
+        .parent()
+        .context("private Git directory parent")?
+        .join(".agents/scripts/check-human-authorship")
+        .exists());
+    let base = boundary.revalidate()?;
+    let shared_before = snapshot_managed_git_tree(&common)?;
+    fs::write(child.join("RELEASE_NOTES.md"), "guarded candidate\n")?;
+    let candidate_tree = expected_managed_candidate_tree(
+        &metadata,
+        base,
+        &[("RELEASE_NOTES.md", Some(b"guarded candidate\n"), 0o100644)],
+    )?;
+    let paths = [PathBuf::from("RELEASE_NOTES.md")];
+    let result = materialize_managed_child_git_commit(
+        &primary,
+        &child,
+        base,
+        base,
+        &paths,
+        &paths,
+        candidate_tree,
+    );
+    if with_guard {
+        let head = result?.context("guarded candidate did not materialize")?;
+        assert_ne!(head, base);
+        assert_eq!(boundary.revalidate()?, head);
+        assert_eq!(fs::read_to_string(&guard)?, guard_contents);
+    } else {
+        let error = result.expect_err("missing guard must reject the commit");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("commit managed child materialization candidate failed"),
+            "{message}"
+        );
+        assert!(message.contains("missing executable guard"), "{message}");
+        assert_eq!(boundary.revalidate()?, base);
+    }
+    let mut shared_after = snapshot_managed_git_tree(&common)?;
+    // The private boundary alone may change during supervisor materialization.
+    let private_relative = boundary.private_git_dir().strip_prefix(&common)?;
+    shared_after.retain(|path, _| !path.starts_with(private_relative));
+    let shared_before = shared_before
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(private_relative))
+        .collect::<BTreeMap<_, _>>();
+    assert_eq!(shared_after, shared_before);
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn grok_style_uncommitted_candidate_materializes_exact_tree_and_imports() -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
