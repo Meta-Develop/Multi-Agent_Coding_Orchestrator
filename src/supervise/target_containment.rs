@@ -1244,7 +1244,7 @@ mod tests {
             .command
             .clone()
             .with_workspace_access(WorkspaceAccess::ReadOnly)
-            .with_model_selection(Some("fixture-model".into()), None);
+            .with_model_selection(Some("fixture-model".into()), Some("xhigh".into()));
         // Explicit protocol fixture custody; no provider/process is launched.
         for path in [
             &fixture.artifacts.prompt_path,
