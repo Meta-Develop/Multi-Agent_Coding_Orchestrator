@@ -2983,6 +2983,157 @@ fn worker_read_only_roots_fixture() -> Result<(tempfile::TempDir, ExternalAgentC
 
 #[cfg(unix)]
 #[test]
+fn worker_memory_max_bytes_unset_and_empty_preserve_default_argv_and_profile() -> Result<()> {
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    let baseline = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let expected_profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &baseline,
+    )?;
+    for configured in [None, Some(OsStr::new(""))] {
+        let controls =
+            protected_worktree_controls_with_worker_settings(&command, None, configured)?;
+        assert_eq!(controls, baseline);
+        assert_eq!(controls.worker_memory_max_bytes, None);
+        assert_eq!(
+            command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+            command_argv_with_controls_and_service_tier_input(&command, &baseline, None)?
+        );
+        assert_eq!(
+            codex_app_server_argv(&command, &controls),
+            codex_app_server_argv(&command, &baseline)
+        );
+        assert_eq!(
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &controls,
+            )?,
+            expected_profile
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let SideEffectConfinementProfile::ExternalCodex(profile) = expected_profile else {
+            bail!("expected Codex profile");
+        };
+        let properties = crate::process_runner::external_codex_systemd_properties_for_test(
+            profile,
+            &command.program,
+            &command.cwd,
+        )?;
+        assert!(properties.contains(&"--property=MemoryMax=4294967296".to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_memory_max_bytes_valid_values_reach_launch_resource_limits() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    for worker_roots in [None, Some(root.as_os_str())] {
+        let baseline = protected_worktree_controls_with_worker_roots(&command, worker_roots)?;
+        let SideEffectConfinementProfile::ExternalCodex(baseline_profile) =
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &baseline,
+            )?
+        else {
+            bail!("expected Codex profile");
+        };
+        for bytes in [
+            16 * 1024 * 1024_u64,
+            8 * 1024 * 1024 * 1024,
+            16 * 1024 * 1024 * 1024,
+        ] {
+            let configured = bytes.to_string();
+            let controls = protected_worktree_controls_with_worker_settings(
+                &command,
+                worker_roots,
+                Some(OsStr::new(&configured)),
+            )?;
+            assert_eq!(controls.worker_memory_max_bytes, Some(bytes));
+            let profile = external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &controls,
+            )?;
+            assert_eq!(
+                profile,
+                SideEffectConfinementProfile::ExternalCodex(
+                    baseline_profile.clone().with_resource_limits(
+                        crate::process_runner::ProcessResourceLimits {
+                            memory_max_bytes: bytes,
+                            ..Default::default()
+                        }
+                    )
+                )
+            );
+            let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+                bail!("expected Codex profile");
+            };
+            let properties = crate::process_runner::external_codex_systemd_properties_for_test(
+                profile,
+                &command.program,
+                &command.cwd,
+            )?;
+            for expected in [
+                format!("--property=MemoryMax={bytes}"),
+                "--property=TasksMax=256".to_string(),
+                "--property=CPUQuota=400%".to_string(),
+                "--property=LimitNOFILE=8192".to_string(),
+                "--property=LimitFSIZE=2147483648".to_string(),
+                "--property=MemorySwapMax=0".to_string(),
+                "--property=OOMPolicy=kill".to_string(),
+            ] {
+                assert!(properties.contains(&expected), "missing {expected}");
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_memory_max_bytes_reject_invalid_values_before_launch() -> Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    let mut invalid = [
+        "not-a-number",
+        "0",
+        "-1",
+        "+8589934592",
+        " 8589934592",
+        "8589934592 ",
+        "8GiB",
+        "8589934592.0",
+        "16777215",
+        "17179869185",
+        "18446744073709551616",
+    ]
+    .map(OsString::from)
+    .to_vec();
+    invalid.push(OsString::from_vec(vec![0xff]));
+    for configured in invalid {
+        let error =
+            protected_worktree_controls_with_worker_settings(&command, None, Some(&configured))
+                .expect_err("invalid Worker memory limit must refuse launch");
+        assert!(error.to_string().contains("MACO_WORKER_MEMORY_MAX_BYTES"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
 fn worker_read_only_roots_parse_colon_list_and_deduplicate() -> Result<()> {
     let (temp, command) = worker_read_only_roots_fixture()?;
     let roots = [
@@ -3239,6 +3390,31 @@ fn worker_read_only_roots_exclude_other_roles_read_only_primary_and_consultants(
     }
     for excluded in excluded {
         let baseline = protected_worktree_controls_with_worker_roots(&excluded, None)?;
+        for configured in [OsStr::new("8589934592"), OsStr::new("invalid")] {
+            let controls = protected_worktree_controls_with_worker_settings(
+                &excluded,
+                None,
+                Some(configured),
+            )?;
+            assert_eq!(controls.worker_memory_max_bytes, None);
+            assert_eq!(controls, baseline);
+            if excluded.invocation != ExternalAgentInvocation::ClaudeConsultant {
+                assert_eq!(
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &controls,
+                    )?,
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &baseline,
+                    )?
+                );
+            }
+        }
         for configured in [root.as_os_str(), OsStr::new("invalid-relative-entry")] {
             let controls =
                 protected_worktree_controls_with_worker_roots(&excluded, Some(configured))?;

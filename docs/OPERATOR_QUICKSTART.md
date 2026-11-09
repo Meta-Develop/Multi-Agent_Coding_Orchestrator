@@ -107,6 +107,14 @@ writable Workers in managed child worktrees. Read-only launches, auditors,
 reviewers and consultants receive no grant. Unset or empty preserves the default
 profile.
 
+Set `MACO_WORKER_MEMORY_MAX_BYTES` in the supervising `maco` process environment
+to a decimal byte count from 16777216 through 17179869184 (16 MiB through 16 GiB,
+inclusive) to change the memory ceiling for writable Workers in managed child
+worktrees, the same launches eligible for the read-only roots grant. Invalid
+values refuse launch; unset or empty keeps the 4 GiB default. A Worker compiling
+a large crate can exceed that default and be killed. Other roles and read-only
+launches keep their default limits; swap remains disabled.
+
 ## Codex runtime
 
 Prerequisites:
