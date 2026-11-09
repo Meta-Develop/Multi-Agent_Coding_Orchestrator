@@ -1934,6 +1934,7 @@ struct ProtectedWorktreeControls {
     exact_read_only_input_files: Vec<PathBuf>,
     exact_writable_artifact_files: Vec<ExactWritableArtifactFile>,
     writable_artifact_root: Option<PathBuf>,
+    worker_read_only_roots: Vec<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -3188,6 +3189,16 @@ impl ProtectedWorktreeControls {
 }
 
 fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedWorktreeControls> {
+    protected_worktree_controls_with_worker_roots(
+        spec,
+        std::env::var_os("MACO_WORKER_READ_ONLY_ROOTS").as_deref(),
+    )
+}
+
+fn protected_worktree_controls_with_worker_roots(
+    spec: &ExternalAgentCommand,
+    worker_roots: Option<&OsStr>,
+) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
     let managed_git_runtime = spec
@@ -3221,7 +3232,88 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
     controls.exact_writable_artifact_files =
         validate_exact_writable_artifact_files(spec, &controls)?;
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
+    controls.worker_read_only_roots = validate_worker_read_only_roots(spec, &controls, worker_roots)?;
     Ok(controls)
+}
+
+fn validate_worker_read_only_roots(
+    spec: &ExternalAgentCommand,
+    controls: &ProtectedWorktreeControls,
+    configured: Option<&OsStr>,
+) -> Result<Vec<PathBuf>> {
+    if spec.workspace_access != WorkspaceAccess::ReadWrite
+        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+        || matches!(
+            spec.invocation,
+            ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::ClaudeConsultant
+        )
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|identity| identity.role != "worker")
+    {
+        return Ok(Vec::new());
+    }
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(Vec::new());
+    };
+    let workspace = fs::canonicalize(&spec.cwd)?;
+    let mut protected = vec![workspace];
+    protected.extend(controls.iter().map(|control| control.absolute.clone()));
+    protected.extend(spec.hidden_roots.iter().cloned());
+    protected.extend(controls.writable_artifact_root.iter().cloned());
+    for artifact in &controls.exact_writable_artifact_files {
+        // The inner Codex permission covers the carrier, even though the outer
+        // profile grants writes only to held journal files.
+        protected.push(required_parent(&artifact.path)?.to_path_buf());
+    }
+    if let Some(git) = &controls.managed_git {
+        protected.extend([git.private_git_dir.clone(), git.worktree_git_dir.clone()]);
+        protected.extend(git.common_read_only_roots.iter().cloned());
+        protected.extend(git.common_read_only_files.iter().cloned());
+    }
+    let mut validated = BTreeSet::new();
+    for declared in std::env::split_paths(configured) {
+        let validate = || -> Result<PathBuf> {
+            normalized_absolute_path(&declared, "root")?;
+            let canonical = fs::canonicalize(&declared).context("root could not be resolved")?;
+            if !canonical.is_dir() {
+                bail!("root must be a directory");
+            }
+            if canonical.as_os_str() != declared.as_os_str() {
+                bail!("root must already be canonical");
+            }
+            if canonical.to_str().is_none() {
+                bail!("root must be valid UTF-8 for Codex permissions");
+            }
+            for path in &protected {
+                let normalized = normalized_absolute_path(path, "protected root")?;
+                if canonical.starts_with(&normalized) || normalized.starts_with(&canonical) {
+                    bail!("root overlaps protected path {}", path.display());
+                }
+                // Resolve existing aliases of hidden and writable roots as well.
+                // Missing descendants still overlap any accepted ancestor.
+                for ancestor in normalized.ancestors() {
+                    match fs::canonicalize(ancestor) {
+                        Ok(resolved) => {
+                            let resolved = resolved.join(normalized.strip_prefix(ancestor)?);
+                            if canonical.starts_with(&resolved) || resolved.starts_with(&canonical) {
+                                bail!("root overlaps protected path {}", path.display());
+                            }
+                            break;
+                        }
+                        Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                        Err(error) => return Err(error).context("protected root could not be resolved"),
+                    }
+                }
+            }
+            Ok(canonical)
+        };
+        validated.insert(validate().with_context(|| {
+            format!("MACO_WORKER_READ_ONLY_ROOTS entry {:?}", declared.as_os_str())
+        })?);
+    }
+    Ok(validated.into_iter().collect())
 }
 
 fn validate_exact_read_only_input_files(
@@ -5921,6 +6013,12 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::GeminiCli
         | ExternalAgentInvocation::DeepSeek => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
+            for root in &protected_controls.worker_read_only_roots {
+                // Output staging replaces the declared artifact root after the
+                // initial admission check. Validate against the final roots too.
+                validate_worker_read_only_roots(spec, protected_controls, Some(root.as_os_str()))?;
+                profile = profile.with_visible_read_only_root(root);
+            }
             for control in &protected_controls.read_only_roots {
                 profile = profile.with_visible_read_only_root(&control.absolute);
             }
@@ -7470,6 +7568,11 @@ fn codex_filesystem_permissions(
     controls: &ProtectedWorktreeControls,
 ) -> String {
     let mut path_permissions = BTreeMap::<String, &'static str>::new();
+    for root in &controls.worker_read_only_roots {
+        if let Some(path) = root.to_str() {
+            path_permissions.insert(path.to_string(), "read");
+        }
+    }
     for control in controls
         .read_only_roots
         .iter()

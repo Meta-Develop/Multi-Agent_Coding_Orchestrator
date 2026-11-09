@@ -97,6 +97,16 @@ when building reviewed uncommitted changes. Version identity alone cannot prove
 which uncommitted changes were included. Run the plan checks below with this
 same executable before dispatch.
 
+For toolchains outside the workspace and `/nix/store`, set
+`MACO_WORKER_READ_ONLY_ROOTS=/absolute/toolchain:/absolute/sdk` in the supervising
+`maco` process environment. Each entry must be an existing canonical directory,
+with no `..` components, disjoint from the workspace, private Git metadata,
+hidden roots and writable roots. Invalid entries refuse launch. The directories
+are exposed read-only in both the outer sandbox and Codex permissions, only for
+writable Workers in managed child worktrees. Read-only launches, auditors,
+reviewers and consultants receive no grant. Unset or empty preserves the default
+profile.
+
 ## Codex runtime
 
 Prerequisites:

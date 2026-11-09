@@ -2967,6 +2967,308 @@ fn managed_git_command(child: &Path, incoming: &Path) -> ExternalAgentCommand {
 }
 
 #[cfg(unix)]
+fn worker_read_only_roots_fixture() -> Result<(tempfile::TempDir, ExternalAgentCommand)> {
+    let temp = tempfile::tempdir()?;
+    let (_primary, child, _common, _git) = create_linked_git_metadata_fixture(temp.path())?;
+    let incoming = temp.path().join("incoming");
+    fs::create_dir(&incoming)?;
+    let command = managed_git_command(&child, &incoming).with_agent_lifecycle(
+        &child,
+        "worker",
+        "run-roots",
+        "worker-roots",
+    );
+    Ok((temp, command))
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_parse_colon_list_and_deduplicate() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let roots = [
+        temp.path().join("toolchain-a"),
+        temp.path().join("toolchain-b"),
+    ];
+    for root in &roots {
+        fs::create_dir(root)?;
+    }
+    let configured = std::env::join_paths([&roots[1], &roots[0], &roots[1]])?;
+    let controls = protected_worktree_controls_with_worker_roots(&command, Some(&configured))?;
+    assert_eq!(controls.worker_read_only_roots, roots);
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reject_invalid_entries_before_launch() -> Result<()> {
+    use std::os::unix::{ffi::OsStringExt, fs::symlink};
+
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    let file = temp.path().join("file");
+    fs::write(&file, b"file")?;
+    let alias = temp.path().join("alias");
+    symlink(&root, &alias)?;
+    let non_utf8 = temp.path().join(OsString::from_vec(vec![b't', 0xff]));
+    fs::create_dir(&non_utf8)?;
+    for (entry, reason) in [
+        (PathBuf::from("relative"), "must be absolute"),
+        (root.join("../toolchain"), "must already be normalized"),
+        (temp.path().join("missing"), "could not be resolved"),
+        (file, "must be a directory"),
+        (alias, "must already be canonical"),
+        (root.join("."), "must already be canonical"),
+        (non_utf8, "must be valid UTF-8"),
+    ] {
+        // Include a valid first entry to prove a later bad entry rejects the list.
+        let configured = std::env::join_paths([&root, &entry])?;
+        let error = protected_worktree_controls_with_worker_roots(&command, Some(&configured))
+            .expect_err("invalid root must refuse launch");
+        assert!(error
+            .to_string()
+            .contains(&format!("{:?}", entry.as_os_str())));
+        assert!(format!("{error:#}").contains(reason), "{error:#}");
+    }
+    for configured in [
+        format!(":{}", root.display()),
+        format!("{}:", root.display()),
+        format!("{}::{}", root.display(), root.display()),
+    ] {
+        let error =
+            protected_worktree_controls_with_worker_roots(&command, Some(OsStr::new(&configured)))
+                .expect_err("empty list entry must refuse launch");
+        assert!(error.to_string().contains("entry \"\""));
+        assert!(format!("{error:#}").contains("must be absolute"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reject_overlaps_in_both_directions() -> Result<()> {
+    use std::os::unix::fs::symlink;
+
+    let (temp, mut command) = worker_read_only_roots_fixture()?;
+    let hidden = temp.path().join("hidden-parent/hidden");
+    let writable = temp.path().join("writable-parent/writable");
+    fs::create_dir_all(&hidden)?;
+    fs::create_dir_all(&writable)?;
+    command.hidden_roots.push(hidden.clone());
+    let mut controls = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let mut writable_control = controls.read_only_roots[0].clone();
+    writable_control.absolute = writable.clone();
+    controls.read_write_roots.push(writable_control);
+    let private_git = controls
+        .managed_git
+        .as_ref()
+        .unwrap()
+        .private_git_dir
+        .clone();
+    for protected in [
+        command.cwd.clone(),
+        private_git,
+        hidden.clone(),
+        writable,
+        controls.writable_artifact_root.clone().unwrap(),
+    ] {
+        let child = protected.join("nested-read-only-root");
+        fs::create_dir(&child)?;
+        for entry in [&protected, &child, protected.parent().unwrap()] {
+            let error =
+                validate_worker_read_only_roots(&command, &controls, Some(entry.as_os_str()))
+                    .expect_err("overlapping root must refuse launch");
+            assert!(error
+                .to_string()
+                .contains(&format!("{:?}", entry.as_os_str())));
+            assert!(format!("{error:#}").contains("overlaps protected path"));
+        }
+        fs::remove_dir(child)?;
+    }
+    // Hidden aliases, including missing descendants, must not reveal a granted root.
+    let toolchain = temp.path().join("toolchain");
+    fs::create_dir(&toolchain)?;
+    let alias = temp.path().join("hidden-alias");
+    symlink(&toolchain, &alias)?;
+    for hidden in [alias.clone(), alias.join("missing")] {
+        command.hidden_roots = vec![hidden];
+        let error =
+            validate_worker_read_only_roots(&command, &controls, Some(toolchain.as_os_str()))
+                .expect_err("hidden alias must refuse launch");
+        assert!(format!("{error:#}").contains("overlaps protected path"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_reach_both_layers_with_exact_read_permission() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("aaa-toolchain");
+    fs::create_dir(&root)?;
+    let baseline = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let controls = protected_worktree_controls_with_worker_roots(&command, Some(root.as_os_str()))?;
+    let prefix = "permissions.maco_external_codex.filesystem={\":minimal\"=\"read\",\":workspace_roots\"={\".\"=\"write\"},";
+    let baseline_permissions = codex_filesystem_permissions(&command, &baseline);
+    let expected = format!(
+        "{prefix}{}=\"read\",{}",
+        toml_basic_string(root.to_str().unwrap()),
+        baseline_permissions
+            .strip_prefix(prefix)
+            .context("legacy permission prefix")?,
+    );
+    assert_eq!(codex_filesystem_permissions(&command, &controls), expected);
+    for argv in [
+        command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+        codex_app_server_argv(&command, &controls),
+    ] {
+        assert!(argv.contains(&OsString::from(&expected)));
+    }
+    let profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &controls,
+    )?;
+    let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+        bail!("expected Codex profile");
+    };
+    assert!(profile.visible_read_only_roots().contains(&root));
+    assert!(!profile.visible_read_write_roots().contains(&root));
+    assert!(!profile.writable_artifact_roots().contains(&root));
+    let mut staged_controls = controls.clone();
+    staged_controls.writable_artifact_root = Some(root.join("private-staging"));
+    let error = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &staged_controls,
+    )
+    .expect_err("final output staging must remain disjoint from the read-only root");
+    assert!(error
+        .to_string()
+        .contains(&format!("{:?}", root.as_os_str())));
+    assert!(format!("{error:#}").contains("overlaps protected path"));
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_unset_and_empty_preserve_legacy_argv_and_profile() -> Result<()> {
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    // This role used the same Git controls and writable profile before the setting existed.
+    let legacy_command = command.clone().with_agent_lifecycle(
+        &command.cwd,
+        "child_orchestrator",
+        "run-roots",
+        "worker-roots",
+    );
+    let legacy = protected_worktree_controls_with_worker_roots(&legacy_command, None)?;
+    assert!(legacy.worker_read_only_roots.is_empty());
+    let expected_argv = command_argv_with_controls_and_service_tier_input(&command, &legacy, None)?;
+    let expected_app_server = codex_app_server_argv(&command, &legacy);
+    let expected_profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &legacy,
+    )?;
+    for configured in [None, Some(OsStr::new(""))] {
+        let controls = protected_worktree_controls_with_worker_roots(&command, configured)?;
+        assert_eq!(controls, legacy);
+        assert_eq!(
+            command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+            expected_argv
+        );
+        assert_eq!(
+            codex_app_server_argv(&command, &controls),
+            expected_app_server
+        );
+        assert_eq!(
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &controls,
+            )?,
+            expected_profile
+        );
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_read_only_roots_exclude_other_roles_read_only_primary_and_consultants() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    let mut excluded = Vec::new();
+    for role in [
+        "auditor",
+        "reviewer",
+        "researcher",
+        "consultant",
+        "child_orchestrator",
+        "Worker",
+    ] {
+        excluded.push(
+            command
+                .clone()
+                .with_agent_lifecycle(&command.cwd, role, "run", "task"),
+        );
+    }
+    excluded.push(
+        command
+            .clone()
+            .with_workspace_access(WorkspaceAccess::ReadOnly),
+    );
+    let mut primary = command.clone();
+    primary.writable_launch_target = WritableLaunchTarget::PrimaryWorktree;
+    excluded.push(primary);
+    let mut anonymous = command.clone();
+    anonymous.agent_lifecycle = None;
+    excluded.push(anonymous);
+    for invocation in [
+        ExternalAgentInvocation::CodexConsultant,
+        ExternalAgentInvocation::ClaudeConsultant,
+    ] {
+        let mut consultant = command.clone();
+        consultant.invocation = invocation;
+        excluded.push(consultant);
+    }
+    for excluded in excluded {
+        let baseline = protected_worktree_controls_with_worker_roots(&excluded, None)?;
+        for configured in [root.as_os_str(), OsStr::new("invalid-relative-entry")] {
+            let controls =
+                protected_worktree_controls_with_worker_roots(&excluded, Some(configured))?;
+            assert_eq!(controls, baseline);
+            assert_eq!(
+                codex_app_server_argv(&excluded, &controls),
+                codex_app_server_argv(&excluded, &baseline)
+            );
+            if excluded.invocation != ExternalAgentInvocation::ClaudeConsultant {
+                assert_eq!(
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &controls,
+                    )?,
+                    external_side_effect_profile(
+                        &excluded,
+                        &excluded.program,
+                        ExternalProgramTrust::TrustedSystemCodex,
+                        &baseline,
+                    )?
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn exact_worker_journal_controls(
     child: &Path,
     root: &Path,
