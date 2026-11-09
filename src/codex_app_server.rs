@@ -28,9 +28,9 @@ const EXTERNAL_CODEX_PERMISSION_PROFILE: &str = "maco_external_codex";
 const STARTUP_INFORMATION_MAX_MESSAGES: usize = 8;
 const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
-const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 64;
+const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 4096;
 const ACCOUNT_UPDATE_MAX_MESSAGES: usize = 64;
-const MODERATION_METADATA_MAX_MESSAGES: usize = 64;
+const MODERATION_METADATA_MAX_MESSAGES: usize = 4096;
 const WARNING_MAX_MESSAGES: usize = 64;
 const RETRY_NOTICE_MAX_MESSAGES: usize = 16;
 const RETRY_NOTICE_MAX_BYTES: usize = 16 * 1024;
@@ -5414,15 +5414,35 @@ mod tests {
         for _ in 0..MODERATION_METADATA_MAX_MESSAGES {
             messages.insert(4, notice.clone());
         }
-        assert!(run_command_observation_messages(messages.clone()).is_ok());
+        assert_eq!(
+            run_command_observation_messages(messages.clone())
+                .unwrap()
+                .status,
+            TurnTerminalStatus::Completed
+        );
         messages.insert(4, notice);
         assert!(matches!(
             run_command_observation_messages(messages),
             Err(AppServerError::Malformed {
                 phase: "turn/moderationMetadata",
-                ..
-            })
+                message,
+            }) if message == "moderation metadata notifications exceeded their bound"
         ));
+    }
+
+    #[test]
+    fn long_turn_completes_with_interleaved_moderation_and_rate_limit_notices() {
+        let mut messages = command_observation_messages();
+        for position in [6, 4] {
+            messages.splice(
+                position..position,
+                (0..50).flat_map(|_| [captured_moderation_notice(), captured_rate_limit_notice()]),
+            );
+        }
+        let expected_messages = messages.len();
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.messages_received, expected_messages);
     }
 
     #[test]
@@ -5454,15 +5474,22 @@ mod tests {
             assert!(run_command_observation_messages(messages).is_err());
         }
         let mut messages = command_observation_messages();
-        for _ in 0..=ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
+        for _ in 0..ACCOUNT_RATE_LIMIT_MAX_MESSAGES {
             messages.insert(4, notice.clone());
         }
+        assert_eq!(
+            run_command_observation_messages(messages.clone())
+                .unwrap()
+                .status,
+            TurnTerminalStatus::Completed
+        );
+        messages.insert(4, notice);
         assert!(matches!(
             run_command_observation_messages(messages),
             Err(AppServerError::Malformed {
                 phase: "account/rateLimits/updated",
-                ..
-            })
+                message,
+            }) if message == "account rate-limit notifications exceeded their bound"
         ));
         assert!(!valid_account_rate_limits_updated(
             br#"{"method":"account/rateLimits/updated","params":{"rateLimits":{"limitId":"codex","limitId":"other"}}}"#
