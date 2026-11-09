@@ -1296,7 +1296,83 @@ mod tests {
         );
         retain_review_fixture(&mut fixture, &run)?;
         let evidence = read_review_fixture(&fixture)?;
-        assert_eq!(evidence["review_complete"], true);
+        assert_eq!(
+            evidence["review_complete"],
+            true,
+            "native large-field review conditions: {}",
+            {
+                // Only bounded typed conditions: never print protocol text, command
+                // identities, hashes, paths, or private parent evidence on failure.
+                let status = |value: &Value| match value.as_str() {
+                    Some("captured") => "captured",
+                    Some("unavailable") => "unavailable",
+                    Some("incomplete") => "incomplete",
+                    Some("oversize") => "oversize",
+                    Some("redacted") => "redacted",
+                    _ => "invalid_or_missing",
+                };
+                let capture = &evidence["commands"];
+                let commands = capture["commands"].as_array().map(|commands| {
+                    commands.iter().take(8).map(|command| {
+                    let output = &command["aggregated_output"];
+                    json!({
+                        "command":status(&command["native_command"]["status"]),
+                        "argv":status(&command["argv_status"]),
+                        "cwd":status(&command["cwd"]["status"]),
+                        "output":status(&output["status"]),
+                        "output_bytes":output["original_bytes"].as_u64(),
+                        "output_text_present":output["text"].is_string(),
+                        "output_hash_present":output["sha256"].is_string(),
+                        "output_view_hash_present":output["view_sha256"].is_string(),
+                        "output_view_truncated":output["view_truncated"].as_bool(),
+                        "terminal_exit_consistent":
+                            (command["status"] == "completed" && command["exit_code"] == 0)
+                            || (command["status"] == "failed"
+                                && command["exit_code"].as_i64().is_some_and(|code| code != 0)),
+                    })
+                }).collect::<Vec<_>>()
+                });
+                let observations = run.codex_command_execution_evidence().unwrap()
+                .observations.iter().take(8).map(|observation| match observation {
+                    crate::external_agent::codex_app_server::CommandExecutionObservation::Complete {
+                        started, completed, ..
+                    } => format!("complete; redacted={}; start_valid={}; command_matches={}; cwd_matches={}",
+                        started.review_redacted || completed.review_redacted,
+                        started.status == crate::external_agent::codex_app_server::CommandExecutionStatus::InProgress
+                            && started.exit_code.is_none(),
+                        started.command == completed.command,
+                        started.cwd == completed.cwd),
+                    crate::external_agent::codex_app_server::CommandExecutionObservation::Incomplete {
+                        reason, ..
+                    } => format!("incomplete: {reason:?}"),
+                }).collect::<Vec<_>>();
+                let parent = run.authenticated_app_server_evidence();
+                json!({
+                    "quiescence_verified":evidence["target_quiescence_verified"].as_bool(),
+                    "capture_version":capture["version"].as_u64(),
+                    "capture_status":status(&capture["status"]),
+                    "host_completed":capture["host_process_completed"].as_bool(),
+                    "source_truncated":capture["source_truncated"].as_bool(),
+                    "turn_completed":capture["turn_status"] == "completed",
+                    "thread_hash_present":capture["thread_id_sha256"].is_string(),
+                    "turn_hash_present":capture["turn_id_sha256"].is_string(),
+                    "observation_count":capture["observation_count"].as_u64(),
+                    "command_count":capture["commands"].as_array().map(Vec::len),
+                    "run_publishable":run.publishable,
+                    "run_exit":run.exit_code,
+                    "run_timed_out":run.timed_out,
+                    "run_error_present":run.error.is_some(),
+                    "run_safety_verified":external_safety_verified(&run, SupervisorRuntime::Codex),
+                    "parent_identity_matches":parent.is_some_and(|parent| parent.identity_matches_request()),
+                    "parent_resolution_complete":parent.is_some_and(|parent| parent.resolution_status == "complete"),
+                    "parent_matches_retained":parent == run.codex_parent_evidence.as_ref(),
+                    "usage_available":run.authenticated_codex_usage().is_some(),
+                    "auditor_effort_qualified":run.codex_auditor_effort_qualified(),
+                    "observations":observations,
+                    "commands":commands,
+                })
+            }
+        );
         assert_eq!(evidence["source_bytes"], run.stdout_bytes().len());
         assert_eq!(evidence["source_sha256"], sha256_hex(run.stdout_bytes()));
         let commands = evidence["commands"]["commands"].as_array().unwrap();
