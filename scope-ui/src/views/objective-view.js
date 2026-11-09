@@ -82,8 +82,11 @@
     return (Math.round(value * 10) / 10).toFixed(1);
   }
 
-  function formatUsd(value) {
-    return "$" + value.toFixed(4);
+  function formatCost(row) {
+    var coverage = row.cost_count + "/" + row.count + " measured; " + row.cost_unknown_count + " unknown";
+    return row.cost_complete
+      ? "$" + row.mean_cost.toFixed(4) + " (" + coverage + ")"
+      : "Unknown (" + coverage + (row.cost_unknown_count === 0 && row.count > 0 ? "; aggregate unavailable" : "") + ")";
   }
 
   function renderPreview() {
@@ -117,7 +120,9 @@
           preview.selection.score.toFixed(4) +
           ")";
       } else {
-        winner.textContent = "No selectable profile.";
+        winner.textContent = preview.cost_selection_limited
+          ? "No selectable profile: cost-weighted selection requires complete measured cost coverage."
+          : "No selectable profile.";
       }
     }
     if (notice) {
@@ -126,6 +131,12 @@
       if (state.loaded.pareto_status) bits.push("recorded Pareto: " + state.loaded.pareto_status);
       if (preview.labeled_preview) {
         bits.push("labelled preview — document is not eligible for production decisions");
+      }
+      if (preview.cost_unavailable_profiles) {
+        bits.push("Cost unavailable for " + preview.cost_unavailable_profiles + " profile(s); unknown or partial costs cannot establish a cost/quality frontier");
+        bits.push(preview.cost_selection_limited
+          ? "cost-weighted selection excludes profiles without complete measured cost coverage"
+          : "quality-only selection remains available without cost evidence; score ties prefer complete measured costs, then lower cost, then profile ID");
       }
       bits.push("client holds no authority; nothing is written");
       notice.textContent = bits.join(" · ");
@@ -153,7 +164,7 @@
         td(row.profile_id);
         td(formatBp(row.recorded_overall));
         td(formatBp(row.preview_overall));
-        td(formatUsd(row.mean_cost));
+        td(formatCost(row));
         td(preview.selection && row.profile_id === preview.selection.profile_id
           ? preview.selection.score.toFixed(4)
           : "—");
