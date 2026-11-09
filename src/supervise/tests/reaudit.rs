@@ -500,7 +500,13 @@ fn verified_reaudit_source_turn(
         // Preserve the native uncommitted edit, as in the managed handoff fixture.
         fs::write(command.cwd.join("README.md"), "preserved implementation\n").unwrap();
     }
-    retained_review_turn_fixture(command, &mut run, items, input, output);
+    retained_review_turn_fixture(
+        command,
+        &mut run,
+        items,
+        u64::try_from(input).expect("fixture input tokens fit u64"),
+        u64::try_from(output).expect("fixture output tokens fit u64"),
+    );
     run
 }
 

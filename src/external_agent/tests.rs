@@ -17014,7 +17014,9 @@ pub(crate) fn retain_review_protocol_fixture(
     run.retain_codex_command_execution_evidence(&outcome, &CredentialRedactor::default());
     replace_report_stdout(
         run,
-        CapturedOutput::from_captured_bytes_for_test(&CapturedBytes::from_bytes_for_test(&raw)),
+        CapturedOutput::from_captured_bytes_for_test(&CapturedBytes::from_bytes_for_test(
+            raw.as_slice(),
+        )),
     );
     run.stdout.target_launch_attempted = true;
     // This opt-in protocol fixture has one consistent declared version.
