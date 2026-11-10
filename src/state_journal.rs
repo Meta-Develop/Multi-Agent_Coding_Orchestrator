@@ -1109,8 +1109,14 @@ fn durable_publish_no_replace<S: JournalSpec>(
         .context("failed to persist checkpoint record temp")?;
     drop(file);
     fence()?;
+    #[cfg(unix)]
+    let publication = publish_no_replace(&temp_path, &final_path)?;
+    #[cfg(not(unix))]
     publish_no_replace(&temp_path, &final_path)?;
     sync_parent_directory(root.path())?;
+    #[cfg(unix)]
+    cleanup_published_temp_if_linked(&temp_path, &final_path, publication)?;
+    #[cfg(not(unix))]
     cleanup_published_temp_if_linked(&temp_path, &final_path)?;
     sync_parent_directory(root.path())?;
     fence()?;
@@ -1159,13 +1165,51 @@ fn open_new_private_file(path: &Path) -> Result<File> {
 }
 
 #[cfg(unix)]
-fn publish_no_replace(temp: &Path, final_path: &Path) -> Result<()> {
+enum RecordPublication {
+    #[cfg(target_os = "linux")]
+    Renamed,
+    HardLinked,
+}
+
+#[cfg(unix)]
+fn publish_no_replace(temp: &Path, final_path: &Path) -> Result<RecordPublication> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let source = CString::new(temp.as_os_str().as_bytes())
+            .context("checkpoint temp path contains a NUL byte")?;
+        let destination = CString::new(final_path.as_os_str().as_bytes())
+            .context("checkpoint record path contains a NUL byte")?;
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            return Ok(RecordPublication::Renamed);
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return Err(error).with_context(|| {
+                format!(
+                    "failed to publish checkpoint record without replacement: {}",
+                    final_path.display()
+                )
+            });
+        }
+    }
     fs::hard_link(temp, final_path).with_context(|| {
         format!(
             "failed to publish checkpoint record without replacement: {}",
             final_path.display()
         )
-    })
+    })?;
+    Ok(RecordPublication::HardLinked)
 }
 
 #[cfg(target_os = "windows")]
@@ -1304,7 +1348,21 @@ fn sync_parent_directory(_directory: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn cleanup_published_temp_if_linked(temp: &Path, final_path: &Path) -> Result<()> {
+fn cleanup_published_temp_if_linked(
+    temp: &Path,
+    final_path: &Path,
+    publication: RecordPublication,
+) -> Result<()> {
+    #[cfg(target_os = "linux")]
+    if matches!(publication, RecordPublication::Renamed) {
+        return match fs::symlink_metadata(temp) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error).context("failed to inspect checkpoint temp after atomic move"),
+            Ok(_) => bail!("checkpoint temp survived an atomic move unexpectedly"),
+        };
+    }
+    #[cfg(not(target_os = "linux"))]
+    let RecordPublication::HardLinked = publication;
     let temp_identity = identity_for_path(temp)?;
     let final_identity = identity_for_path(final_path)?;
     if temp_identity != final_identity {
@@ -1445,6 +1503,62 @@ mod tests {
         let repo = crate::git_repository::open(repo_path)?;
         let auth = RepositoryAuthenticator::open_existing(repo.commondir())?;
         StateJournal::open(auth, identity)
+    }
+
+    #[test]
+    fn record_publication_preserves_bytes_and_removes_temp() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_existing(temp.path()).expect("open record directory");
+        let final_name = record_file_name(1);
+        let contents = b"checkpoint bytes\0with a newline\n";
+
+        durable_publish_no_replace::<CheckpointJournalSpec>(
+            &root,
+            &final_name,
+            1,
+            contents,
+            || Ok(()),
+        )
+        .expect("publish record");
+
+        assert_eq!(
+            fs::read(temp.path().join(&final_name)).expect("read record"),
+            contents
+        );
+        let entries = fs::read_dir(temp.path())
+            .expect("list record directory")
+            .map(|entry| entry.expect("directory entry").file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(entries, vec![final_name]);
+    }
+
+    #[test]
+    fn record_publication_does_not_replace_existing_record() {
+        let temp = TempDir::new().expect("tempdir");
+        let root = SafeRoot::open_existing(temp.path()).expect("open record directory");
+        let final_name = record_file_name(1);
+        let final_path = temp.path().join(&final_name);
+        let original = b"existing checkpoint\0bytes\n";
+
+        // Introduce the collision after the initial absence check to exercise
+        // the publication operation's no-replace guarantee.
+        let error = durable_publish_no_replace::<CheckpointJournalSpec>(
+            &root,
+            &final_name,
+            1,
+            b"replacement checkpoint",
+            || {
+                open_new_private_file(&final_path)?.write_all(original)?;
+                Ok(())
+            },
+        )
+        .expect_err("existing record must not be replaced");
+
+        assert!(error.to_string().contains("without replacement"));
+        assert_eq!(
+            fs::read(&final_path).expect("read original record"),
+            original
+        );
     }
 
     #[test]
