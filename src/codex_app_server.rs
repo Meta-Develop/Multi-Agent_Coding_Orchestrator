@@ -781,10 +781,26 @@ impl AppServerLimits {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AppServerApprovalPolicy {
+    OnRequest,
+    Never,
+}
+
+impl AppServerApprovalPolicy {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::OnRequest => "on-request",
+            Self::Never => "never",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct AppServerTurn {
     pub(crate) cwd: String,
     pub(crate) permission_profile: String,
+    pub(crate) approval_policy: AppServerApprovalPolicy,
     pub(crate) prompt: String,
     pub(crate) model: Option<String>,
     /// Selected Auditor requirement; other roles keep their existing qualification path.
@@ -1840,7 +1856,10 @@ where
     let thread_start_id = state.allocate_request_id()?;
     let mut thread_params = Map::from_iter([
         ("cwd".to_string(), Value::from(turn.cwd.clone())),
-        ("approvalPolicy".to_string(), Value::from("on-request")),
+        (
+            "approvalPolicy".to_string(),
+            Value::from(turn.approval_policy.as_str()),
+        ),
         // Production routes every surfaced request through the client-owned MACO callback.
         // Upstream auto_review remains experiment-only evidence because it does not review
         // actions already allowed inside the active sandbox.
@@ -1886,7 +1905,7 @@ where
     require_exact_text(
         &thread_response,
         &["result", "approvalPolicy"],
-        "on-request",
+        turn.approval_policy.as_str(),
         "thread/start",
     )?;
     require_exact_text(
@@ -1978,7 +1997,10 @@ where
             "input".to_string(),
             json!([{"type": "text", "text": turn.prompt, "text_elements": []}]),
         ),
-        ("approvalPolicy".to_string(), Value::from("on-request")),
+        (
+            "approvalPolicy".to_string(),
+            Value::from(turn.approval_policy.as_str()),
+        ),
         ("approvalsReviewer".to_string(), Value::from("user")),
         (
             "permissions".to_string(),
@@ -3952,10 +3974,61 @@ mod tests {
         AppServerTurn {
             cwd: "/workspace".to_string(),
             permission_profile: "maco_external_codex".to_string(),
+            approval_policy: AppServerApprovalPolicy::OnRequest,
             prompt: "perform the bounded task".to_string(),
             model: None,
             minimum_effort: None,
             output_schema: None,
+        }
+    }
+
+    #[test]
+    fn approval_policy_outside_managed_worker_sends_and_requires_on_request() {
+        for with_worker_requests in [false, true] {
+            for echoed_policy in ["on-request", "never"] {
+                let mut messages = command_observation_messages();
+                messages[1]["result"]["approvalPolicy"] = json!(echoed_policy);
+                let mut transport = FakeTransport::from_values(messages);
+                let mut worker_requests = |_: &Value| panic!("no Worker request expected");
+                let result = run_app_server_turn_with_worker_requests(
+                    &mut transport,
+                    &test_turn(),
+                    AppServerLimits::default(),
+                    &mut |_: ApprovalRequest| panic!("no approval expected"),
+                    if with_worker_requests {
+                        Some(&mut worker_requests)
+                    } else {
+                        None
+                    },
+                    || false,
+                );
+                let thread_start = transport
+                    .sent
+                    .iter()
+                    .find(|value| value["method"] == "thread/start")
+                    .unwrap();
+                assert_eq!(thread_start["params"]["approvalPolicy"], "on-request");
+                assert_eq!(thread_start["params"]["approvalsReviewer"], "user");
+                let turn_start = transport
+                    .sent
+                    .iter()
+                    .find(|value| value["method"] == "turn/start");
+                if echoed_policy == "on-request" {
+                    assert_eq!(result.unwrap().status, TurnTerminalStatus::Completed);
+                    let turn_start = turn_start.unwrap();
+                    assert_eq!(turn_start["params"]["approvalPolicy"], "on-request");
+                    assert_eq!(turn_start["params"]["approvalsReviewer"], "user");
+                } else {
+                    assert!(matches!(
+                        result,
+                        Err(AppServerError::Unexpected {
+                            phase: "thread/start",
+                            ..
+                        })
+                    ));
+                    assert!(turn_start.is_none());
+                }
+            }
         }
     }
 

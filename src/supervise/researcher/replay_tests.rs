@@ -66,6 +66,8 @@ fn researcher_replays_codex_0162_login_shell_commands_without_invented_wrappers(
         &AppServerTurn {
             cwd: "/workspace".to_string(),
             permission_profile: "maco_external_codex".to_string(),
+            approval_policy:
+                crate::external_agent::codex_app_server::AppServerApprovalPolicy::OnRequest,
             prompt: "offline command replay".to_string(),
             model: Some("gpt-6.1-sol".to_string()),
             minimum_effort: Some("xhigh".to_string()),
