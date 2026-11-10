@@ -1031,22 +1031,29 @@ fn all_failed_commands_are_licensed(
         .iter()
         .map(|failure| failure.failure_signature.as_str())
         .collect::<Vec<_>>();
-    report
-        .commands_run
-        .iter()
+    std::iter::once(report.commands_run.as_slice())
         .chain(
             report
                 .worker_reports
                 .iter()
-                .flat_map(|worker| worker.commands_run.iter()),
+                .map(|worker| worker.commands_run.as_slice()),
         )
-        .filter(|command| command.status != ReviewStatus::Succeeded)
-        .all(|command| {
-            !command.timed_out
-                && command.error.is_none()
-                && command.environment_failures.is_empty()
-                && signatures.iter().any(|signature| {
-                    command.stdout.contains(*signature) || command.stderr.contains(*signature)
+        .all(|commands| {
+            commands
+                .iter()
+                .enumerate()
+                .filter(|(index, command)| {
+                    command.status != ReviewStatus::Succeeded
+                        && !command_is_repaired_by_later_success(command, &commands[index + 1..])
+                })
+                .all(|(_, command)| {
+                    !command.timed_out
+                        && command.error.is_none()
+                        && command.environment_failures.is_empty()
+                        && signatures.iter().any(|signature| {
+                            command.stdout.contains(*signature)
+                                || command.stderr.contains(*signature)
+                        })
                 })
         })
 }
