@@ -43,7 +43,7 @@ send({"id": start["id"], "result": {
     "thread": {"id": thread}, "cwd": str(workspace), "model": params["model"],
     "reasoningEffort": json.loads(next(arg.split("=", 1)[1] for arg in sys.argv
                                      if arg.startswith("model_reasoning_effort="))),
-    "approvalPolicy": "on-request", "approvalsReviewer": "user",
+    "approvalPolicy": params["approvalPolicy"], "approvalsReviewer": "user",
     "activePermissionProfile": {"id": "maco_external_codex"}}})
 request = receive()
 assert request["method"] == "turn/start"

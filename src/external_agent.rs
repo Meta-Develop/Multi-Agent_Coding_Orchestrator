@@ -11000,6 +11000,7 @@ fn run_read_only_terminal_app_server_process_with_auth(
     let turn = codex_app_server::AppServerTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
         permission_profile: "maco_external_codex".to_string(),
+        approval_policy: codex_app_server::AppServerApprovalPolicy::OnRequest,
         prompt,
         model: spec.model.clone(),
         minimum_effort: spec
@@ -11072,6 +11073,11 @@ pub(crate) fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTr
     spec: &ExternalAgentCommand,
     cancellation: &ProcessCancellation,
 ) -> Result<codex_app_server::AppServerOutcome, String> {
+    // The managed Worker owns this choice, regardless of the caller's turn policy.
+    let turn = codex_app_server::AppServerTurn {
+        approval_policy: codex_app_server::AppServerApprovalPolicy::Never,
+        ..turn.clone()
+    };
     let mut approval_requested = false;
     let mut reviewer = |_: codex_app_server::ApprovalRequest| {
         approval_requested = true;
@@ -11080,7 +11086,7 @@ pub(crate) fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTr
     // No dynamic Worker tool or callback. Native in-scope edits use the unchanged
     // workspace-write profile; approval and permission expansion always cancel.
     let mut outcome =
-        run_observed_app_server_turn(transport, turn, spec, &mut reviewer, None, cancellation)?;
+        run_observed_app_server_turn(transport, &turn, spec, &mut reviewer, None, cancellation)?;
     if approval_requested || outcome.refused_ceiling_expansions != 0 {
         cancellation.cancel();
         fail_app_server_outcome(
@@ -11102,6 +11108,7 @@ fn run_managed_worker_app_server_process_with_auth(
     let turn = codex_app_server::AppServerTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
         permission_profile: "maco_external_codex".to_string(),
+        approval_policy: codex_app_server::AppServerApprovalPolicy::Never,
         prompt,
         model: spec.model.clone(),
         minimum_effort: None,
@@ -11190,6 +11197,7 @@ fn run_duplex_app_server_process_with_auth(
     let turn = codex_app_server::AppServerTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
         permission_profile: "maco_external_codex".to_string(),
+        approval_policy: codex_app_server::AppServerApprovalPolicy::OnRequest,
         prompt,
         model: spec.model.clone(),
         minimum_effort: None,

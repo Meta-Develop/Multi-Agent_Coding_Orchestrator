@@ -515,7 +515,7 @@ fn qualification_mode(
                 incoming: VecDeque::from([
                     json!({"id":1,"result":{}}),
                     json!({"id":2,"result":{"thread":{"id":"thread"},"model":"gpt-6.1-sol","reasoningEffort":"high",
-                    "approvalPolicy":"on-request","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":command.cwd}}),
+                    "approvalPolicy":"never","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":command.cwd}}),
                     json!({"id":3,"result":{"turn":{"id":"turn","status":"inProgress"}}}),
                     json!({"method":"turn/started","params":{"threadId":"thread","turn":{"id":"turn","status":"inProgress"}}}),
                     usage(limit / 2),
@@ -529,6 +529,7 @@ fn qualification_mode(
             let turn = codex_app_server::AppServerTurn {
                 cwd: command.cwd.to_string_lossy().into_owned(),
                 permission_profile: "maco_external_codex".into(),
+                approval_policy: codex_app_server::AppServerApprovalPolicy::OnRequest,
                 prompt: fs::read_to_string(&command.prompt).unwrap(),
                 model: command.model.clone(),
                 minimum_effort: None,

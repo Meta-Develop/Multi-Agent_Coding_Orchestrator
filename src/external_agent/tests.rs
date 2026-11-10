@@ -1280,14 +1280,17 @@ start = receive()
 assert start["method"] == "thread/start"
 assert start["params"]["cwd"] == str(workspace)
 assert start["params"]["approvalsReviewer"] == "user"
+approval_policy = "never" if worker else "on-request"
+assert start["params"]["approvalPolicy"] == approval_policy
 send({"id":start["id"], "result":{
     "thread":{"id":"research-thread"}, "cwd":str(workspace),
     "model":"gpt-5.6-astra" if mode == "model-mismatch" else "gpt-5.6-sol", "reasoningEffort":None if mode == "unknown-effort" else ("high" if mode == "low-effort" else "xhigh"),
-    "approvalPolicy":"on-request", "approvalsReviewer":"user",
+    "approvalPolicy":approval_policy, "approvalsReviewer":"user",
     "activePermissionProfile":{"id":"maco_external_codex"}
 }})
 turn = receive()
 assert turn["method"] == "turn/start"
+assert turn["params"]["approvalPolicy"] == approval_policy
 if worker:
     assert start["params"]["dynamicTools"] == []
     assert "journal-append" in turn["params"]["input"][0]["text"]
@@ -2188,6 +2191,7 @@ assert receive()["method"] == "initialized"
 thread_start = receive()
 assert thread_start["method"] == "thread/start"
 assert thread_start["params"]["approvalsReviewer"] == "user"
+assert thread_start["params"]["approvalPolicy"] == "on-request"
 send({"id": thread_start["id"], "result": {
     "thread": {"id": "thread-contained"},
     "model": "gpt-5.6-sol",
@@ -2200,6 +2204,7 @@ send({"id": thread_start["id"], "result": {
 turn_start = receive()
 assert turn_start["method"] == "turn/start"
 assert turn_start["params"]["approvalsReviewer"] == "user"
+assert turn_start["params"]["approvalPolicy"] == "on-request"
 send({"id": turn_start["id"], "result": {
     "turn": {"id": "turn-contained", "status": "inProgress"}
 }})
@@ -16435,6 +16440,7 @@ mod managed_worker_live_budget {
         codex_app_server::AppServerTurn {
             cwd: "/workspace".into(),
             permission_profile: "maco_external_codex".into(),
+            approval_policy: codex_app_server::AppServerApprovalPolicy::OnRequest,
             prompt: "effective Worker prompt including the bound helper appendix".into(),
             model: Some("gpt-5.6-sol".into()),
             minimum_effort: None,
@@ -16445,7 +16451,7 @@ mod managed_worker_live_budget {
     fn prefix() -> Vec<serde_json::Value> {
         vec![
             serde_json::json!({"id":1,"result":{}}),
-            serde_json::json!({"id":2,"result":{"thread":{"id":"worker-thread"},"model":"gpt-5.6-sol","reasoningEffort":"high","approvalPolicy":"on-request","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":"/workspace"}}),
+            serde_json::json!({"id":2,"result":{"thread":{"id":"worker-thread"},"model":"gpt-5.6-sol","reasoningEffort":"high","approvalPolicy":"never","approvalsReviewer":"user","activePermissionProfile":{"id":"maco_external_codex"},"cwd":"/workspace"}}),
             serde_json::json!({"id":3,"result":{"turn":{"id":"worker-turn","status":"inProgress"}}}),
             serde_json::json!({"method":"turn/started","params":{"threadId":"worker-thread","turn":{"id":"worker-turn","status":"inProgress"}}}),
         ]
@@ -16480,6 +16486,52 @@ mod managed_worker_live_budget {
         messages.push(serde_json::json!({"method":"item/completed","params":{"threadId":"worker-thread","turnId":"worker-turn","item":{"id":"report","type":"agentMessage","text":"{\"summary\":\"native edit\"}"}}}));
         messages.push(terminal());
         messages
+    }
+
+    #[test]
+    fn managed_worker_approval_policy_forces_never_for_thread_and_turn() {
+        let mut transport = Transport::new(complete_messages());
+        let requested_turn = turn();
+        assert_eq!(
+            requested_turn.approval_policy,
+            codex_app_server::AppServerApprovalPolicy::OnRequest
+        );
+        let outcome = run_managed_worker_app_server_turn(
+            &mut transport,
+            &requested_turn,
+            &command(),
+            &ProcessCancellation::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            outcome.status,
+            codex_app_server::TurnTerminalStatus::Completed
+        );
+        for method in ["thread/start", "turn/start"] {
+            let sent = transport
+                .sent
+                .iter()
+                .find(|v| v["method"] == method)
+                .unwrap();
+            assert_eq!(sent["params"]["approvalPolicy"], "never");
+            assert_eq!(sent["params"]["approvalsReviewer"], "user");
+            assert_eq!(sent["params"]["permissions"], "maco_external_codex");
+        }
+    }
+
+    #[test]
+    fn managed_worker_approval_policy_rejects_on_request_echo() {
+        let mut messages = complete_messages();
+        messages[1]["result"]["approvalPolicy"] = serde_json::json!("on-request");
+        let mut transport = Transport::new(messages);
+        let cancellation = ProcessCancellation::new();
+        let error =
+            run_managed_worker_app_server_turn(&mut transport, &turn(), &command(), &cancellation)
+                .unwrap_err();
+        assert!(error.contains("thread/start"), "{error}");
+        assert!(error.contains("outside the requested ceiling"), "{error}");
+        assert!(cancellation.is_cancelled());
+        assert!(!transport.sent.iter().any(|v| v["method"] == "turn/start"));
     }
 
     fn reserve(ledger: &RunBudgetLedger) -> crate::supervise_budget::BudgetReservation {
