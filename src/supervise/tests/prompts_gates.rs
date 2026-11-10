@@ -972,6 +972,190 @@ fn gate_terminal_append_failure_retains_active_denial_without_false_outcome() {
 }
 
 #[test]
+fn gate_correction_tracker_authorizes_different_denial_with_remaining_budget() {
+    with_gate_correction_replacement_artifacts(
+        "replacement-authorized",
+        |artifacts, parent, first, second| {
+            let mut tracker = GateCorrectionTracker::new(2);
+            let mut health_signals = Vec::new();
+            assert_eq!(
+                tracker
+                    .authorize(
+                        first.clone(),
+                        artifacts,
+                        "child-a",
+                        parent,
+                        &mut health_signals
+                    )
+                    .expect("authorize first denial"),
+                Some(first.clone())
+            );
+            assert_eq!(
+                tracker
+                    .authorize(
+                        second.clone(),
+                        artifacts,
+                        "child-a",
+                        parent,
+                        &mut health_signals
+                    )
+                    .expect("authorize replacement denial"),
+                Some(second.clone())
+            );
+
+            let active = tracker.active.as_ref().expect("second denial is active");
+            assert_eq!(active.denial, second);
+            assert_eq!(active.correction_attempts, 1);
+            assert_eq!(tracker.used, 2);
+            assert_eq!(tracker.budget, 2);
+            assert_eq!(tracker.denials, vec![first.clone(), second]);
+            assert_eq!(tracker.outcomes.len(), 1);
+            assert_eq!(tracker.outcomes[0].denial_id, first.denial_id.as_str());
+            assert_eq!(
+                tracker.outcomes[0].terminal_class,
+                GateCorrectionTerminalClass::Escalated
+            );
+            assert_eq!(tracker.outcomes[0].correction_attempts, 1);
+        },
+    );
+}
+
+#[test]
+fn gate_correction_tracker_exhausts_different_denial_without_remaining_budget() {
+    with_gate_correction_replacement_artifacts(
+        "replacement-exhausted",
+        |artifacts, parent, first, second| {
+            let mut tracker = GateCorrectionTracker::new(1);
+            let mut health_signals = Vec::new();
+            assert!(tracker
+                .authorize(
+                    first.clone(),
+                    artifacts,
+                    "child-a",
+                    parent,
+                    &mut health_signals
+                )
+                .expect("authorize first denial")
+                .is_some());
+            assert_eq!(
+                tracker
+                    .authorize(
+                        second.clone(),
+                        artifacts,
+                        "child-a",
+                        parent,
+                        &mut health_signals
+                    )
+                    .expect("exhaust replacement denial"),
+                None
+            );
+
+            assert!(tracker.active.is_none());
+            assert_eq!(tracker.used, 1);
+            assert_eq!(tracker.budget, 1);
+            assert_eq!(tracker.denials, vec![first.clone(), second.clone()]);
+            assert_eq!(tracker.outcomes.len(), 2);
+            assert_eq!(tracker.outcomes[0].denial_id, first.denial_id.as_str());
+            assert_eq!(
+                tracker.outcomes[0].terminal_class,
+                GateCorrectionTerminalClass::Escalated
+            );
+            assert_eq!(tracker.outcomes[0].correction_attempts, 1);
+            assert_eq!(tracker.outcomes[1].denial_id, second.denial_id.as_str());
+            assert_eq!(
+                tracker.outcomes[1].terminal_class,
+                GateCorrectionTerminalClass::Exhausted
+            );
+            assert_eq!(tracker.outcomes[1].correction_attempts, 0);
+        },
+    );
+}
+
+#[test]
+fn gate_correction_tracker_escalates_different_denial_after_active_denial() {
+    with_gate_correction_replacement_artifacts(
+        "replacement-escalated",
+        |artifacts, parent, first, second| {
+            let mut tracker = GateCorrectionTracker::new(2);
+            let mut health_signals = Vec::new();
+            assert!(tracker
+                .authorize(
+                    first.clone(),
+                    artifacts,
+                    "child-a",
+                    parent,
+                    &mut health_signals
+                )
+                .expect("authorize first denial")
+                .is_some());
+            tracker
+                .escalate(second.clone(), artifacts, "child-a", parent)
+                .expect("escalate replacement denial");
+
+            assert!(tracker.active.is_none());
+            assert_eq!(tracker.used, 1);
+            assert_eq!(tracker.denials, vec![first.clone(), second.clone()]);
+            assert_eq!(tracker.outcomes.len(), 2);
+            assert_eq!(tracker.outcomes[0].denial_id, first.denial_id.as_str());
+            assert_eq!(tracker.outcomes[0].correction_attempts, 1);
+            assert_eq!(tracker.outcomes[1].denial_id, second.denial_id.as_str());
+            assert_eq!(tracker.outcomes[1].correction_attempts, 0);
+            assert!(tracker
+                .outcomes
+                .iter()
+                .all(|outcome| outcome.terminal_class == GateCorrectionTerminalClass::Escalated));
+        },
+    );
+}
+
+fn with_gate_correction_replacement_artifacts(
+    name: &str,
+    check: impl FnOnce(&Mutex<SharedSupervisorArtifacts<'_>>, &str, GateDenial, GateDenial),
+) {
+    let (_temp, repo_path) = injected_repository();
+    let run_id = RunId::new(name).expect("valid replacement gate run id");
+    let mut journal = Some(OrchestrationEventJournal::new(
+        "gate-replacement-test-repository",
+        run_id.as_str(),
+    ));
+    let mut writer = ArtifactRunWriter::reserve(
+        &repo_path,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "gate-replacement-test",
+    )
+    .expect("reserve replacement gate artifact run");
+    let mut autonomy_kpis = AutonomyKpiCollector::default();
+    let artifacts = Mutex::new(SharedSupervisorArtifacts {
+        writer: &mut writer,
+        journal: &mut journal,
+        autonomy_kpis: &mut autonomy_kpis,
+        checkpoint: None,
+    });
+    let denial = |blocker| {
+        GateDenial::new(
+            "gate-replacement-correlation",
+            GateDenialReason::ValidationRepair { blocker },
+            VerifiedGateContext::new(
+                "child-a",
+                GateCheckSource::Validation,
+                [PathBuf::from("README.md")],
+            )
+            .expect("construct replacement gate context"),
+        )
+        .expect("construct replacement gate denial")
+    };
+    let first = denial(GateApplyBlocker::ValidationFailed);
+    let second = denial(GateApplyBlocker::ValidationMissing);
+    assert_ne!(first.denial_id, second.denial_id);
+    assert_eq!(
+        first.correction_correlation_id,
+        second.correction_correlation_id
+    );
+    check(&artifacts, run_id.as_str(), first, second);
+}
+
+#[test]
 fn safe_claim_conflict_narrows_scope_before_child_launch() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
@@ -2135,34 +2319,15 @@ fn parent_auditor_repair_gap_resets_warning_streak_before_later_consecutive_pair
         injected_verified_run(command)
     };
 
-    let result = run_positive_gate_selected_plan(&temp, plan, options, &mut runner);
+    let report = run_positive_gate_selected_plan(&temp, plan, options, &mut runner)
+        .expect("run parent-auditor warning-streak gap");
 
-    assert_eq!(child_invocations, 3);
+    assert_eq!(child_invocations, 4);
     assert_eq!(auditor_invocations, 1);
-    match result {
-        Err(error) => {
-            let text = format!("{error:#}");
-            assert!(
-                text.contains("cannot replace active gate denial"),
-                "unexpected runner Err: {text}"
-            );
-        }
-        Ok(report) => {
-            assert!(
-                report.findings.iter().any(|finding| finding
-                    .message
-                    .contains("cannot replace active gate denial")),
-                "expected typed begin-refusal, not Narrow; findings={:?} outcomes={:?}",
-                report
-                    .findings
-                    .iter()
-                    .map(|finding| finding.message.as_str())
-                    .collect::<Vec<_>>(),
-                report.gate_correction_outcomes
-            );
-            assert!(!report.success);
-        }
-    }
+    assert!(!report.findings.iter().any(|finding| finding
+        .message
+        .contains("cannot replace active gate denial")));
+    assert!(!report.success);
 }
 
 #[test]

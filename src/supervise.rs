@@ -4840,11 +4840,12 @@ impl GateCorrectionTracker {
             if active.denial.denial_id == denial.denial_id {
                 return Ok(());
             }
-            bail!(
-                "cannot replace active gate denial {} with {} before terminal disposition",
-                active.denial.denial_id.as_str(),
-                denial.denial_id.as_str()
-            );
+            self.finish(
+                GateCorrectionTerminalClass::Escalated,
+                artifacts,
+                entity_id,
+                parent_id,
+            )?;
         }
         record_gate_correction_event(
             artifacts,
