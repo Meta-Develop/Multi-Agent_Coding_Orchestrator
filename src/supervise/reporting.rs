@@ -1684,6 +1684,26 @@ pub(super) fn report_failed<T: ReportStatus>(report: &T) -> bool {
     !report.accepted() || report.rejected() || report.status() != ReviewStatus::Succeeded
 }
 
+/// Errors and environment or sandbox failures cannot be repaired by a rerun.
+pub(super) fn command_is_repaired_by_later_success(
+    command: &CommandRunRecord,
+    later_commands: &[CommandRunRecord],
+) -> bool {
+    command.error.is_none()
+        && command.environment_failures.is_empty()
+        && command.sandbox_denials.is_empty()
+        && later_commands.iter().any(|later| {
+            later.command == command.command
+                && later.cwd.as_os_str() == command.cwd.as_os_str()
+                && later.status == ReviewStatus::Succeeded
+                && later.exit_code == Some(0)
+                && !later.timed_out
+                && later.error.is_none()
+                && later.environment_failures.is_empty()
+                && later.sandbox_denials.is_empty()
+        })
+}
+
 /// Technical completion is independent of the Worker's self-reported acceptance.
 /// Exceptions require the supervisor's reconciled licensed-failure records.
 pub(super) fn worker_technical_failure(
@@ -1723,16 +1743,10 @@ pub(super) fn worker_technical_failure(
                                 command.stdout.contains(&failure.failure_signature)
                                     || command.stderr.contains(&failure.failure_signature)
                             })))
-                        && !worker.commands_run[index + 1..].iter().any(|later| {
-                            later.command == command.command
-                                && later.cwd.as_os_str() == command.cwd.as_os_str()
-                                && later.status == ReviewStatus::Succeeded
-                                && later.exit_code == Some(0)
-                                && !later.timed_out
-                                && later.error.is_none()
-                                && later.environment_failures.is_empty()
-                                && later.sandbox_denials.is_empty()
-                        }))
+                        && !command_is_repaired_by_later_success(
+                            command,
+                            &worker.commands_run[index + 1..],
+                        ))
             })
         || worker.findings.iter().any(|finding| {
             finding.severity == FindingSeverity::Error && !licensed_signature(&finding.message)

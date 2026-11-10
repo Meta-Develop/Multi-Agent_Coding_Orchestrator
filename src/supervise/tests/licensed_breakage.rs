@@ -1461,6 +1461,216 @@ fn undeclared_breakage_keeps_validation_gate_failure_and_generates_nothing() {
 }
 
 #[test]
+fn licensed_repaired_command_baseline_has_licensed_failures() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let mut report = worker_dependent_failure_child(&assignment);
+
+    prepare_licensed_breakage_review(&assignment, &mut report);
+
+    assert!(report
+        .licensed_breakage_review
+        .as_ref()
+        .is_some_and(|review| !review.failures.is_empty()));
+}
+
+#[test]
+fn licensed_repaired_command_later_identical_clean_success_preserves_license() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let clean = injected_command_record();
+    for in_worker in [true, false] {
+        for timed_out in [false, true] {
+            let mut report = worker_dependent_failure_child(&assignment);
+            let mut failed = clean.clone();
+            failed.status = ReviewStatus::Failed;
+            failed.exit_code = Some(1);
+            failed.timed_out = timed_out;
+            failed.stderr = "unrelated command failure".into();
+            let commands = vec![failed, clean.clone()];
+            if in_worker {
+                report.worker_reports[0].commands_run = commands;
+            } else {
+                report.commands_run = commands;
+            }
+
+            prepare_licensed_breakage_review(&assignment, &mut report);
+
+            assert!(report
+                .licensed_breakage_review
+                .as_ref()
+                .is_some_and(|review| !review.failures.is_empty()));
+        }
+    }
+}
+
+#[test]
+fn licensed_repaired_command_requires_later_matching_command_and_cwd() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let clean = injected_command_record();
+    let mut failed = clean.clone();
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    failed.stderr = "unrelated command failure".into();
+    let mut different_command = clean.clone();
+    different_command.command.push("different-argument".into());
+    let mut different_cwd = clean.clone();
+    different_cwd.cwd = PathBuf::from("other-directory");
+    let mut differently_spelled_cwd = clean.clone();
+    differently_spelled_cwd.cwd = PathBuf::from("./.");
+    for commands in [
+        vec![failed.clone()],
+        vec![failed.clone(), different_command],
+        vec![failed.clone(), different_cwd],
+        vec![failed.clone(), differently_spelled_cwd],
+        vec![clean.clone(), failed.clone()],
+        vec![failed.clone(), clean, failed],
+    ] {
+        let mut report = worker_dependent_failure_child(&assignment);
+        report.worker_reports[0].commands_run = commands;
+
+        prepare_licensed_breakage_review(&assignment, &mut report);
+
+        assert!(report
+            .licensed_breakage_review
+            .as_ref()
+            .is_some_and(|review| review.failures.is_empty()));
+    }
+}
+
+#[test]
+fn licensed_repaired_command_requires_clean_rerun() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let clean = injected_command_record();
+    let mut failed = clean.clone();
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    failed.stderr = "unrelated command failure".into();
+    for cause in [
+        "status",
+        "exit",
+        "missing-exit",
+        "timeout",
+        "error",
+        "environment",
+        "sandbox",
+    ] {
+        let mut unclean = clean.clone();
+        match cause {
+            "status" => unclean.status = ReviewStatus::Failed,
+            "exit" => unclean.exit_code = Some(1),
+            "missing-exit" => unclean.exit_code = None,
+            "timeout" => unclean.timed_out = true,
+            "error" => unclean.error = Some("fixture error".into()),
+            "environment" => unclean
+                .environment_failures
+                .push(EnvironmentFailure::probe_failed("fixture failure".into())),
+            "sandbox" => unclean.sandbox_denials.push(denial_fixture(
+                SandboxDenialBoundary::InnerCodex,
+                "maco_external_codex_inner_v1",
+                Some("AGENTS.md"),
+                SandboxDenialRetryability::RequiresDeclaredException,
+            )),
+            _ => unreachable!(),
+        }
+        let mut report = worker_dependent_failure_child(&assignment);
+        report.worker_reports[0].commands_run = vec![failed.clone(), unclean];
+
+        prepare_licensed_breakage_review(&assignment, &mut report);
+
+        assert!(
+            report
+                .licensed_breakage_review
+                .as_ref()
+                .is_some_and(|review| review.failures.is_empty()),
+            "{cause}"
+        );
+    }
+}
+
+#[test]
+fn licensed_repaired_command_does_not_excuse_error_environment_or_sandbox_failure() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let clean = injected_command_record();
+    for cause in ["error", "environment", "sandbox"] {
+        let mut failed = clean.clone();
+        failed.status = ReviewStatus::Failed;
+        failed.exit_code = Some(1);
+        failed.stderr = "unrelated command failure".into();
+        match cause {
+            "error" => failed.error = Some("fixture error".into()),
+            "environment" => failed
+                .environment_failures
+                .push(EnvironmentFailure::probe_failed("fixture failure".into())),
+            "sandbox" => failed.sandbox_denials.push(denial_fixture(
+                SandboxDenialBoundary::InnerCodex,
+                "maco_external_codex_inner_v1",
+                Some("AGENTS.md"),
+                SandboxDenialRetryability::RequiresDeclaredException,
+            )),
+            _ => unreachable!(),
+        }
+        let mut report = worker_dependent_failure_child(&assignment);
+        report.worker_reports[0].commands_run = vec![failed, clean.clone()];
+
+        prepare_licensed_breakage_review(&assignment, &mut report);
+
+        assert!(
+            report
+                .licensed_breakage_review
+                .as_ref()
+                .is_some_and(|review| review.failures.is_empty()),
+            "{cause}"
+        );
+    }
+}
+
+#[test]
+fn licensed_repaired_command_does_not_match_across_report_lists() {
+    let mut assignment = licensed_assignment();
+    assignment.worker_assignments = injected_assignment(true).worker_assignments;
+    let clean = injected_command_record();
+    let mut failed = clean.clone();
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    failed.stderr = "unrelated command failure".into();
+    for placement in ["report-to-worker", "worker-to-report", "worker-to-worker"] {
+        let mut report = worker_dependent_failure_child(&assignment);
+        match placement {
+            "report-to-worker" => {
+                report.commands_run = vec![failed.clone()];
+                report.worker_reports[0].commands_run = vec![clean.clone()];
+            }
+            "worker-to-report" => {
+                report.worker_reports[0].commands_run = vec![failed.clone()];
+                report.commands_run = vec![clean.clone()];
+            }
+            "worker-to-worker" => {
+                report.worker_reports[0].commands_run = vec![failed.clone()];
+                let mut sibling = report.worker_reports[0].clone();
+                sibling.id = "sibling-worker".into();
+                sibling.commands_run = vec![clean.clone()];
+                report.worker_reports.push(sibling);
+            }
+            _ => unreachable!(),
+        }
+
+        prepare_licensed_breakage_review(&assignment, &mut report);
+
+        assert!(
+            report
+                .licensed_breakage_review
+                .as_ref()
+                .is_some_and(|review| review.failures.is_empty()),
+            "{placement}"
+        );
+    }
+}
+
+#[test]
 fn undeclared_attribution_guard_is_directly_fail_capable() {
     let assignment = injected_assignment(false);
     let mut report = dependent_failure_child(&assignment, "src/client.rs");
