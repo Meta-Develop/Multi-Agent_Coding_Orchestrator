@@ -391,6 +391,58 @@ impl Drop for SystemdUnitPermit {
     }
 }
 
+// Fixed candidate order shared by strict containment and the read-only doctor.
+pub(crate) const STRICT_CONTAINMENT_HELPERS: [(&str, &[&str]); 7] = [
+    (
+        "systemd-run",
+        &[
+            "/usr/bin/systemd-run",
+            "/bin/systemd-run",
+            "/run/current-system/sw/bin/systemd-run",
+        ],
+    ),
+    (
+        "sh",
+        &["/bin/sh", "/usr/bin/sh", "/run/current-system/sw/bin/sh"],
+    ),
+    (
+        "systemctl",
+        &[
+            "/usr/bin/systemctl",
+            "/bin/systemctl",
+            "/run/current-system/sw/bin/systemctl",
+        ],
+    ),
+    (
+        "env",
+        &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
+    ),
+    (
+        "sleep",
+        &[
+            "/usr/bin/sleep",
+            "/bin/sleep",
+            "/run/current-system/sw/bin/sleep",
+        ],
+    ),
+    (
+        "stat",
+        &[
+            "/usr/bin/stat",
+            "/bin/stat",
+            "/run/current-system/sw/bin/stat",
+        ],
+    ),
+    (
+        "findmnt",
+        &[
+            "/usr/bin/findmnt",
+            "/bin/findmnt",
+            "/run/current-system/sw/bin/findmnt",
+        ],
+    ),
+];
+
 #[cfg(target_os = "linux")]
 impl SystemdUnit {
     fn prepare(
@@ -410,12 +462,8 @@ impl SystemdUnit {
         let permit = SystemdUnitPermit::acquire(&client_runtime, operation_deadline, cancellation)?;
         timings.enter("containment_preparation", Instant::now());
         let systemd_run = find_trusted_unix_executable(
-            "systemd-run",
-            &[
-                "/usr/bin/systemd-run",
-                "/bin/systemd-run",
-                "/run/current-system/sw/bin/systemd-run",
-            ],
+            STRICT_CONTAINMENT_HELPERS[0].0,
+            STRICT_CONTAINMENT_HELPERS[0].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -424,8 +472,8 @@ impl SystemdUnit {
             )
         })?;
         let shell = find_trusted_unix_executable(
-            "sh",
-            &["/bin/sh", "/usr/bin/sh", "/run/current-system/sw/bin/sh"],
+            STRICT_CONTAINMENT_HELPERS[1].0,
+            STRICT_CONTAINMENT_HELPERS[1].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -434,12 +482,8 @@ impl SystemdUnit {
             )
         })?;
         let systemctl = find_trusted_unix_executable(
-            "systemctl",
-            &[
-                "/usr/bin/systemctl",
-                "/bin/systemctl",
-                "/run/current-system/sw/bin/systemctl",
-            ],
+            STRICT_CONTAINMENT_HELPERS[2].0,
+            STRICT_CONTAINMENT_HELPERS[2].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -448,8 +492,8 @@ impl SystemdUnit {
             )
         })?;
         let env_program = find_trusted_unix_executable(
-            "env",
-            &["/usr/bin/env", "/bin/env", "/run/current-system/sw/bin/env"],
+            STRICT_CONTAINMENT_HELPERS[3].0,
+            STRICT_CONTAINMENT_HELPERS[3].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -458,12 +502,8 @@ impl SystemdUnit {
             )
         })?;
         let sleep_program = find_trusted_unix_executable(
-            "sleep",
-            &[
-                "/usr/bin/sleep",
-                "/bin/sleep",
-                "/run/current-system/sw/bin/sleep",
-            ],
+            STRICT_CONTAINMENT_HELPERS[4].0,
+            STRICT_CONTAINMENT_HELPERS[4].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -472,12 +512,8 @@ impl SystemdUnit {
             )
         })?;
         let stat_program = find_trusted_unix_executable(
-            "stat",
-            &[
-                "/usr/bin/stat",
-                "/bin/stat",
-                "/run/current-system/sw/bin/stat",
-            ],
+            STRICT_CONTAINMENT_HELPERS[5].0,
+            STRICT_CONTAINMENT_HELPERS[5].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -486,12 +522,8 @@ impl SystemdUnit {
             )
         })?;
         let findmnt_program = find_trusted_unix_executable(
-            "findmnt",
-            &[
-                "/usr/bin/findmnt",
-                "/bin/findmnt",
-                "/run/current-system/sw/bin/findmnt",
-            ],
+            STRICT_CONTAINMENT_HELPERS[6].0,
+            STRICT_CONTAINMENT_HELPERS[6].1,
         )
         .ok_or_else(|| {
             std::io::Error::new(
@@ -1977,7 +2009,7 @@ fn systemd_user_manager_cgroup() -> std::io::Result<PathBuf> {
 }
 
 #[cfg(target_os = "linux")]
-fn delegated_systemd_user_manager_cgroup(contents: &str) -> std::io::Result<PathBuf> {
+pub(crate) fn delegated_systemd_user_manager_cgroup(contents: &str) -> std::io::Result<PathBuf> {
     let current = contents
         .lines()
         .find_map(|line| line.strip_prefix("0::"))

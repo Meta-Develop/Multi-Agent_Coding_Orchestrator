@@ -10,6 +10,31 @@ use super::*;
 
 static MERGE_LOCAL_GIT_TIMEOUT_ENVIRONMENT_LOCK: Mutex<()> = Mutex::new(());
 
+#[test]
+fn doctor_parses_default_arguments() {
+    let cli = Cli::try_parse_from(["maco", "doctor"]).unwrap();
+    let Command::Doctor(args) = cli.command else {
+        panic!("expected doctor command");
+    };
+    assert_eq!(args.repo, PathBuf::from("."));
+    assert!(!args.json);
+}
+
+#[test]
+fn doctor_parses_repo_and_json() {
+    let cli = Cli::try_parse_from(["maco", "doctor", "--repo", "X", "--json"]).unwrap();
+    let Command::Doctor(args) = cli.command else {
+        panic!("expected doctor command");
+    };
+    assert_eq!(args.repo, PathBuf::from("X"));
+    assert!(args.json);
+}
+
+#[test]
+fn doctor_rejects_unknown_flag() {
+    assert!(Cli::try_parse_from(["maco", "doctor", "--unknown"]).is_err());
+}
+
 #[cfg(unix)]
 #[test]
 fn documented_grok_diagnostic_preserves_confinement_and_reports_observed_startup_stages() {
