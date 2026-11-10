@@ -12,7 +12,8 @@ const WORKER_PROMPT_FIXTURE_CEILING_BYTES: usize = 15 * 512;
 // raising it is a deliberate prompt-cost decision about the multiplied worker-template cost.
 // Raised from 21 KiB when the Worker contracts gained the cumulative files_changed rule
 // and the repaired-command rule.
-const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 22 * 1024;
+// Raised from 22 KiB when the embedded auditor gained the parent-delegated validation rule.
+const CHILD_ORCHESTRATOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 23 * 1024;
 // Cost decision: 4 KiB permits the advisory child-side audit contract and a small fixed margin;
 // raising it is a deliberate prompt-cost decision, never an automatic fixture update.
 const REVIEW_AUDITOR_PROMPT_FIXTURE_CEILING_BYTES: usize = 4 * 1024;
@@ -25,6 +26,7 @@ const TOOL_CALL_BATCHING_GUIDANCE: &str = "\
 Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
+const PARENT_DELEGATED_VALIDATION_RULE: &str = "- Validation the assignment objective explicitly delegates to the parent or hosted CI because it cannot run in the Worker sandbox is not missing Worker evidence: do not reject its absence; record it once in remaining_risk as a parent follow-up. Undelegated validation the Worker skipped, excluded or failed is still missing evidence.";
 
 #[cfg(test)]
 fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
@@ -395,9 +397,11 @@ Rules:
 - Include "no_further_delegation": true in AuditorReport JSON to attest this terminal auditor did not delegate further.
 - Include "read_only": true in AuditorReport JSON to attest this audit stayed read-only.
 - Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the implementation must change, or rejection_kind="evidence_quality" only when validation/report evidence alone must be corrected.
+{parent_delegated_validation_rule}
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 "#,
-        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
+        parent_delegated_validation_rule = PARENT_DELEGATED_VALIDATION_RULE
     )
 }
 
@@ -424,12 +428,14 @@ Review requirements:
 - reviewed_paths coverage is computed over repository-relative entries only. Absolute out-of-repo evidence paths are allowed and retained verbatim as evidence, but excluded from coverage computation.
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the preserved implementation must change, or rejection_kind="evidence_quality" only when the implementation is sound and validation/report evidence alone must be corrected.
+{parent_delegated_validation_rule}
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - If the child report contains licensed_breakage_review, verify that every failed validation is attributable to its exact named dependent, path, and interface scope and that the migration rationale is adequate. Accepting that license requires one succeeded validation_results entry whose name is "licensed_breakage_declaration" and whose message is the exact declaration_sha256. Omitting or changing that marker refuses the license and must reject the report.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 "#,
-        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE
+        tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
+        parent_delegated_validation_rule = PARENT_DELEGATED_VALIDATION_RULE
     )
 }
 
