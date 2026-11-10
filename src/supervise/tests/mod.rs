@@ -1592,6 +1592,73 @@ fn retain_priced_single_turn_fixture(
     run.retain_cli_parent_evidence_for_test(complete_capture);
 }
 
+fn injected_managed_child_git_command(
+    cwd: &Path,
+    private_git_dir: &Path,
+    private_object_dir: &Path,
+    shared_object_dir: &Path,
+) -> std::process::Command {
+    let mut process = std::process::Command::new("git");
+    process
+        .current_dir(cwd)
+        .env("GIT_DIR", private_git_dir)
+        .env("GIT_WORK_TREE", cwd)
+        .env("GIT_OBJECT_DIRECTORY", private_object_dir)
+        .env("GIT_ALTERNATE_OBJECT_DIRECTORIES", shared_object_dir)
+        // Without COUNT, inherited GIT_CONFIG_KEY_<n>/VALUE_<n> entries are inert.
+        .env_remove("GIT_CONFIG_COUNT")
+        .env_remove("GIT_CONFIG_PARAMETERS")
+        .env("GIT_CONFIG_GLOBAL", "/dev/null")
+        .env("GIT_CONFIG_NOSYSTEM", "1")
+        .env("GIT_AUTHOR_NAME", "maco test")
+        .env("GIT_AUTHOR_EMAIL", "maco-test@example.invalid")
+        .env("GIT_COMMITTER_NAME", "maco test")
+        .env("GIT_COMMITTER_EMAIL", "maco-test@example.invalid");
+    process
+}
+
+#[test]
+fn injected_managed_child_git_ignores_inherited_config() {
+    use std::ffi::OsStr;
+
+    let cwd = Path::new("/fixture/worktree");
+    let private_git_dir = Path::new("/fixture/private-git");
+    let private_object_dir = Path::new("/fixture/private-objects");
+    let shared_object_dir = Path::new("/fixture/shared-objects");
+    let process = injected_managed_child_git_command(
+        cwd,
+        private_git_dir,
+        private_object_dir,
+        shared_object_dir,
+    );
+    let envs = process.get_envs().collect::<BTreeMap<_, _>>();
+    for key in ["GIT_CONFIG_COUNT", "GIT_CONFIG_PARAMETERS"] {
+        assert_eq!(envs.get(OsStr::new(key)), Some(&None), "{key}");
+    }
+    for (key, value) in [
+        ("GIT_DIR", private_git_dir.as_os_str()),
+        ("GIT_WORK_TREE", cwd.as_os_str()),
+        ("GIT_OBJECT_DIRECTORY", private_object_dir.as_os_str()),
+        (
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+            shared_object_dir.as_os_str(),
+        ),
+        ("GIT_CONFIG_GLOBAL", OsStr::new("/dev/null")),
+        ("GIT_CONFIG_NOSYSTEM", OsStr::new("1")),
+        ("GIT_AUTHOR_NAME", OsStr::new("maco test")),
+        ("GIT_AUTHOR_EMAIL", OsStr::new("maco-test@example.invalid")),
+        ("GIT_COMMITTER_NAME", OsStr::new("maco test")),
+        (
+            "GIT_COMMITTER_EMAIL",
+            OsStr::new("maco-test@example.invalid"),
+        ),
+    ] {
+        assert_eq!(envs.get(OsStr::new(key)), Some(&Some(value)), "{key}");
+    }
+    assert_eq!(process.get_program(), OsStr::new("git"));
+    assert_eq!(process.get_current_dir(), Some(cwd));
+}
+
 fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
     if command.workspace_access != WorkspaceAccess::ReadWrite
         || command.writable_launch_target
@@ -1611,23 +1678,12 @@ fn commit_injected_managed_child_result(command: &ExternalAgentCommand) {
     let boundary = crate::external_agent::bind_existing_managed_child_git_boundary(&command.cwd)
         .expect("bind injected managed-child private Git boundary");
     let git = || {
-        let mut process = std::process::Command::new("git");
-        process
-            .current_dir(&command.cwd)
-            .env("GIT_DIR", boundary.private_git_dir())
-            .env("GIT_WORK_TREE", &command.cwd)
-            .env("GIT_OBJECT_DIRECTORY", boundary.private_object_dir())
-            .env(
-                "GIT_ALTERNATE_OBJECT_DIRECTORIES",
-                boundary.shared_object_dir(),
-            )
-            .env("GIT_CONFIG_GLOBAL", "/dev/null")
-            .env("GIT_CONFIG_NOSYSTEM", "1")
-            .env("GIT_AUTHOR_NAME", "maco test")
-            .env("GIT_AUTHOR_EMAIL", "maco-test@example.invalid")
-            .env("GIT_COMMITTER_NAME", "maco test")
-            .env("GIT_COMMITTER_EMAIL", "maco-test@example.invalid");
-        process
+        injected_managed_child_git_command(
+            &command.cwd,
+            boundary.private_git_dir(),
+            boundary.private_object_dir(),
+            boundary.shared_object_dir(),
+        )
     };
 
     let add = git()
