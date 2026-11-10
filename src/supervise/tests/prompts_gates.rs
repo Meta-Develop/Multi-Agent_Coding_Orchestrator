@@ -673,7 +673,10 @@ fn admitted_direct_worker_prompt_has_leaf_authority_and_exact_scope() {
         prompt.clone(),
     ] {
         assert!(contract.contains("- files_changed lists every path the cumulative candidate changes against the assignment base, including changes kept from an earlier attempt of this assignment."));
-        assert!(contract.contains("- A command that failed or timed out counts against the assignment unless that identical command from the same directory later succeeds, so after a repair run the identical command again."));
+        assert!(contract.contains("- Any commands_run entry with non-null error, nonempty environment_failures or nonempty sandbox_denials fails the report regardless of later success. Use error only when a command could not run; leave it null when a command ran and exited nonzero."));
+        assert!(contract.contains("- A commands_run entry that failed, timed out or exited nonzero fails the report unless a later entry runs the identical command from the same directory and finishes cleanly; after a repair run the identical command again. Read, search and other inspection commands count too; make them exit 0 (e.g. end searches that may find nothing with || true)."));
+        assert!(contract.contains("- Any validation_results entry that did not succeed fails the report; report the final run of each validation."));
+        assert!(contract.contains("- Any finding with severity error fails the report; use severity error only for a problem that remains."));
     }
 
     assert!(prompt.contains("admitted direct terminal worker"));
