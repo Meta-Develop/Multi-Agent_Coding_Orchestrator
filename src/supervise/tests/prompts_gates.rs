@@ -1,5 +1,76 @@
 use super::*;
 
+const EXPECTED_PARENT_DELEGATED_VALIDATION_RULE: &str = "- Validation the assignment objective explicitly delegates to the parent or hosted CI because it cannot run in the Worker sandbox is not missing Worker evidence: do not reject its absence; record it once in remaining_risk as a parent follow-up. Undelegated validation the Worker skipped, excluded or failed is still missing evidence.";
+
+#[test]
+fn auditor_prefixes_include_parent_delegated_validation_exactly_once() {
+    for prefix in [
+        review_auditor_cacheable_prefix(),
+        parent_review_auditor_cacheable_prefix(),
+    ] {
+        assert_eq!(
+            prefix
+                .matches(EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
+                .count(),
+            1,
+            "each auditor prefix must carry the complete shared validation rule once"
+        );
+        let rejection_rule = prefix
+            .lines()
+            .position(|line| line.starts_with("- Set rejection_kind="))
+            .expect("rejection classification rule");
+        assert_eq!(
+            prefix.lines().nth(rejection_rule + 1),
+            Some(EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
+        );
+    }
+}
+
+#[test]
+fn review_lens_prompt_includes_parent_delegated_validation() -> Result<()> {
+    let assignment = injected_assignment(true);
+    let lens = ReviewLensConfig {
+        id: "delegated-validation".to_string(),
+        backend: ReviewLensBackendConfig::Model {
+            backend_id: "provider-alpha".to_string(),
+            model: "model-alpha".to_string(),
+            model_provider: None,
+            reasoning_effort: Some("high".to_string()),
+        },
+        information_scope: ReviewInformationScope::DiffOnly,
+    };
+    let request = build_review_lens_request(
+        &lens,
+        ReviewLensRequestSources {
+            child_transcript: "bounded transcript",
+            diff: "+bounded change",
+            output_report: "bounded report",
+        },
+    )?;
+    let coverage = ReviewCoverageRequirement {
+        worker_ids: vec![assignment.worker_assignments[0].id.clone()],
+        paths: assignment.assigned_paths.clone(),
+    };
+    let rendered = render_review_lens_auditor_prompt(
+        ReviewLensAuditorPromptContext {
+            assignment: &assignment,
+            lens: &lens,
+            resolved_reasoning_effort: None,
+            request: &request,
+            required_coverage: &coverage,
+        },
+        0,
+    )?;
+    assert_eq!(
+        rendered
+            .prompt
+            .matches(EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
+            .count(),
+        1
+    );
+    Ok(())
+}
+
 fn auditor_findings_json(block: &str) -> Vec<Value> {
     block
         .split_once("```json\n")
