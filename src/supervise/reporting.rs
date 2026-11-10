@@ -63,7 +63,36 @@ pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport)
             }
         }
     }
-    if !report.environment_failures.is_empty() || !report.gate_denials.is_empty() {
+    let mut gate_outcomes = BTreeMap::new();
+    for outcome in &report.gate_correction_outcomes {
+        let entry = gate_outcomes
+            .entry(outcome.denial_id.as_str())
+            .or_insert((true, 0));
+        entry.0 &= outcome.terminal_class == GateCorrectionTerminalClass::SelfCorrected;
+        entry.1 = outcome.correction_attempts;
+    }
+    let mut unresolved_denials = Vec::new();
+    let mut resolved_denials = Vec::new();
+    let mut resolved_ids = BTreeSet::new();
+    for denial in &report.gate_denials {
+        let id = denial.denial_id.as_str();
+        if let Some((true, attempts)) = gate_outcomes.get(id) {
+            if resolved_ids.insert(id) {
+                resolved_denials.push((denial, attempts));
+            }
+        } else {
+            unresolved_denials.push(denial);
+        }
+    }
+    let error_findings = report
+        .findings
+        .iter()
+        .filter(|finding| finding.severity == FindingSeverity::Error)
+        .collect::<Vec<_>>();
+    if !report.environment_failures.is_empty()
+        || !unresolved_denials.is_empty()
+        || !error_findings.is_empty()
+    {
         lines.push(String::new());
         lines.push("## Failures".to_string());
         lines.push(String::new());
@@ -71,8 +100,24 @@ pub(super) fn render_supervisor_operator_summary(report: &SupervisorFinalReport)
             let failure = sanitize_environment_failure(failure.clone());
             lines.push(format!("- environment: {}", failure.summary));
         }
-        for denial in &report.gate_denials {
+        for denial in unresolved_denials {
             lines.push(format!("- gate: {}", denial.denial_id.as_str()));
+        }
+        for finding in error_findings {
+            let message = sanitize_report_diagnostic(&finding.message)
+                .unwrap_or_else(|| "<no message>".to_string());
+            lines.push(format!("- finding: {message}"));
+        }
+    }
+    if !resolved_denials.is_empty() {
+        lines.push(String::new());
+        lines.push("## Resolved gate denials".to_string());
+        lines.push(String::new());
+        for (denial, attempts) in resolved_denials {
+            lines.push(format!(
+                "- gate: {} (self-corrected; correction attempts: {attempts})",
+                denial.denial_id.as_str()
+            ));
         }
     }
     lines.push(String::new());
@@ -1201,6 +1246,10 @@ fn sanitize_environment_failure_diagnostic(
         .strip_prefix(canonical_summary)
         .map(|suffix| suffix.strip_prefix(": ").unwrap_or(suffix))
         .unwrap_or(summary);
+    sanitize_report_diagnostic(diagnostic)
+}
+
+fn sanitize_report_diagnostic(diagnostic: &str) -> Option<String> {
     let diagnostic = diagnostic
         .chars()
         .map(|character| match character {

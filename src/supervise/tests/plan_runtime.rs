@@ -1,5 +1,219 @@
 use super::*;
 
+fn operator_summary_report() -> SupervisorFinalReport {
+    serde_json::from_str(include_str!(
+        "../../../fixtures/schemas/supervisor-final-report-v1.valid.json"
+    ))
+    .unwrap()
+}
+
+fn operator_summary_denial(name: &str) -> GateDenial {
+    GateDenial::from_claim_conflict(name, name, ["src/lib.rs"]).unwrap()
+}
+
+fn operator_summary_outcome(
+    denial: &GateDenial,
+    terminal_class: GateCorrectionTerminalClass,
+    correction_attempts: u8,
+) -> GateCorrectionOutcomeRecord {
+    GateCorrectionOutcomeRecord {
+        denial_id: denial.denial_id.as_str().to_string(),
+        correction_correlation_id: denial.correction_correlation_id.as_str().to_string(),
+        route: denial.route,
+        terminal_class,
+        correction_attempts,
+    }
+}
+
+#[test]
+fn operator_summary_resolved_denials_are_unique_ordered_and_use_last_attempts() {
+    let mut report = operator_summary_report();
+    let first = operator_summary_denial("first");
+    let second = operator_summary_denial("second");
+    report.gate_denials = vec![first.clone(), second.clone(), first.clone()];
+    report.gate_correction_outcomes = vec![
+        operator_summary_outcome(&second, GateCorrectionTerminalClass::SelfCorrected, 2),
+        operator_summary_outcome(&first, GateCorrectionTerminalClass::SelfCorrected, 1),
+        operator_summary_outcome(&first, GateCorrectionTerminalClass::SelfCorrected, 3),
+    ];
+
+    let summary = render_supervisor_operator_summary(&report);
+    assert!(!summary.contains("## Failures"));
+    let resolved = summary
+        .split_once("## Resolved gate denials\n\n")
+        .unwrap()
+        .1
+        .split_once("\n\n## Remaining risk")
+        .unwrap()
+        .0;
+    assert_eq!(
+        resolved,
+        format!(
+            "- gate: {} (self-corrected; correction attempts: 3)\n- gate: {} (self-corrected; correction attempts: 2)",
+            first.denial_id.as_str(),
+            second.denial_id.as_str()
+        )
+    );
+}
+
+#[test]
+fn operator_summary_unresolved_denials_remain_failures() {
+    let mut report = operator_summary_report();
+    let exhausted = operator_summary_denial("exhausted");
+    let escalated = operator_summary_denial("escalated");
+    let no_outcome = operator_summary_denial("no-outcome");
+    let mixed = operator_summary_denial("mixed");
+    let mixed_reversed = operator_summary_denial("mixed-reversed");
+    report.gate_denials = vec![
+        exhausted.clone(),
+        escalated.clone(),
+        no_outcome,
+        mixed.clone(),
+        mixed_reversed.clone(),
+    ];
+    report.gate_correction_outcomes = vec![
+        operator_summary_outcome(&exhausted, GateCorrectionTerminalClass::Exhausted, 2),
+        operator_summary_outcome(&escalated, GateCorrectionTerminalClass::Escalated, 1),
+        operator_summary_outcome(&mixed, GateCorrectionTerminalClass::SelfCorrected, 1),
+        operator_summary_outcome(&mixed, GateCorrectionTerminalClass::Exhausted, 2),
+        operator_summary_outcome(&mixed_reversed, GateCorrectionTerminalClass::Exhausted, 2),
+        operator_summary_outcome(
+            &mixed_reversed,
+            GateCorrectionTerminalClass::SelfCorrected,
+            1,
+        ),
+    ];
+
+    let summary = render_supervisor_operator_summary(&report);
+    assert!(!summary.contains("## Resolved gate denials"));
+    let failures = summary
+        .split_once("## Failures\n\n")
+        .unwrap()
+        .1
+        .split_once("\n\n## Remaining risk")
+        .unwrap()
+        .0;
+    assert_eq!(
+        failures,
+        report
+            .gate_denials
+            .iter()
+            .map(|denial| format!("- gate: {}", denial.denial_id.as_str()))
+            .collect::<Vec<_>>()
+            .join("\n")
+    );
+}
+
+#[test]
+fn operator_summary_error_findings_follow_environment_and_gates_in_report_order() {
+    let mut report = operator_summary_report();
+    let unresolved = operator_summary_denial("unresolved");
+    let resolved = operator_summary_denial("resolved");
+    report.gate_denials = vec![resolved.clone(), unresolved.clone()];
+    report.gate_correction_outcomes = vec![operator_summary_outcome(
+        &resolved,
+        GateCorrectionTerminalClass::SelfCorrected,
+        1,
+    )];
+    report.environment_failures = vec![EnvironmentFailure::runtime_model_catalog(
+        "catalog unavailable".to_string(),
+    )];
+    report.findings = [
+        (FindingSeverity::Warning, "warning omitted"),
+        (FindingSeverity::Error, "first error"),
+        (FindingSeverity::Info, "info omitted"),
+        (FindingSeverity::Error, "second error"),
+    ]
+    .into_iter()
+    .map(|(severity, message)| Finding {
+        severity,
+        message: message.to_string(),
+        paths: Vec::new(),
+    })
+    .collect();
+
+    let summary = render_supervisor_operator_summary(&report);
+    let failures = summary
+        .split_once("## Failures\n\n")
+        .unwrap()
+        .1
+        .split_once("\n\n## Resolved gate denials")
+        .unwrap()
+        .0;
+    assert_eq!(
+        failures,
+        format!(
+            "- environment: environment preflight reported runtime_model_catalog_unavailable: catalog unavailable\n- gate: {}\n- finding: first error\n- finding: second error",
+            unresolved.denial_id.as_str()
+        )
+    );
+    assert!(!summary.contains("warning omitted"));
+    assert!(!summary.contains("info omitted"));
+    assert!(summary.contains(&format!(
+        "- gate: {} (self-corrected; correction attempts: 1)\n\n## Remaining risk",
+        resolved.denial_id.as_str()
+    )));
+}
+
+#[test]
+fn operator_summary_findings_are_redacted_single_line_bounded_and_nonempty() {
+    let mut report = operator_summary_report();
+    let secret = "FINDING_SECRET_MARKER_83";
+    report.findings = [
+        format!("first line\r\nAPI_TOKEN={secret}\nlast\tline\u{0000}"),
+        "\r\n\t\u{0000}".to_string(),
+        "é".repeat(MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS + 1),
+    ]
+    .into_iter()
+    .map(|message| Finding {
+        severity: FindingSeverity::Error,
+        message,
+        paths: Vec::new(),
+    })
+    .collect();
+
+    let summary = render_supervisor_operator_summary(&report);
+    assert!(summary.contains("## Failures"));
+    assert!(!summary.contains(secret));
+    assert!(!summary
+        .chars()
+        .any(|character| { character.is_control() && character != '\n' }));
+    let messages = summary
+        .lines()
+        .filter_map(|line| line.strip_prefix("- finding: "))
+        .collect::<Vec<_>>();
+    assert_eq!(messages.len(), 3);
+    assert_eq!(
+        messages[0],
+        "first line API_TOKEN <redacted:secret> last line"
+    );
+    assert_eq!(messages[1], "<no message>");
+    assert_eq!(
+        messages[2].chars().count(),
+        MAX_ENVIRONMENT_FAILURE_DIAGNOSTIC_CHARS
+    );
+    assert!(messages[2].ends_with(ENVIRONMENT_FAILURE_DIAGNOSTIC_TRUNCATION_MARKER));
+    assert!(!summary.contains("## Resolved gate denials"));
+}
+
+#[test]
+fn operator_summary_without_failures_omits_both_sections() {
+    let mut report = operator_summary_report();
+    report.findings = [FindingSeverity::Warning, FindingSeverity::Info]
+        .into_iter()
+        .map(|severity| Finding {
+            severity,
+            message: "non-error finding".to_string(),
+            paths: Vec::new(),
+        })
+        .collect();
+
+    let summary = render_supervisor_operator_summary(&report);
+    assert!(!summary.contains("## Failures"));
+    assert!(!summary.contains("## Resolved gate denials"));
+    assert!(!summary.contains("- finding:"));
+}
+
 fn operator_pricing_fields(value: &Value) -> Value {
     Value::Object(
         [
