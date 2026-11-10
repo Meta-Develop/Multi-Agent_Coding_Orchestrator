@@ -271,6 +271,9 @@ fn load_or_create_remote_binding_secret(state_directory: &Path) -> Result<Zeroiz
                         }
                     }
                     sync_journal_directory(state_directory)?;
+                } else {
+                    #[cfg(unix)]
+                    require_publication_temp_absent(&temporary_path)?;
                 }
                 read_remote_binding_secret(&path)
             }
@@ -297,13 +300,57 @@ enum RemoteBindingSecretPublish {
     Existing,
 }
 
+// Returns whether publication left a hard-linked temp that needs removal.
+#[cfg(unix)]
+fn publish_publication_file_no_replace(
+    temporary_path: &Path,
+    final_path: &Path,
+) -> std::io::Result<bool> {
+    #[cfg(target_os = "linux")]
+    {
+        use std::{ffi::CString, os::unix::ffi::OsStrExt};
+
+        let source = CString::new(temporary_path.as_os_str().as_bytes())?;
+        let destination = CString::new(final_path.as_os_str().as_bytes())?;
+        // SAFETY: Both paths are NUL-terminated buffers alive for the call.
+        // RENAME_NOREPLACE prevents overwriting a concurrently created file.
+        if unsafe {
+            libc::renameat2(
+                libc::AT_FDCWD,
+                source.as_ptr(),
+                libc::AT_FDCWD,
+                destination.as_ptr(),
+                libc::RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            return Ok(false);
+        }
+        let error = std::io::Error::last_os_error();
+        if !matches!(error.raw_os_error(), Some(libc::EINVAL | libc::ENOSYS)) {
+            return Err(error);
+        }
+    }
+    fs::hard_link(temporary_path, final_path)?;
+    Ok(true)
+}
+
+#[cfg(unix)]
+fn require_publication_temp_absent(temporary_path: &Path) -> Result<()> {
+    match fs::symlink_metadata(temporary_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error).context("failed to inspect publication temp after atomic move"),
+        Ok(_) => bail!("publication temp survived an atomic move unexpectedly"),
+    }
+}
+
 #[cfg(all(test, unix))]
 fn publish_remote_binding_secret_temp(
     temporary_path: &Path,
     final_path: &Path,
 ) -> Result<RemoteBindingSecretPublish> {
-    match fs::hard_link(temporary_path, final_path) {
-        Ok(()) => Ok(RemoteBindingSecretPublish::Published { temp_is_link: true }),
+    match publish_publication_file_no_replace(temporary_path, final_path) {
+        Ok(temp_is_link) => Ok(RemoteBindingSecretPublish::Published { temp_is_link }),
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
             Ok(RemoteBindingSecretPublish::Existing)
         }
@@ -1029,20 +1076,37 @@ impl PublicationTransaction {
                 .context("failed to write publication transaction journal")?;
             file.sync_all()
                 .context("failed to persist publication transaction journal")?;
-            fs::hard_link(&temporary_path, &final_path).with_context(|| {
-                format!(
-                    "failed to atomically publish journal record {}",
-                    final_path.display()
-                )
-            })?;
+            #[cfg(unix)]
+            let temp_is_link = publish_publication_file_no_replace(&temporary_path, &final_path)
+                .with_context(|| {
+                    format!(
+                        "failed to atomically publish journal record {}",
+                        final_path.display()
+                    )
+                })?;
+            #[cfg(not(unix))]
+            let temp_is_link = {
+                fs::hard_link(&temporary_path, &final_path).with_context(|| {
+                    format!(
+                        "failed to atomically publish journal record {}",
+                        final_path.display()
+                    )
+                })?;
+                true
+            };
             published = true;
             sync_journal_directory(&self.directory)?;
-            fs::remove_file(&temporary_path).with_context(|| {
-                format!(
-                    "failed to remove published journal temp file {}",
-                    temporary_path.display()
-                )
-            })?;
+            if temp_is_link {
+                fs::remove_file(&temporary_path).with_context(|| {
+                    format!(
+                        "failed to remove published journal temp file {}",
+                        temporary_path.display()
+                    )
+                })?;
+            } else {
+                #[cfg(unix)]
+                require_publication_temp_absent(&temporary_path)?;
+            }
             sync_journal_directory(&self.directory)?;
             prune_publication_journal(&self.directory, 32)?;
             Ok(())

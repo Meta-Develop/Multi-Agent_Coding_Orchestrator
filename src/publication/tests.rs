@@ -1845,6 +1845,66 @@ fn write_test_journal_record(directory: &Path, journal: &PublicationTransactionJ
 }
 
 #[test]
+fn publication_journal_publishes_exact_bytes_without_temp() {
+    let temp = tempfile::tempdir().expect("journal directory");
+    let journal_directory = temp.path().join("journal");
+    merge::create_private_directory(&journal_directory).expect("private journal directory");
+    let mut transaction = prepared_github_transaction(&journal_directory, false);
+
+    transaction.persist().expect("publish journal record");
+
+    let mut expected = serde_json::to_vec_pretty(&transaction.journal).expect("encode journal");
+    expected.push(b'\n');
+    let final_path = journal_directory.join("00000000000000000001.json");
+    assert_eq!(fs::read(&final_path).expect("read record"), expected);
+    let entries = fs::read_dir(&journal_directory)
+        .expect("list journal directory")
+        .map(|entry| entry.expect("journal entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![final_path]);
+}
+
+#[test]
+fn publication_journal_preserves_record_created_after_absence_check() {
+    let temp = tempfile::tempdir().expect("journal directory");
+    let journal_directory = temp.path().join("journal");
+    merge::create_private_directory(&journal_directory).expect("private journal directory");
+    let mut transaction = prepared_github_transaction(&journal_directory, false);
+    let final_path = journal_directory.join("00000000000000000001.json");
+    assert_eq!(
+        fs::symlink_metadata(&final_path)
+            .expect_err("record initially absent")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let existing = b"concurrently published journal record\n";
+    merge::write_private_file(&final_path, existing).expect("concurrent record");
+
+    let error = transaction.persist().expect_err("must not replace record");
+
+    assert!(error
+        .to_string()
+        .contains("failed to atomically publish journal record"));
+    assert_eq!(
+        error
+            .downcast_ref::<std::io::Error>()
+            .expect("I/O error")
+            .kind(),
+        std::io::ErrorKind::AlreadyExists
+    );
+    assert_eq!(transaction.journal.sequence, 0);
+    assert_eq!(
+        fs::read(&final_path).expect("read existing record"),
+        existing
+    );
+    let entries = fs::read_dir(&journal_directory)
+        .expect("list journal directory")
+        .map(|entry| entry.expect("journal entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![final_path]);
+}
+
+#[test]
 fn publication_journal_retains_only_latest_32_of_100_retries() {
     let temp = tempfile::tempdir().expect("tempdir");
     let journal_directory = temp.path().join("journal");
@@ -3707,6 +3767,93 @@ fn gh_command_refuses_changed_private_runtime_before_spawn() {
     };
     assert!(error.to_string().contains("private gh runtime changed"));
     context.close().expect("explicit gh context cleanup");
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_remote_binding_key_creation_leaves_no_temp() {
+    let state = tempfile::tempdir().expect("state directory");
+    load_or_create_remote_binding_secret(state.path()).expect("publish key");
+    let final_path = state.path().join(REMOTE_BINDING_SECRET_FILE);
+
+    let entries = fs::read_dir(state.path())
+        .expect("list state directory")
+        .map(|entry| entry.expect("state entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![final_path]);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn publication_remote_binding_key_publishes_exact_bytes_without_temp() {
+    let state = tempfile::tempdir().expect("state directory");
+    let final_path = state.path().join(REMOTE_BINDING_SECRET_FILE);
+    let temporary_path = state
+        .path()
+        .join(format!(".{REMOTE_BINDING_SECRET_FILE}-123-456.tmp"));
+    let candidate = [17_u8; REMOTE_BINDING_SECRET_BYTES];
+    merge::write_private_file(&temporary_path, &candidate).expect("write candidate key");
+
+    let temp_is_link = match publish_remote_binding_secret_temp(&temporary_path, &final_path)
+        .expect("publish key")
+    {
+        RemoteBindingSecretPublish::Published { temp_is_link } => temp_is_link,
+        RemoteBindingSecretPublish::Existing => panic!("key must be newly published"),
+    };
+
+    assert_eq!(
+        fs::read(&final_path).expect("read published key"),
+        candidate
+    );
+    if temp_is_link {
+        assert_eq!(
+            fs::read(&temporary_path).expect("read published hard-linked temp"),
+            candidate
+        );
+        fs::remove_file(&temporary_path).expect("remove published hard-linked temp");
+    }
+    assert_eq!(
+        fs::symlink_metadata(&temporary_path)
+            .expect_err("published temp must be absent")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let entries = fs::read_dir(state.path())
+        .expect("list state directory")
+        .map(|entry| entry.expect("state entry").path())
+        .collect::<Vec<_>>();
+    assert_eq!(entries, vec![final_path]);
+}
+
+#[cfg(unix)]
+#[test]
+fn publication_remote_binding_key_preserves_key_created_after_absence_check() {
+    let state = tempfile::tempdir().expect("state directory");
+    let final_path = state.path().join(REMOTE_BINDING_SECRET_FILE);
+    let temporary_path = state
+        .path()
+        .join(format!(".{REMOTE_BINDING_SECRET_FILE}-123-456.tmp"));
+    assert_eq!(
+        fs::symlink_metadata(&final_path)
+            .expect_err("key initially absent")
+            .kind(),
+        std::io::ErrorKind::NotFound
+    );
+    let candidate = [17_u8; REMOTE_BINDING_SECRET_BYTES];
+    merge::write_private_file(&temporary_path, &candidate).expect("write candidate key");
+    let existing = [29_u8; REMOTE_BINDING_SECRET_BYTES];
+    merge::write_private_file(&final_path, &existing).expect("concurrent key");
+
+    assert!(matches!(
+        publish_remote_binding_secret_temp(&temporary_path, &final_path).expect("publish outcome"),
+        RemoteBindingSecretPublish::Existing
+    ));
+
+    assert_eq!(fs::read(&final_path).expect("read existing key"), existing);
+    assert_eq!(
+        fs::read(&temporary_path).expect("read losing temp"),
+        candidate
+    );
 }
 
 #[cfg(unix)]
