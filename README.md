@@ -1318,6 +1318,23 @@ maco --version
 
 `maco --version` prints the package version and the compile-time source identity, the exact lines are documented in `docs/PACKAGING.md`, and after install `maco` runs from any working directory.
 
+### Vibe terminal Workers
+
+Vibe is an optional, selectable runtime for execution-phase nondelegating
+terminal Workers only; it is not a Manager runtime. CLI installation, runtime
+registration, authentication, the allowed Worker role, and per-environment
+live qualification are separate steps, and qualification in one environment
+does not carry to another. Managed Vibe journals shell execution
+automatically: `bash` and `read_file` are available, edits and commands go
+through `bash`, and native `edit`/`write_file` are disabled. The requested IDs
+`deepseek-v4-1-flash-1017` and `zai-glm-5-3` do not attest served model
+identity or effort; served identity, effort, and USD cost remain unknown, and
+no economic superiority is claimed. Configured claim, evidence, confinement,
+and review gates still apply. See
+[`src/runtime_adapter/vibe.rs`](src/runtime_adapter/vibe.rs) and
+[`src/external_agent/vibe.rs`](src/external_agent/vibe.rs).
+
+
 ## Development
 
 The authoritative local environment for CI parity is the repository's Nix
