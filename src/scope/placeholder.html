@@ -332,6 +332,79 @@ tr[data-frontier="true"] td:last-child { color: var(--amber); }
 }
 .banner.winner { color: var(--cyan); }
 .constraint-note { color: var(--amber); font: 0.7rem var(--mono); }
+.evidence-panel {
+  display: grid;
+  gap: 0.75rem;
+  padding-top: 0.85rem;
+  border-top: 1px solid var(--line);
+}
+.field-label {
+  color: var(--muted);
+  font: 0.68rem var(--mono);
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.evidence-panel input[type="file"],
+.evidence-panel select {
+  min-height: 2.1rem;
+  padding: 0.3rem 0.5rem;
+  border: 1px solid var(--line);
+  border-radius: 0.45rem;
+  background: #10171c;
+  color: var(--ink);
+  font: 0.72rem var(--mono);
+}
+.chart-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(20rem, 1fr));
+  gap: 0.85rem;
+}
+.chart {
+  margin: 0;
+  padding: 0.7rem 0.8rem;
+  border: 1px solid var(--line);
+  border-radius: 0.5rem;
+  background: var(--panel-2);
+}
+.chart figcaption {
+  color: var(--ink);
+  font: 0.72rem var(--mono);
+  margin-bottom: 0.55rem;
+}
+.chart-bars { display: grid; gap: 0.4rem; }
+.chart-row {
+  display: grid;
+  grid-template-columns: minmax(6rem, 12rem) 1fr auto;
+  align-items: center;
+  gap: 0.5rem;
+  font: 0.7rem var(--mono);
+}
+.chart-label {
+  color: var(--muted);
+  overflow-wrap: anywhere;
+}
+.chart-track {
+  position: relative;
+  height: 0.7rem;
+  border-radius: 0.35rem;
+  background: #0d1418;
+  border: 1px solid var(--line);
+  overflow: hidden;
+}
+.chart-fill {
+  display: block;
+  height: 100%;
+  background: var(--cyan);
+}
+.chart-value { color: var(--ink); white-space: nowrap; }
+.chart-row.is-unavailable .chart-fill { background: transparent; }
+.chart-row.is-unavailable .chart-value { color: var(--muted); }
+.chart-note {
+  color: var(--muted);
+  font: 0.68rem/1.45 var(--mono);
+  margin-top: 0.5rem;
+}
+.chart-empty { color: var(--muted); font: 0.7rem var(--mono); }
 
     </style>
   </head>
@@ -464,6 +537,55 @@ tr[data-frontier="true"] td:last-child { color: var(--amber); }
       <tbody id="catalogBody"></tbody>
     </table>
   </div>
+  <section class="evidence-panel" aria-labelledby="evidenceHeading">
+    <div class="panel-heading">
+      <span id="evidenceHeading" class="section-label">Switch-cost evidence</span>
+      <span id="evidenceStatus" class="hint">No artifacts imported</span>
+    </div>
+    <p class="page-copy">
+      Import one or more local <code>switch-cost/live-evidence.json</code> artifacts
+      (<code>schema_version: 1</code>). Files are read in this browser tab only and
+      stay in memory: nothing is uploaded, written or fetched. Charts cover the
+      supplied artifacts only, not the whole account.
+    </p>
+    <div class="inline-actions">
+      <label class="field-label" for="evidenceFiles">Evidence artifacts</label>
+      <input id="evidenceFiles" type="file" accept=".json,application/json" multiple>
+      <label class="field-label" for="evidenceGrouping">Group by</label>
+      <select id="evidenceGrouping">
+        <option value="resolved" selected>Resolved / observed model</option>
+        <option value="requested">Requested model</option>
+      </select>
+      <button id="evidenceClear" type="button">Clear</button>
+    </div>
+    <p id="evidenceError" class="error" role="alert"></p>
+    <p id="evidenceNotice" class="hint"></p>
+    <div class="chart-grid">
+      <figure class="chart">
+        <figcaption id="invocationChartTitle">Recorded invocations by resolved / observed model</figcaption>
+        <div id="invocationChart" class="chart-bars" role="img" aria-label="Recorded invocations by model"></div>
+        <p id="invocationChartNote" class="chart-note"></p>
+      </figure>
+      <figure class="chart">
+        <figcaption id="tokenChartTitle">Measured input + output tokens by resolved / observed model</figcaption>
+        <div id="tokenChart" class="chart-bars" role="img" aria-label="Measured tokens by model"></div>
+        <p id="tokenChartNote" class="chart-note"></p>
+      </figure>
+    </div>
+    <table class="data-table" aria-label="Evidence coverage">
+      <thead>
+        <tr>
+          <th>Model group</th>
+          <th>Invocations</th>
+          <th>Invocation share</th>
+          <th>Measured invocations</th>
+          <th>Measured tokens</th>
+          <th>Token share</th>
+        </tr>
+      </thead>
+      <tbody id="evidenceBody"></tbody>
+    </table>
+  </section>
 </section>
 
 <section id="objectiveView" class="page-panel" hidden aria-label="Objective preview">
@@ -831,11 +953,362 @@ function liveHref(row) {
   params.set("run", row.run);
   return "?" + params.toString() + "#/live";
 }
+
+// ---------------------------------------------------------------------------
+// Local switch-cost evidence import (client-only, read-only).
+//
+// The operator supplies one or more `switch-cost/live-evidence.json` artifacts
+// (schema_version: 1, `invocations` array). Everything below is pure: files
+// stay in browser memory, nothing is uploaded, persisted or fetched.
+// ---------------------------------------------------------------------------
+
+const EVIDENCE_SCHEMA_VERSION = 1;
+const UNKNOWN_MODEL = "Unknown";
+const MODEL_GROUPINGS = ["resolved", "requested"];
+
+const MODEL_GROUPING_LABELS = {
+  resolved: "Resolved / observed model",
+  requested: "Requested model",
+};
+
+function modelGroupingLabel(grouping) {
+  return MODEL_GROUPING_LABELS[grouping] || MODEL_GROUPING_LABELS.resolved;
+}
+
+function isPlainObject(value) {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function textOrNull(value) {
+  if (typeof value !== "string") return null;
+  const trimmed = value.trim();
+  return trimmed ? trimmed : null;
+}
+
+// Measured token mass: input_tokens + output_tokens, only when both are
+// nonnegative safe integers and the sum is still safe. cached_input_tokens is
+// already part of input_tokens and is never added again.
+function measuredTokenMass(record) {
+  if (!isPlainObject(record)) return null;
+  const input = record.input_tokens;
+  const output = record.output_tokens;
+  if (!Number.isSafeInteger(input) || input < 0) return null;
+  if (!Number.isSafeInteger(output) || output < 0) return null;
+  const sum = input + output;
+  return Number.isSafeInteger(sum) ? sum : null;
+}
+
+// Exact nonnegative integer totals. Individual records are safe integers, but
+// their sum can exceed Number.MAX_SAFE_INTEGER, so totals are kept as BigInt
+// and only converted to a Number when that conversion is lossless.
+function exactTotal(values) {
+  let total = 0n;
+  for (const value of Array.isArray(values) ? values : []) {
+    if (!Number.isSafeInteger(value) || value < 0) continue;
+    total += BigInt(value);
+  }
+  return total;
+}
+
+function exactToNumber(total) {
+  if (typeof total !== "bigint" || total < 0n) return null;
+  if (total > BigInt(Number.MAX_SAFE_INTEGER)) return null;
+  return Number(total);
+}
+
+function identityKey(record) {
+  const run = textOrNull(record.optimization_run_id);
+  const invocation = textOrNull(record.invocation_id);
+  if (!run || !invocation) return null;
+  return run + "\u0000" + invocation;
+}
+
+// Every field that can distinguish two rows for the same invocation. Raw
+// counters are compared verbatim so fractional, negative or unsafe values are
+// still detected as conflicts even though they never qualify for token mass.
+const CONFLICT_FIELDS = [
+  "role",
+  "backend",
+  "provider",
+  "requested_model",
+  "resolved_model",
+  "input_tokens",
+  "cached_input_tokens",
+  "output_tokens",
+];
+
+function fieldValue(record, field) {
+  const value = record[field];
+  if (value === undefined) return null;
+  if (typeof value === "number" && !Number.isFinite(value)) return String(value);
+  return value;
+}
+
+function comparableRow(record) {
+  return JSON.stringify(CONFLICT_FIELDS.map((field) => fieldValue(record, field)));
+}
+
+function describeConflict(existing, incoming) {
+  const run = textOrNull(incoming.optimization_run_id) || "?";
+  const invocation = textOrNull(incoming.invocation_id) || "?";
+  const fields = [];
+  for (const field of CONFLICT_FIELDS) {
+    const before = fieldValue(existing, field);
+    const after = fieldValue(incoming, field);
+    if (JSON.stringify(before) !== JSON.stringify(after)) {
+      fields.push(field + ": " + JSON.stringify(before) + " vs " + JSON.stringify(after));
+    }
+  }
+  return (
+    "Conflicting duplicate invocation " +
+    run +
+    "/" +
+    invocation +
+    " (" +
+    (fields.length ? fields.join("; ") : "differing measurement fields") +
+    ")"
+  );
+}
+
+// Parse one artifact text. Returns { ok, records, errors }. An artifact with any
+// error is rejected as a whole: its records are never returned for charting.
+function parseEvidenceArtifact(text, label) {
+  const name = label || "artifact";
+  const errors = [];
+  let document;
+  try {
+    document = JSON.parse(String(text == null ? "" : text));
+  } catch (cause) {
+    return { ok: false, records: [], errors: [name + ": not valid JSON (" + cause.message + ")"] };
+  }
+  if (!isPlainObject(document)) {
+    return { ok: false, records: [], errors: [name + ": expected a JSON object"] };
+  }
+  if (document.schema_version !== EVIDENCE_SCHEMA_VERSION) {
+    errors.push(
+      name +
+        ": unsupported schema_version " +
+        JSON.stringify(document.schema_version) +
+        " (expected " +
+        EVIDENCE_SCHEMA_VERSION +
+        ")",
+    );
+  }
+  if (!Array.isArray(document.invocations)) {
+    errors.push(name + ": missing an invocations array");
+    return { ok: false, records: [], errors };
+  }
+  if (document.invocations.length === 0) {
+    errors.push(name + ": invocations array is empty; nothing to chart");
+  }
+  const records = [];
+  document.invocations.forEach((entry, index) => {
+    if (!isPlainObject(entry)) {
+      errors.push(name + ": invocation #" + index + " is not an object");
+      return;
+    }
+    if (!textOrNull(entry.optimization_run_id) || !textOrNull(entry.invocation_id)) {
+      errors.push(
+        name +
+          ": invocation #" +
+          index +
+          " is missing optimization_run_id or invocation_id",
+      );
+      return;
+    }
+    records.push(entry);
+  });
+  if (errors.length > 0) return { ok: false, records: [], errors };
+  return { ok: true, records, errors };
+}
+
+// Merge parsed artifacts, deduplicating by optimization_run_id + invocation_id.
+// Identical duplicates collapse; conflicting rows are rejected and reported.
+// Artifacts that failed to parse contribute no records at all.
+function mergeEvidenceArtifacts(artifacts) {
+  const list = Array.isArray(artifacts) ? artifacts : [];
+  const errors = [];
+  const byKey = new Map();
+  const records = [];
+  let duplicates = 0;
+  let conflicts = 0;
+  let rejectedArtifacts = 0;
+  for (const artifact of list) {
+    const parsed = isPlainObject(artifact) && Array.isArray(artifact.records)
+      ? artifact
+      : parseEvidenceArtifact(artifact && artifact.text, artifact && artifact.label);
+    const artifactErrors = Array.isArray(parsed.errors) ? parsed.errors : [];
+    for (const message of artifactErrors) errors.push(message);
+    if (parsed.ok === false || artifactErrors.length > 0) {
+      rejectedArtifacts += 1;
+      continue;
+    }
+    for (const record of parsed.records || []) {
+      const key = identityKey(record);
+      if (!key) continue;
+      const existing = byKey.get(key);
+      if (!existing) {
+        byKey.set(key, record);
+        records.push(record);
+        continue;
+      }
+      if (comparableRow(existing) === comparableRow(record)) {
+        duplicates += 1;
+        continue;
+      }
+      conflicts += 1;
+      errors.push(describeConflict(existing, record));
+    }
+  }
+  return {
+    ok: errors.length === 0,
+    records,
+    errors,
+    duplicates,
+    conflicts,
+    rejectedArtifacts,
+    artifacts: list.length,
+  };
+}
+
+function groupLabel(record, grouping) {
+  const field = grouping === "requested" ? "requested_model" : "resolved_model";
+  return textOrNull(record[field]) || UNKNOWN_MODEL;
+}
+
+// Percentages stay defined even when the aggregate exceeds Number's safe
+// integer range: each record is individually safe, so the ratio is computed
+// from finite doubles rather than requiring a safe-integer total.
+function percentOf(part, whole) {
+  if (typeof whole !== "number" || !Number.isFinite(whole) || whole <= 0) return null;
+  if (typeof part !== "number" || !Number.isFinite(part) || part < 0) return null;
+  const share = (part / whole) * 100;
+  return Number.isFinite(share) ? share : null;
+}
+
+// Aggregate records into chart rows for one model grouping. Token totals are
+// accumulated exactly; a group with no measured usage keeps null token values
+// instead of a fabricated zero.
+function evidenceGroups(records, grouping) {
+  const mode = MODEL_GROUPINGS.includes(grouping) ? grouping : "resolved";
+  const list = Array.isArray(records) ? records : [];
+  const buckets = new Map();
+  let measuredRecords = 0;
+  const masses = [];
+  for (const record of list) {
+    const label = groupLabel(record, mode);
+    let bucket = buckets.get(label);
+    if (!bucket) {
+      bucket = { label, invocations: 0, measuredInvocations: 0, masses: [] };
+      buckets.set(label, bucket);
+    }
+    bucket.invocations += 1;
+    const mass = measuredTokenMass(record);
+    if (mass == null) continue;
+    bucket.measuredInvocations += 1;
+    bucket.masses.push(mass);
+    masses.push(mass);
+    measuredRecords += 1;
+  }
+  const measuredExact = exactTotal(masses);
+  const measuredTokens = exactToNumber(measuredExact);
+  const rows = [...buckets.values()].map((bucket) => {
+    const exact = exactTotal(bucket.masses);
+    // No measured usage in this group means no token value at all; a measured
+    // zero is a real zero and stays 0.
+    const measured = bucket.measuredInvocations > 0;
+    const tokens = measured ? exactToNumber(exact) : null;
+    return {
+      label: bucket.label,
+      invocations: bucket.invocations,
+      invocationShare: percentOf(bucket.invocations, list.length),
+      measuredInvocations: bucket.measuredInvocations,
+      tokens,
+      tokensExact: measured ? exact.toString() : null,
+      tokenShare: tokens == null ? null : percentOf(tokens, measuredTokens),
+    };
+  });
+  rows.sort((left, right) => {
+    if (right.invocations !== left.invocations) return right.invocations - left.invocations;
+    return left.label.localeCompare(right.label);
+  });
+  return {
+    grouping: mode,
+    groupingLabel: modelGroupingLabel(mode),
+    rows,
+    totalInvocations: list.length,
+    measuredInvocations: measuredRecords,
+    unknownUsageInvocations: list.length - measuredRecords,
+    measuredTokens,
+    measuredTokensExact: measuredExact.toString(),
+    tokenCoverage: percentOf(measuredRecords, list.length),
+  };
+}
+
+function evidenceSummary(records) {
+  const list = Array.isArray(records) ? records : [];
+  const roles = new Set();
+  const runs = new Set();
+  const masses = [];
+  for (const record of list) {
+    roles.add(textOrNull(record.role) || "Unknown");
+    runs.add(textOrNull(record.optimization_run_id) || "Unknown");
+    const mass = measuredTokenMass(record);
+    if (mass == null) continue;
+    masses.push(mass);
+  }
+  const measured = masses.length;
+  const measuredExact = exactTotal(masses);
+  return {
+    invocations: list.length,
+    runs: runs.size,
+    roles: [...roles].sort(),
+    measuredInvocations: measured,
+    unknownUsageInvocations: list.length - measured,
+    measuredTokens: exactToNumber(measuredExact),
+    measuredTokensExact: measuredExact.toString(),
+    tokenCoverage: percentOf(measured, list.length),
+  };
+}
+
+function formatPercent(value) {
+  if (value == null || !Number.isFinite(value)) return "—";
+  return value.toFixed(1) + "%";
+}
+
+// Exact integer formatting: safe integers print directly, larger exact totals
+// print their full decimal digits instead of an em dash.
+function formatCount(value) {
+  if (typeof value === "bigint") return value < 0n ? "—" : value.toString();
+  if (Number.isSafeInteger(value)) return String(value);
+  return "—";
+}
+
+function formatExactCount(value) {
+  if (typeof value === "bigint") return value < 0n ? "—" : value.toString();
+  if (typeof value === "string" && /^\d+$/.test(value)) return value;
+  if (Number.isSafeInteger(value)) return String(value);
+  return "—";
+}
   global.MacoScope = global.MacoScope || {};
   global.MacoScope.catalog = {
     catalogRows: catalogRows,
     catalogSummary: catalogSummary,
-    liveHref: liveHref
+    liveHref: liveHref,
+    EVIDENCE_SCHEMA_VERSION: EVIDENCE_SCHEMA_VERSION,
+    UNKNOWN_MODEL: UNKNOWN_MODEL,
+    MODEL_GROUPINGS: MODEL_GROUPINGS,
+    modelGroupingLabel: modelGroupingLabel,
+    measuredTokenMass: measuredTokenMass,
+    exactTotal: exactTotal,
+    exactToNumber: exactToNumber,
+    parseEvidenceArtifact: parseEvidenceArtifact,
+    mergeEvidenceArtifacts: mergeEvidenceArtifacts,
+    evidenceGroups: evidenceGroups,
+    evidenceSummary: evidenceSummary,
+    formatPercent: formatPercent,
+    formatCount: formatCount,
+    formatExactCount: formatExactCount
   };
 })(globalThis);
 (function (global) {
@@ -2604,12 +3077,290 @@ function pageFromLocation(location) {
     }
   }
 
+  // --- Local switch-cost evidence import (client-only, read-only) ---------
+  var evidence = {
+    artifacts: [],
+    merged: null,
+    grouping: "resolved",
+  };
+
+  var evidenceFiles = document.getElementById("evidenceFiles");
+  var evidenceGrouping = document.getElementById("evidenceGrouping");
+  var evidenceClear = document.getElementById("evidenceClear");
+  var evidenceStatus = document.getElementById("evidenceStatus");
+  var evidenceError = document.getElementById("evidenceError");
+  var evidenceNotice = document.getElementById("evidenceNotice");
+  var evidenceBody = document.getElementById("evidenceBody");
+  var invocationChart = document.getElementById("invocationChart");
+  var tokenChart = document.getElementById("tokenChart");
+  var invocationChartTitle = document.getElementById("invocationChartTitle");
+  var tokenChartTitle = document.getElementById("tokenChartTitle");
+  var invocationChartNote = document.getElementById("invocationChartNote");
+  var tokenChartNote = document.getElementById("tokenChartNote");
+
+  function setEvidenceError(message) {
+    if (evidenceError) evidenceError.textContent = message || "";
+  }
+
+  function setEvidenceNotice(message) {
+    if (evidenceNotice) evidenceNotice.textContent = message || "";
+  }
+
+  function setEvidenceStatus(message) {
+    if (evidenceStatus) evidenceStatus.textContent = message || "";
+  }
+
+  function chartRow(label, valueText, share, unavailable) {
+    var row = document.createElement("div");
+    row.className = unavailable ? "chart-row is-unavailable" : "chart-row";
+    var name = document.createElement("span");
+    name.className = "chart-label";
+    name.textContent = label;
+    var track = document.createElement("span");
+    track.className = "chart-track";
+    var fill = document.createElement("span");
+    fill.className = "chart-fill";
+    var width = share == null || !isFinite(share) ? 0 : Math.max(0, Math.min(100, share));
+    fill.style.width = width + "%";
+    track.appendChild(fill);
+    var value = document.createElement("span");
+    value.className = "chart-value";
+    value.textContent = valueText;
+    row.appendChild(name);
+    row.appendChild(track);
+    row.appendChild(value);
+    return row;
+  }
+
+  function renderChart(container, rows, valueOf, shareOf, emptyText) {
+    if (!container) return;
+    container.replaceChildren();
+    if (!rows.length) {
+      var empty = document.createElement("p");
+      empty.className = "chart-empty";
+      empty.textContent = emptyText;
+      container.appendChild(empty);
+      return;
+    }
+    rows.forEach(function (row) {
+      container.appendChild(
+        chartRow(row.label, valueOf(row), shareOf(row), row.tokens === null),
+      );
+    });
+  }
+
+  // A group with no measured usage has no token value at all: show the
+  // unavailable marker rather than a fabricated zero.
+  function tokenValueText(row) {
+    if (row.tokens == null) return "unavailable";
+    return catalog.formatExactCount(row.tokensExact);
+  }
+
+  function tokenShareText(row) {
+    if (row.tokens == null) return "—";
+    return catalog.formatPercent(row.tokenShare);
+  }
+
+  function renderEvidence() {
+    var merged = evidence.merged;
+    var groups = catalog.evidenceGroups(merged ? merged.records : [], evidence.grouping);
+    var summary = catalog.evidenceSummary(merged ? merged.records : []);
+    var groupingLabel = catalog.modelGroupingLabel(evidence.grouping);
+
+    if (invocationChartTitle) {
+      invocationChartTitle.textContent = "Recorded invocations by " + groupingLabel.toLowerCase();
+    }
+    if (tokenChartTitle) {
+      tokenChartTitle.textContent =
+        "Measured input + output tokens by " + groupingLabel.toLowerCase();
+    }
+
+    renderChart(
+      invocationChart,
+      groups.rows,
+      function (row) {
+        return (
+          catalog.formatCount(row.invocations) +
+          " · " +
+          catalog.formatPercent(row.invocationShare)
+        );
+      },
+      function (row) {
+        return row.invocationShare;
+      },
+      "No invocations imported.",
+    );
+
+    renderChart(
+      tokenChart,
+      groups.rows,
+      function (row) {
+        return tokenValueText(row) + " · " + tokenShareText(row);
+      },
+      function (row) {
+        return row.tokenShare;
+      },
+      "No measured tokens imported.",
+    );
+
+    if (invocationChartNote) {
+      invocationChartNote.textContent =
+        catalog.formatCount(groups.totalInvocations) +
+        " recorded invocations across " +
+        catalog.formatCount(summary.runs) +
+        " optimization runs. Shares are of the supplied artifacts only.";
+    }
+    if (tokenChartNote) {
+      tokenChartNote.textContent =
+        "Token shares are over the known measured subtotal of " +
+        catalog.formatExactCount(groups.measuredTokensExact) +
+        " tokens; " +
+        catalog.formatCount(groups.measuredInvocations) +
+        " of " +
+        catalog.formatCount(groups.totalInvocations) +
+        " invocations have measured usage (" +
+        catalog.formatPercent(groups.tokenCoverage) +
+        " coverage). Unknown usage is excluded, never counted as zero.";
+    }
+
+    if (evidenceBody) {
+      evidenceBody.replaceChildren();
+      if (!groups.rows.length) {
+        var emptyRow = document.createElement("tr");
+        var emptyCell = document.createElement("td");
+        emptyCell.colSpan = 6;
+        emptyCell.className = "table-empty";
+        emptyCell.textContent = "Import a live-evidence.json artifact to chart invocations.";
+        emptyRow.appendChild(emptyCell);
+        evidenceBody.appendChild(emptyRow);
+      } else {
+        groups.rows.forEach(function (row) {
+          var tr = document.createElement("tr");
+          function td(text) {
+            var cell = document.createElement("td");
+            cell.textContent = text;
+            tr.appendChild(cell);
+          }
+          td(row.label);
+          td(catalog.formatCount(row.invocations));
+          td(catalog.formatPercent(row.invocationShare));
+          td(catalog.formatCount(row.measuredInvocations));
+          td(tokenValueText(row));
+          td(tokenShareText(row));
+          evidenceBody.appendChild(tr);
+        });
+      }
+    }
+
+    if (merged) {
+      setEvidenceStatus(
+        catalog.formatCount(summary.invocations) +
+          " invocations · " +
+          catalog.formatCount(merged.artifacts) +
+          " artifacts · " +
+          catalog.formatCount(merged.duplicates) +
+          " duplicates collapsed",
+      );
+      var notices = [];
+      if (summary.roles.length) notices.push("Roles present: " + summary.roles.join(", ") + ".");
+      if (summary.unknownUsageInvocations > 0) {
+        notices.push(
+          catalog.formatCount(summary.unknownUsageInvocations) +
+            " invocations have unknown or partial usage and are excluded from token mass.",
+        );
+      }
+      if (merged.conflicts > 0) {
+        notices.push(
+          catalog.formatCount(merged.conflicts) +
+            " conflicting duplicate invocations were rejected.",
+        );
+      }
+      if (merged.rejectedArtifacts > 0) {
+        notices.push(
+          catalog.formatCount(merged.rejectedArtifacts) +
+            " rejected artifacts contributed no records.",
+        );
+      }
+      setEvidenceNotice(notices.join(" "));
+    } else {
+      setEvidenceStatus("No artifacts imported");
+      setEvidenceNotice("");
+    }
+  }
+
+  function readFileText(file) {
+    if (typeof file.text === "function") return file.text();
+    return new Promise(function (resolve, reject) {
+      var reader = new FileReader();
+      reader.onload = function () {
+        resolve(String(reader.result || ""));
+      };
+      reader.onerror = function () {
+        reject(reader.error || new Error("could not read file"));
+      };
+      reader.readAsText(file);
+    });
+  }
+
+  async function importFiles(fileList) {
+    var files = Array.prototype.slice.call(fileList || []);
+    if (!files.length) return;
+    setEvidenceError("");
+    var loaded = [];
+    var failures = [];
+    for (var index = 0; index < files.length; index += 1) {
+      var file = files[index];
+      var label = file && file.name ? String(file.name) : "artifact " + (index + 1);
+      try {
+        var text = await readFileText(file);
+        loaded.push({ label: label, text: text });
+      } catch (cause) {
+        failures.push(label + ": could not be read (" + cause.message + ")");
+      }
+    }
+    evidence.artifacts = evidence.artifacts.concat(loaded);
+    evidence.merged = catalog.mergeEvidenceArtifacts(evidence.artifacts);
+    var messages = failures.concat(evidence.merged.errors || []);
+    setEvidenceError(messages.join(" "));
+    renderEvidence();
+  }
+
+  function clearEvidence() {
+    evidence.artifacts = [];
+    evidence.merged = null;
+    setEvidenceError("");
+    if (evidenceFiles) evidenceFiles.value = "";
+    renderEvidence();
+  }
+
+  if (evidenceFiles) {
+    evidenceFiles.addEventListener("change", function (event) {
+      importFiles(event.target.files);
+    });
+  }
+  if (evidenceGrouping) {
+    evidenceGrouping.addEventListener("change", function (event) {
+      evidence.grouping = event.target.value === "requested" ? "requested" : "resolved";
+      renderEvidence();
+    });
+  }
+  if (evidenceClear) evidenceClear.addEventListener("click", clearEvidence);
+
+  renderEvidence();
+
   if (refresh) refresh.addEventListener("click", load);
   document.addEventListener("maco-scope-page", function (event) {
     if (event.detail && event.detail.page === "catalog") load();
   });
 
-  globalThis.MacoScope.catalogView = { load: load, render: render };
+  globalThis.MacoScope.catalogView = {
+    load: load,
+    render: render,
+    importFiles: importFiles,
+    clearEvidence: clearEvidence,
+    renderEvidence: renderEvidence,
+    evidenceState: evidence,
+  };
 })();
 
 (function () {

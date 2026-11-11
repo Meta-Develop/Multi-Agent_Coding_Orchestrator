@@ -1,6 +1,23 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { catalogRows, catalogSummary, liveHref } from "../src/catalog.mjs";
+import {
+  catalogRows,
+  catalogSummary,
+  liveHref,
+  EVIDENCE_SCHEMA_VERSION,
+  UNKNOWN_MODEL,
+  modelGroupingLabel,
+  measuredTokenMass,
+  parseEvidenceArtifact,
+  mergeEvidenceArtifacts,
+  evidenceGroups,
+  evidenceSummary,
+  exactTotal,
+  exactToNumber,
+  formatPercent,
+  formatCount,
+  formatExactCount,
+} from "../src/catalog.mjs";
 import { parseProjectsPayload, streamUrl } from "../src/api.mjs";
 import { hrefFor, parseHash } from "../src/router.mjs";
 
@@ -77,4 +94,538 @@ test("hash router does not collide with graph view query values", () => {
   assert.equal(parseHash("#/objective").page, "objective");
   assert.equal(parseHash("#/unknown").page, "live");
   assert.equal(hrefFor("catalog"), "#/catalog");
+});
+
+// --- Local switch-cost evidence import -------------------------------------
+
+function invocation(overrides) {
+  return Object.assign(
+    {
+      optimization_run_id: "run-a",
+      invocation_id: "inv-1",
+      role: "worker",
+      backend: "vibe",
+      provider: "mistral",
+      requested_model: "model-x",
+      resolved_model: "model-x",
+      input_tokens: 100,
+      cached_input_tokens: 40,
+      output_tokens: 20,
+    },
+    overrides || {},
+  );
+}
+
+function artifact(invocations, schemaVersion) {
+  return JSON.stringify({
+    schema_version: schemaVersion === undefined ? EVIDENCE_SCHEMA_VERSION : schemaVersion,
+    invocations,
+  });
+}
+
+test("measuredTokenMass adds input and output only when both are safe", () => {
+  assert.equal(measuredTokenMass({ input_tokens: 100, output_tokens: 20 }), 120);
+  assert.equal(measuredTokenMass({ input_tokens: 0, output_tokens: 0 }), 0);
+  assert.equal(measuredTokenMass({ input_tokens: 5, output_tokens: null }), null);
+  assert.equal(measuredTokenMass({ input_tokens: 5 }), null);
+  assert.equal(measuredTokenMass({ input_tokens: -1, output_tokens: 5 }), null);
+  assert.equal(measuredTokenMass({ input_tokens: 1.5, output_tokens: 5 }), null);
+  assert.equal(
+    measuredTokenMass({ input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 1 }),
+    null,
+  );
+});
+
+test("cached_input_tokens is never added to token mass", () => {
+  const withCache = measuredTokenMass({
+    input_tokens: 100,
+    cached_input_tokens: 90,
+    output_tokens: 20,
+  });
+  const withoutCache = measuredTokenMass({ input_tokens: 100, output_tokens: 20 });
+  assert.equal(withCache, withoutCache);
+  assert.equal(withCache, 120);
+});
+
+test("parseEvidenceArtifact rejects malformed and empty input with messages", () => {
+  const broken = parseEvidenceArtifact("{not json", "broken.json");
+  assert.equal(broken.ok, false);
+  assert.match(broken.errors[0], /broken\.json: not valid JSON/);
+
+  const empty = parseEvidenceArtifact(artifact([]), "empty.json");
+  assert.equal(empty.ok, false);
+  assert.match(empty.errors.join(" "), /invocations array is empty/);
+
+  const wrongSchema = parseEvidenceArtifact(artifact([invocation()], 2), "v2.json");
+  assert.equal(wrongSchema.ok, false);
+  assert.match(wrongSchema.errors.join(" "), /unsupported schema_version 2/);
+
+  const noArray = parseEvidenceArtifact(JSON.stringify({ schema_version: 1 }), "noarray.json");
+  assert.equal(noArray.ok, false);
+  assert.match(noArray.errors.join(" "), /missing an invocations array/);
+
+  const missingId = parseEvidenceArtifact(
+    artifact([invocation({ invocation_id: null })]),
+    "noid.json",
+  );
+  assert.equal(missingId.ok, false);
+  assert.match(missingId.errors.join(" "), /missing optimization_run_id or invocation_id/);
+});
+
+test("mergeEvidenceArtifacts dedups identical rows across files and snapshots", () => {
+  const first = parseEvidenceArtifact(artifact([invocation()]), "a.json");
+  const second = parseEvidenceArtifact(artifact([invocation()]), "b.json");
+  const merged = mergeEvidenceArtifacts([first, second]);
+  assert.equal(merged.ok, true);
+  assert.equal(merged.records.length, 1);
+  assert.equal(merged.duplicates, 1);
+  assert.equal(merged.conflicts, 0);
+});
+
+test("mergeEvidenceArtifacts rejects conflicting measurement rows visibly", () => {
+  const first = parseEvidenceArtifact(artifact([invocation()]), "a.json");
+  const second = parseEvidenceArtifact(
+    artifact([invocation({ input_tokens: 999 })]),
+    "b.json",
+  );
+  const merged = mergeEvidenceArtifacts([first, second]);
+  assert.equal(merged.ok, false);
+  assert.equal(merged.conflicts, 1);
+  assert.equal(merged.records.length, 1);
+  assert.match(merged.errors.join(" "), /Conflicting duplicate invocation run-a\/inv-1/);
+  assert.match(merged.errors.join(" "), /input_tokens/);
+});
+
+test("mergeEvidenceArtifacts rejects conflicting resolved model rows", () => {
+  const first = parseEvidenceArtifact(artifact([invocation()]), "a.json");
+  const second = parseEvidenceArtifact(
+    artifact([invocation({ resolved_model: "model-y" })]),
+    "b.json",
+  );
+  const merged = mergeEvidenceArtifacts([first, second]);
+  assert.equal(merged.ok, false);
+  assert.match(merged.errors.join(" "), /resolved_model/);
+});
+
+test("evidenceGroups groups by resolved model and never falls back to requested", () => {
+  const records = [
+    invocation({ invocation_id: "i1", resolved_model: "model-a", input_tokens: 10, output_tokens: 10 }),
+    invocation({ invocation_id: "i2", resolved_model: "model-a", input_tokens: 30, output_tokens: 10 }),
+    invocation({ invocation_id: "i3", resolved_model: null, requested_model: "model-b", input_tokens: 5, output_tokens: 5 }),
+  ];
+  const resolved = evidenceGroups(records, "resolved");
+  const labels = resolved.rows.map((row) => row.label).sort();
+  assert.deepEqual(labels, [UNKNOWN_MODEL, "model-a"]);
+  const unknown = resolved.rows.find((row) => row.label === UNKNOWN_MODEL);
+  assert.equal(unknown.invocations, 1);
+  assert.equal(unknown.tokens, 10);
+  assert.equal(resolved.totalInvocations, 3);
+  assert.equal(resolved.measuredTokens, 70);
+  assert.equal(resolved.measuredInvocations, 3);
+  assert.equal(resolved.tokenCoverage, 100);
+
+  const requested = evidenceGroups(records, "requested");
+  assert.deepEqual(
+    requested.rows.map((row) => row.label).sort(),
+    ["model-b", "model-x"],
+  );
+});
+
+test("evidenceGroups keeps unknown usage out of token mass and reports coverage", () => {
+  const records = [
+    invocation({ invocation_id: "i1", input_tokens: 100, output_tokens: 0 }),
+    invocation({ invocation_id: "i2", input_tokens: null, output_tokens: 50 }),
+    invocation({ invocation_id: "i3", input_tokens: 10, output_tokens: -5 }),
+    invocation({ invocation_id: "i4", input_tokens: 0, output_tokens: 0 }),
+  ];
+  const groups = evidenceGroups(records, "resolved");
+  assert.equal(groups.totalInvocations, 4);
+  assert.equal(groups.measuredInvocations, 2);
+  assert.equal(groups.unknownUsageInvocations, 2);
+  assert.equal(groups.measuredTokens, 100);
+  assert.equal(groups.tokenCoverage, 50);
+  const row = groups.rows[0];
+  assert.equal(row.invocations, 4);
+  assert.equal(row.measuredInvocations, 2);
+  assert.equal(row.tokens, 100);
+  assert.equal(row.tokenShare, 100);
+});
+
+test("zero denominators yield unavailable shares, never NaN or 100%", () => {
+  const records = [invocation({ invocation_id: "i1", input_tokens: null, output_tokens: null })];
+  const groups = evidenceGroups(records, "resolved");
+  assert.equal(groups.measuredTokens, 0);
+  assert.equal(groups.rows[0].tokenShare, null);
+  assert.equal(formatPercent(groups.rows[0].tokenShare), "—");
+  assert.equal(formatPercent(groups.rows[0].invocationShare), "100.0%");
+
+  const empty = evidenceGroups([], "resolved");
+  assert.equal(empty.rows.length, 0);
+  assert.equal(empty.tokenCoverage, null);
+  assert.equal(formatPercent(empty.tokenCoverage), "—");
+});
+
+test("aggregate token totals stay exact beyond Number safe range per record", () => {
+  const big = Number.MAX_SAFE_INTEGER - 10;
+  const records = [
+    invocation({ invocation_id: "i1", input_tokens: big, output_tokens: 0 }),
+    invocation({ invocation_id: "i2", input_tokens: big, output_tokens: 0 }),
+  ];
+  const groups = evidenceGroups(records, "resolved");
+  assert.equal(groups.measuredTokens, null);
+  assert.equal(groups.measuredTokensExact, String(BigInt(big) * 2n));
+  assert.equal(groups.rows[0].tokens, null);
+  assert.equal(groups.rows[0].tokensExact, String(BigInt(big) * 2n));
+  assert.equal(groups.rows[0].tokenShare, null);
+  assert.equal(formatPercent(groups.rows[0].tokenShare), "—");
+  assert.equal(formatExactCount(groups.rows[0].tokensExact), String(BigInt(big) * 2n));
+});
+
+test("exact totals do not lose the low bit when safe records overflow", () => {
+  // 9007199254740991 + 2 must be 9007199254740993, not 9007199254740992.
+  const records = [
+    invocation({ invocation_id: "i1", input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 0 }),
+    invocation({ invocation_id: "i2", input_tokens: 2, output_tokens: 0 }),
+  ];
+  const groups = evidenceGroups(records, "resolved");
+  assert.equal(groups.measuredTokensExact, "9007199254740993");
+  assert.equal(groups.rows[0].tokensExact, "9007199254740993");
+  assert.equal(formatExactCount(groups.rows[0].tokensExact), "9007199254740993");
+  assert.equal(formatExactCount(groups.measuredTokensExact), "9007199254740993");
+  // The subtotal is exact but not representable as a Number, so the share is
+  // unavailable rather than a fabricated percentage.
+  assert.equal(groups.rows[0].tokenShare, null);
+  assert.equal(formatPercent(groups.rows[0].tokenShare), "—");
+
+  const summary = evidenceSummary(records);
+  assert.equal(summary.measuredTokensExact, "9007199254740993");
+  assert.equal(formatExactCount(summary.measuredTokensExact), "9007199254740993");
+
+  assert.equal(exactTotal([Number.MAX_SAFE_INTEGER, 2]).toString(), "9007199254740993");
+  assert.equal(exactToNumber(9007199254740993n), null);
+  assert.equal(exactToNumber(7n), 7);
+});
+
+test("evidenceSummary counts runs, roles and unknown usage", () => {
+  const records = [
+    invocation({ invocation_id: "i1", role: "worker" }),
+    invocation({ invocation_id: "i2", role: "reviewer", optimization_run_id: "run-b" }),
+    invocation({ invocation_id: "i3", role: null, input_tokens: null, output_tokens: null }),
+  ];
+  const summary = evidenceSummary(records);
+  assert.equal(summary.invocations, 3);
+  assert.equal(summary.runs, 2);
+  assert.deepEqual(summary.roles, ["Unknown", "reviewer", "worker"]);
+  assert.equal(summary.measuredInvocations, 2);
+  assert.equal(summary.unknownUsageInvocations, 1);
+  assert.equal(summary.measuredTokens, 240);
+});
+
+test("a group with no measured usage keeps unavailable tokens, not zero", () => {
+  const records = [
+    invocation({ invocation_id: "i1", resolved_model: "model-a", input_tokens: 60, output_tokens: 40 }),
+    invocation({ invocation_id: "i2", resolved_model: "model-b", input_tokens: null, output_tokens: null }),
+  ];
+  const groups = evidenceGroups(records, "resolved");
+  const measured = groups.rows.find((row) => row.label === "model-a");
+  const unmeasured = groups.rows.find((row) => row.label === "model-b");
+  assert.equal(measured.tokens, 100);
+  assert.equal(measured.tokenShare, 100);
+  assert.equal(unmeasured.invocations, 1);
+  assert.equal(unmeasured.measuredInvocations, 0);
+  assert.equal(unmeasured.tokens, null);
+  assert.equal(unmeasured.tokenShare, null);
+  assert.equal(formatPercent(unmeasured.tokenShare), "—");
+  assert.equal(groups.measuredTokens, 100);
+  assert.equal(groups.tokenCoverage, 50);
+});
+
+test("a genuine measured zero stays zero and is not unavailable", () => {
+  const records = [
+    invocation({ invocation_id: "i1", resolved_model: "model-a", input_tokens: 0, output_tokens: 0 }),
+    invocation({ invocation_id: "i2", resolved_model: "model-b", input_tokens: 10, output_tokens: 10 }),
+  ];
+  const groups = evidenceGroups(records, "resolved");
+  const zero = groups.rows.find((row) => row.label === "model-a");
+  assert.equal(zero.measuredInvocations, 1);
+  assert.equal(zero.tokens, 0);
+  assert.equal(zero.tokensExact, "0");
+  assert.equal(zero.tokenShare, 0);
+  assert.equal(formatPercent(zero.tokenShare), "0.0%");
+  assert.equal(groups.measuredTokens, 20);
+});
+
+test("conflicting cached_input_tokens is detected, not silently collapsed", () => {
+  const first = parseEvidenceArtifact(
+    artifact([invocation({ cached_input_tokens: 40 })]),
+    "a.json",
+  );
+  const second = parseEvidenceArtifact(
+    artifact([invocation({ cached_input_tokens: 90 })]),
+    "b.json",
+  );
+  const merged = mergeEvidenceArtifacts([first, second]);
+  assert.equal(merged.ok, false);
+  assert.equal(merged.conflicts, 1);
+  assert.equal(merged.duplicates, 0);
+  assert.match(merged.errors.join(" "), /cached_input_tokens: 40 vs 90/);
+});
+
+test("fractional and unsafe counters conflict even though they are not token mass", () => {
+  for (const field of ["input_tokens", "output_tokens"]) {
+    const first = parseEvidenceArtifact(artifact([invocation()]), "a.json");
+    const second = parseEvidenceArtifact(
+      artifact([invocation({ [field]: 1.5 })]),
+      "b.json",
+    );
+    const merged = mergeEvidenceArtifacts([first, second]);
+    assert.equal(merged.ok, false, field);
+    assert.equal(merged.conflicts, 1, field);
+    assert.match(merged.errors.join(" "), new RegExp(field + ": 100 vs 1.5|" + field + ": 20 vs 1.5"));
+  }
+  const unsafeFirst = parseEvidenceArtifact(artifact([invocation()]), "a.json");
+  const unsafeSecond = parseEvidenceArtifact(
+    artifact([invocation({ input_tokens: Number.MAX_SAFE_INTEGER + 2 })]),
+    "b.json",
+  );
+  const unsafe = mergeEvidenceArtifacts([unsafeFirst, unsafeSecond]);
+  assert.equal(unsafe.conflicts, 1);
+  assert.match(unsafe.errors.join(" "), /input_tokens/);
+});
+
+test("an invalid artifact contributes no records to the merged charts", () => {
+  const good = parseEvidenceArtifact(artifact([invocation()]), "good.json");
+  const wrongSchema = parseEvidenceArtifact(
+    artifact([invocation({ invocation_id: "inv-2" })], 2),
+    "v2.json",
+  );
+  assert.equal(wrongSchema.ok, false);
+  assert.deepEqual(wrongSchema.records, []);
+
+  const merged = mergeEvidenceArtifacts([good, wrongSchema]);
+  assert.equal(merged.ok, false);
+  assert.equal(merged.rejectedArtifacts, 1);
+  assert.equal(merged.records.length, 1);
+  assert.equal(merged.records[0].invocation_id, "inv-1");
+  assert.match(merged.errors.join(" "), /unsupported schema_version 2/);
+
+  const groups = evidenceGroups(merged.records, "resolved");
+  assert.equal(groups.totalInvocations, 1);
+  assert.equal(groups.measuredTokens, 120);
+});
+
+test("a malformed entry rejects its whole artifact instead of charting the rest", () => {
+  const mixed = parseEvidenceArtifact(
+    artifact([invocation(), null]),
+    "mixed.json",
+  );
+  assert.equal(mixed.ok, false);
+  assert.deepEqual(mixed.records, []);
+  assert.match(mixed.errors.join(" "), /invocation #1 is not an object/);
+
+  const merged = mergeEvidenceArtifacts([mixed]);
+  assert.equal(merged.records.length, 0);
+  assert.equal(merged.rejectedArtifacts, 1);
+  assert.equal(evidenceGroups(merged.records, "resolved").totalInvocations, 0);
+});
+
+test("mixed roles and models group once per invocation across artifacts", () => {
+  const first = parseEvidenceArtifact(
+    artifact([
+      invocation({ invocation_id: "i1", role: "worker", resolved_model: "model-a" }),
+      invocation({ invocation_id: "i2", role: "reviewer", resolved_model: "model-b" }),
+    ]),
+    "a.json",
+  );
+  const second = parseEvidenceArtifact(
+    artifact([
+      invocation({ invocation_id: "i1", role: "worker", resolved_model: "model-a" }),
+      invocation({ invocation_id: "i3", role: "control", resolved_model: null, requested_model: "model-a" }),
+    ]),
+    "b.json",
+  );
+  const merged = mergeEvidenceArtifacts([first, second]);
+  assert.equal(merged.ok, true);
+  assert.equal(merged.duplicates, 1);
+  assert.equal(merged.records.length, 3);
+
+  const groups = evidenceGroups(merged.records, "resolved");
+  assert.equal(groups.totalInvocations, 3);
+  assert.deepEqual(groups.rows.map((row) => row.label).sort(), [UNKNOWN_MODEL, "model-a", "model-b"]);
+  const unknown = groups.rows.find((row) => row.label === UNKNOWN_MODEL);
+  assert.equal(unknown.invocations, 1);
+  assert.equal(unknown.tokens, 120);
+
+  const requested = evidenceGroups(merged.records, "requested");
+  assert.deepEqual(requested.rows.map((row) => row.label).sort(), ["model-a", "model-x"]);
+  assert.equal(requested.rows.find((row) => row.label === "model-a").invocations, 1);
+  assert.equal(requested.rows.find((row) => row.label === "model-x").invocations, 2);
+
+  const summary = evidenceSummary(merged.records);
+  assert.deepEqual(summary.roles, ["control", "reviewer", "worker"]);
+  assert.equal(summary.runs, 1);
+});
+
+// --- Headless DOM wiring ---------------------------------------------------
+
+// Minimal DOM stand-in: enough for catalog-view.js to build rows and charts
+// without a browser, a GUI or any network access.
+function makeNode(tag) {
+  return {
+    tagName: tag,
+    children: [],
+    className: "",
+    textContent: "",
+    colSpan: 0,
+    style: {},
+    value: "",
+    hidden: false,
+    appendChild(child) {
+      this.children.push(child);
+      return child;
+    },
+    replaceChildren() {
+      this.children = [];
+    },
+    addEventListener() {},
+    setAttribute() {},
+    querySelectorAll() {
+      return [];
+    },
+  };
+}
+
+// One stable document object: the view IIFE captures it at load time, so each
+// test resets the node map instead of replacing the document.
+const fakeNodes = new Map();
+const fakeDocument = {
+  nodes: fakeNodes,
+  getElementById(id) {
+    return fakeNodes.get(id) || null;
+  },
+  createElement(tag) {
+    return makeNode(tag);
+  },
+  addEventListener() {},
+};
+
+// The view caches element references at load time, so nodes are reset in place
+// rather than replaced.
+function resetDocument(ids) {
+  for (const id of ids) {
+    const node = fakeNodes.get(id) || makeNode("div");
+    node.children = [];
+    node.textContent = "";
+    node.className = "";
+    node.value = "";
+    fakeNodes.set(id, node);
+  }
+  return fakeDocument;
+}
+
+const VIEW_IDS = [
+  "catalogView",
+  "catalogBody",
+  "catalogSummary",
+  "catalogError",
+  "catalogRefresh",
+  "evidenceFiles",
+  "evidenceGrouping",
+  "evidenceClear",
+  "evidenceStatus",
+  "evidenceError",
+  "evidenceNotice",
+  "evidenceBody",
+  "invocationChart",
+  "tokenChart",
+  "invocationChartTitle",
+  "tokenChartTitle",
+  "invocationChartNote",
+  "tokenChartNote",
+];
+
+function textOf(node) {
+  return node.children.map((child) => child.textContent).join(" ");
+}
+
+// The view module is an IIFE that binds to globalThis once, so it is loaded a
+// single time and each test resets the shared evidence state.
+let viewModulePromise = null;
+async function loadView(document) {
+  globalThis.document = document;
+  // Keep one stable namespace object: the view IIFE captures it at load time.
+  globalThis.MacoScope = globalThis.MacoScope || {};
+  globalThis.MacoScope.catalog = await import("../src/catalog.mjs");
+  globalThis.MacoScope.api = { fetchProjects: async () => [] };
+  if (!viewModulePromise) viewModulePromise = import("../src/views/catalog-view.js");
+  await viewModulePromise;
+  const view = globalThis.MacoScope.catalogView;
+  view.clearEvidence();
+  return view;
+}
+
+test("headless view imports artifacts and renders both charts", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  assert.ok(view, "catalog view registered");
+
+  const files = [
+    {
+      name: "a.json",
+      text: async () =>
+        artifact([
+          invocation({ invocation_id: "i1", resolved_model: "model-a", input_tokens: 60, output_tokens: 40 }),
+          invocation({ invocation_id: "i2", resolved_model: "model-b", input_tokens: null, output_tokens: null }),
+        ]),
+    },
+  ];
+  await view.importFiles(files);
+
+  const invocationRows = document.nodes.get("invocationChart").children;
+  assert.equal(invocationRows.length, 2);
+  const tokenRows = document.nodes.get("tokenChart").children;
+  assert.equal(tokenRows.length, 2);
+  const unmeasured = tokenRows.find((row) => textOf(row).includes("model-b"));
+  assert.match(textOf(unmeasured), /unavailable/);
+  assert.equal(textOf(unmeasured).includes("0 · 0.0%"), false);
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("model-a"))), /100 · 100\.0%/);
+
+  const note = document.nodes.get("tokenChartNote").textContent;
+  assert.match(note, /known measured subtotal of 100 tokens/);
+  assert.match(note, /1 of 2 invocations have measured usage \(50\.0% coverage\)/);
+
+  // Grouping control switches attribution without re-importing.
+  view.evidenceState.grouping = "requested";
+  view.renderEvidence();
+  assert.match(document.nodes.get("invocationChartTitle").textContent, /requested model/);
+
+});
+
+test("headless view rejects an invalid artifact without charting it", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+
+  await view.importFiles([
+    {
+      name: "v2.json",
+      text: async () => artifact([invocation({ invocation_id: "i9" })], 2),
+    },
+  ]);
+
+  assert.match(document.nodes.get("evidenceError").textContent, /unsupported schema_version 2/);
+  assert.equal(document.nodes.get("invocationChart").children.length, 1);
+  assert.match(
+    document.nodes.get("invocationChart").children[0].textContent,
+    /No invocations imported/,
+  );
+  assert.equal(view.evidenceState.merged.records.length, 0);
+});
+
+test("model grouping labels and formatters are explicit", () => {
+  assert.equal(modelGroupingLabel("resolved"), "Resolved / observed model");
+  assert.equal(modelGroupingLabel("requested"), "Requested model");
+  assert.equal(formatPercent(12.345), "12.3%");
+  assert.equal(formatPercent(null), "—");
+  assert.equal(formatCount(7), "7");
+  assert.equal(formatCount(null), "—");
 });

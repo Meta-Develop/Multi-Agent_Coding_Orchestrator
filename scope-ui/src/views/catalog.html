@@ -25,4 +25,53 @@
       <tbody id="catalogBody"></tbody>
     </table>
   </div>
+  <section class="evidence-panel" aria-labelledby="evidenceHeading">
+    <div class="panel-heading">
+      <span id="evidenceHeading" class="section-label">Switch-cost evidence</span>
+      <span id="evidenceStatus" class="hint">No artifacts imported</span>
+    </div>
+    <p class="page-copy">
+      Import one or more local <code>switch-cost/live-evidence.json</code> artifacts
+      (<code>schema_version: 1</code>). Files are read in this browser tab only and
+      stay in memory: nothing is uploaded, written or fetched. Charts cover the
+      supplied artifacts only, not the whole account.
+    </p>
+    <div class="inline-actions">
+      <label class="field-label" for="evidenceFiles">Evidence artifacts</label>
+      <input id="evidenceFiles" type="file" accept=".json,application/json" multiple>
+      <label class="field-label" for="evidenceGrouping">Group by</label>
+      <select id="evidenceGrouping">
+        <option value="resolved" selected>Resolved / observed model</option>
+        <option value="requested">Requested model</option>
+      </select>
+      <button id="evidenceClear" type="button">Clear</button>
+    </div>
+    <p id="evidenceError" class="error" role="alert"></p>
+    <p id="evidenceNotice" class="hint"></p>
+    <div class="chart-grid">
+      <figure class="chart">
+        <figcaption id="invocationChartTitle">Recorded invocations by resolved / observed model</figcaption>
+        <div id="invocationChart" class="chart-bars" role="img" aria-label="Recorded invocations by model"></div>
+        <p id="invocationChartNote" class="chart-note"></p>
+      </figure>
+      <figure class="chart">
+        <figcaption id="tokenChartTitle">Measured input + output tokens by resolved / observed model</figcaption>
+        <div id="tokenChart" class="chart-bars" role="img" aria-label="Measured tokens by model"></div>
+        <p id="tokenChartNote" class="chart-note"></p>
+      </figure>
+    </div>
+    <table class="data-table" aria-label="Evidence coverage">
+      <thead>
+        <tr>
+          <th>Model group</th>
+          <th>Invocations</th>
+          <th>Invocation share</th>
+          <th>Measured invocations</th>
+          <th>Measured tokens</th>
+          <th>Token share</th>
+        </tr>
+      </thead>
+      <tbody id="evidenceBody"></tbody>
+    </table>
+  </section>
 </section>
