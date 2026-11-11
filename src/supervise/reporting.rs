@@ -1097,7 +1097,8 @@ fn external_process_quiescent_for_scratch(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => run.scratch_quiescence_verified(),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Vibe => run.scratch_quiescence_verified(),
     }
 }
 
@@ -2315,7 +2316,8 @@ pub(super) fn external_safety_verified(run: &ExternalAgentRun, runtime: Supervis
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => {
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Vibe => {
             run.process_tree
                 .is_some_and(ProcessTreeEvidence::is_verified_empty)
                 && run
@@ -2379,6 +2381,17 @@ pub(super) fn external_process_completed(
             && run.error.is_none()
             && crate::runtime_adapter::deepseek::parse_event_stream(run.stdout_bytes(), None)
                 .is_ok_and(|parsed| parsed.completed)
+            && external_safety_verified(run, runtime);
+    }
+    if runtime == SupervisorRuntime::Vibe {
+        // Report completion and usage availability are separate. Missing export
+        // counters stay unavailable in settlement without invalidating a report.
+        return run.publishable
+            && run.exit_code == Some(0)
+            && !run.timed_out
+            && run.error.is_none()
+            && !run.stdout.raw_capture_truncated()
+            && crate::runtime_adapter::vibe::final_assistant_text(run.stdout_bytes()).is_ok()
             && external_safety_verified(run, runtime);
     }
     run.publishable
@@ -2468,6 +2481,23 @@ pub(super) fn external_usage_for_runtime(
         let input_tokens = usize::try_from(input).ok()?;
         let output_tokens = usize::try_from(output).ok()?;
         let total_tokens = usize::try_from(total).ok()?;
+        if input_tokens.checked_add(output_tokens) != Some(total_tokens) {
+            return None;
+        }
+        Some(Usage {
+            input_tokens,
+            output_tokens,
+            total_tokens,
+        })
+    } else if runtime == SupervisorRuntime::Vibe {
+        // Only the parent-held export capture is spend evidence. Vibe stdout is
+        // never parsed for Codex-shaped counters, and the export leaf is not
+        // re-read after staging cleanup. `cached_input_tokens` is already a
+        // subset of `input_tokens`, so it is never added a second time.
+        let (captured, _) = run.vibe_usage(command)?;
+        let input_tokens = usize::try_from(captured.input_tokens).ok()?;
+        let output_tokens = usize::try_from(captured.output_tokens).ok()?;
+        let total_tokens = usize::try_from(captured.total_tokens).ok()?;
         if input_tokens.checked_add(output_tokens) != Some(total_tokens) {
             return None;
         }

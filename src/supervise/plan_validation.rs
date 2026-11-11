@@ -74,6 +74,13 @@ pub(super) fn validate_authored_check_metadata(
 
 pub(super) fn validate_assignment_phase_contract(plan: &SupervisorPlan) -> Result<()> {
     for assignment in &plan.assignments {
+        // An explicitly declared Vibe runtime is held to the Vibe admission
+        // contract before the phase skip, so a planning-phase or delegating
+        // Vibe assignment cannot slip through. An omitted runtime stays a
+        // no-op here: the Codex default is applied by the launch binder.
+        if let Some(runtime) = assignment.runtime {
+            super::vibe_worker::validate_assignment(assignment, runtime)?;
+        }
         if assignment.phase != AssignmentPhase::Planning {
             continue;
         }
@@ -644,6 +651,14 @@ fn validate_primary_worktree_execution_target(
     let Some(target) = metadata.execution_target.as_mut() else {
         return Ok(());
     };
+    for assignment in &plan.assignments {
+        if assignment.runtime == Some(SupervisorRuntime::Vibe) {
+            bail!(
+                "assignment '{}': Vibe requires a managed child worktree; execution_target.kind='primary_worktree' is not supported",
+                assignment.id
+            );
+        }
+    }
     let claim_paths = target.claim_paths_mut();
     if claim_paths.is_empty() || claim_paths.len() > MAX_PRIMARY_WORKTREE_CLAIM_PATHS {
         bail!(

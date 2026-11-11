@@ -1383,6 +1383,7 @@ fn is_recognized_test_target(path: &Path) -> bool {
         || file_name.contains(".spec.")
         || [
             "_test.rs",
+            "_tests.rs",
             "_test.go",
             "_test.py",
             "test.java",
@@ -4345,19 +4346,65 @@ mod tests {
 
     #[test]
     fn test_target_classifier_accepts_runnable_sources_and_rejects_fixture_files() {
-        for path in ["tests/preclaim.rs", "tests/test_generator.py"] {
+        for path in [
+            "tests/preclaim.rs",
+            "tests/test_generator.py",
+            "src/supervise/reporting_tests.rs",
+        ] {
             assert!(
                 is_recognized_test_target(Path::new(path)),
                 "runnable test source should be recognized: {path}"
             );
         }
 
-        for path in ["tests/fixtures/input.json", "tests/README.md"] {
+        for path in [
+            "tests/fixtures/input.json",
+            "tests/README.md",
+            "src/supervise/reporting.rs",
+            "docs/notes_tests.md",
+        ] {
             assert!(
                 !is_recognized_test_target(Path::new(path)),
                 "non-runnable fixture must not be a verification target: {path}"
             );
         }
+    }
+
+    #[test]
+    fn preclaim_sibling_tests_provide_worker_verification_path() {
+        let mut candidate = assignment();
+        candidate.role = AgentRole::Worker;
+        candidate.role_category = Some(RoleCategory::NonDelegatingTerminalWorker);
+        candidate.assigned_paths = vec![
+            PathBuf::from("src/supervise/reporting.rs"),
+            PathBuf::from("src/supervise/reporting_tests.rs"),
+        ];
+        let mut repo_map = present_map();
+        for path in &candidate.assigned_paths {
+            repo_map.entries.push(RepoMapEntry {
+                path: path.clone(),
+                kind: RepoEntryKind::File,
+                size_bytes: Some(1),
+                category: "source".to_string(),
+                git_status: RepoGitStatus::Clean,
+            });
+        }
+        let mut risk = risk_for_path("src/supervise/reporting.rs");
+        risk.changed_paths = candidate.assigned_paths.clone();
+        let requested = [candidate.clone()];
+        let decision = evaluate_preclaim_viability(
+            &candidate,
+            &requested,
+            Some(&repo_map),
+            Some(&risk),
+            Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
     }
 
     #[test]

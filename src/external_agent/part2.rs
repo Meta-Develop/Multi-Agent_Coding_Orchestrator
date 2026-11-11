@@ -463,7 +463,8 @@ const fn external_sandbox_requirement(
         | ExternalAgentInvocation::CodexConsultant
         | ExternalAgentInvocation::ClaudeConsultant
         | ExternalAgentInvocation::GeminiCli
-        | ExternalAgentInvocation::DeepSeek => EnvironmentSandboxCapability::VerifiedExternalCodex,
+        | ExternalAgentInvocation::DeepSeek
+        | ExternalAgentInvocation::Vibe => EnvironmentSandboxCapability::VerifiedExternalCodex,
     };
     EnvironmentRequirement::sandbox(capability)
 }
@@ -575,6 +576,13 @@ fn runtime_environment_passthrough_allowed(invocation: ExternalAgentInvocation, 
                 | "DSH_TELEMETRY_OTLP_URL"
                 | "DEEPSEEK_API_KEY"
         ),
+        ExternalAgentInvocation::Vibe => {
+            // The private Vibe home, credential, and privacy pins are set only
+            // by the parent; no inherited owner variable may override them.
+            !matches!(key, "HOME" | "TMPDIR" | "MISTRAL_API_KEY" | "MACO_VIBE_CREDENTIAL_FILE")
+                && !key.starts_with("VIBE_")
+                && !key.starts_with("XDG_")
+        }
         _ => true,
     }
 }
@@ -5919,6 +5927,16 @@ impl ExternalProviderProfile {
                 (ExternalAgentInvocation::Cursor, WorkspaceAccess::ReadWrite, _) => {
                     Self::Cursor(ExternalCursorProfile::read_write(&spec.cwd))
                 }
+                (ExternalAgentInvocation::Vibe, WorkspaceAccess::ReadOnly, _) => {
+                    bail!(
+                        "Vibe execution is admitted only for the writable execution-phase non-delegating terminal Worker"
+                    );
+                }
+                (ExternalAgentInvocation::Vibe, WorkspaceAccess::ReadWrite, None) => {
+                    bail!(
+                        "writable Vibe requires the supervisor-selected non-delegating terminal Worker evidence"
+                    );
+                }
                 (ExternalAgentInvocation::DeepSeek, WorkspaceAccess::ReadWrite, _) => {
                     let bound = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
                         crate::supervise::deepseek_qualification::operator_flag_bound(
@@ -6090,7 +6108,8 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli
-        | ExternalAgentInvocation::DeepSeek => {
+        | ExternalAgentInvocation::DeepSeek
+        | ExternalAgentInvocation::Vibe => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
             if let Some(memory_max_bytes) = protected_controls.worker_memory_max_bytes {
                 profile = profile.with_resource_limits(crate::process_runner::ProcessResourceLimits {
@@ -6171,6 +6190,21 @@ fn external_side_effect_profile_with_claude_relay(
                 // ProtectHome hides custom installations. Expose the executable itself,
                 // not adjacent home files, and keep it read-only even inside the workspace.
                 profile = profile.with_visible_read_only_file(program);
+            } else if spec.invocation == ExternalAgentInvocation::Vibe {
+                // The Vibe launcher is a Python venv entry point: the executable
+                // alone cannot import its dependencies. Expose exactly the
+                // installation root (the bin directory's parent, e.g. the venv
+                // prefix) read-only, never any ancestor that could hold owner
+                // secrets, and keep it read-only even inside the workspace.
+                let venv = program_parent.parent().filter(|prefix| {
+                    program_parent.file_name() == Some(OsStr::new("bin"))
+                        && fs::symlink_metadata(prefix.join("pyvenv.cfg"))
+                            .is_ok_and(|metadata| metadata.file_type().is_file())
+                });
+                profile = match venv {
+                    Some(prefix) => profile.with_visible_read_only_root(prefix),
+                    None => profile.with_visible_read_only_file(program),
+                };
             } else if !program.starts_with(&canonical_workspace) {
                 profile = profile.with_visible_read_only_root(program_parent);
             }
@@ -6194,6 +6228,11 @@ fn external_side_effect_profile_with_claude_relay(
                 profile = profile.with_visible_read_only_file(
                     crate::runtime_adapter::deepseek::launch_patch_path(&spec.prompt),
                 );
+            }
+            if spec.invocation == ExternalAgentInvocation::Vibe {
+                // Vibe reads its prompt by pathname. Expose only that exact
+                // held input to the contained child, not its parent directory.
+                profile = profile.with_visible_read_only_file(&spec.prompt);
             }
             for input in &protected_controls.exact_read_only_input_files {
                 profile = profile.with_visible_read_only_file(input);
@@ -6961,6 +7000,7 @@ impl CredentialRedactor {
             "CODEX_API_KEY",
             "CODEX_ACCESS_TOKEN",
             "DEEPSEEK_API_KEY",
+            "MISTRAL_API_KEY",
         ] {
             if let Some(value) = environment.get(key) {
                 add_credential_pattern(&mut patterns, value.as_bytes())?;
@@ -6970,7 +7010,7 @@ impl CredentialRedactor {
                         .and_then(|value| value.strip_suffix('"'))
                     {
                         add_credential_pattern(&mut patterns, escaped.as_bytes())?;
-                        if key == "DEEPSEEK_API_KEY" {
+                        if key == "DEEPSEEK_API_KEY" || key == "MISTRAL_API_KEY" {
                             // final.text contains a JSON ResearcherReport inside the NDJSON
                             // envelope; tool results can likewise contain JSON text. Redact
                             // that additional wire escaping before the raw stream is persisted.
@@ -7236,7 +7276,8 @@ fn command_argv_with_controls_and_service_tier_input(
         | ExternalAgentInvocation::Cursor
         | ExternalAgentInvocation::ClaudeCode
         | ExternalAgentInvocation::GeminiCli
-        | ExternalAgentInvocation::DeepSeek => runtime_adapter_argv(spec),
+        | ExternalAgentInvocation::DeepSeek
+        | ExternalAgentInvocation::Vibe => runtime_adapter_argv(spec),
     }
 }
 
@@ -7277,9 +7318,13 @@ fn runtime_adapter_argv(spec: &ExternalAgentCommand) -> Result<Vec<OsString>> {
             ExternalAgentInvocation::ClaudeCode => RuntimeId::ClaudeCode,
             ExternalAgentInvocation::GeminiCli => RuntimeId::GeminiCli,
             ExternalAgentInvocation::DeepSeek => RuntimeId::DeepSeek,
+            ExternalAgentInvocation::Vibe => RuntimeId::Vibe,
             _ => RuntimeId::Codex,
         })
     });
+    // Vibe renders its private export directory through the immutable
+    // {vibe_output_dir} placeholder: the renderer derives it from the staged
+    // output leaf, so the context carries the staged leaf itself.
     let context = LaunchContext {
         prompt: &spec.prompt,
         model: spec.model.as_deref(),

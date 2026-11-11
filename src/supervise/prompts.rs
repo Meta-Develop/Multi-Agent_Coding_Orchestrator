@@ -788,6 +788,12 @@ pub(super) fn render_child_orchestrator_prompt_with_incoming_root_and_field_guid
             child_launch_runtime.as_str(),
         );
     }
+    if !assignment.worker_assignments.is_empty()
+        && (child_launch_runtime == SupervisorRuntime::Vibe
+            || worker_launch_runtime == SupervisorRuntime::Vibe)
+    {
+        super::vibe_worker::refuse_nested_worker_launch()?;
+    }
     let assignment_json = serde_json::to_string_pretty(&orchestrator_assignment_value(
         assignment,
         assignment_metadata,
@@ -1245,6 +1251,20 @@ Final JSON:
 "#
 }
 
+const VIBE_DIRECT_WORKER_GUIDANCE: &str = r#"
+Vibe direct-worker guidance:
+The final message is exactly one JSON WorkerReport object with no other text or Markdown fences. Before writing it, read the generated WorkerReport schema at the WorkerReport schema path below with read_file.
+Item key sets from that schema (optional keys may be omitted):
+findings required keys: severity, message, paths; optional keys: (none)
+commands_run required keys: command, cwd, status, timeout_seconds, duration_ms, timed_out, stdout, stderr, environment_preflight_results, environment_failures; optional keys: codex_parent_evidence, error, exit_code, fixed_version_probe_evidence, grok_acp_parent_evidence, grok_stream_usage_evidence, runtime_identity, sandbox_denials
+validation_results required keys: name, status, command; optional keys: message
+Every findings item uses message, never summary.
+Every bash tool call, including read-only inspection with cd, ls, cat, grep, sed, wc or git, must be the bound journal-append invocation. Files may also be read with read_file.
+commands_run stdout and stderr are either empty or copied byte for byte from the observed output in the corresponding stream, never shortened or reworded. Copy any timestamp in the report from the journal records, readable with read_file at the Execution journal path below, never from an example.
+After each native edit or write, run the bound observation before any other action; observe each edit separately.
+Read only the files and sections the assigned change needs: this session has a fixed token cap.
+"#;
+
 fn render_direct_terminal_worker_prompt(
     context: ChildOrchestratorPromptContext<'_>,
     incoming_root: &Path,
@@ -1278,6 +1298,11 @@ fn render_direct_terminal_worker_prompt(
     }
 
     let cacheable_prefix = direct_terminal_worker_cacheable_prefix(execution_target)?;
+    let runtime_guidance = if launch_runtime == SupervisorRuntime::Vibe {
+        VIBE_DIRECT_WORKER_GUIDANCE
+    } else {
+        ""
+    };
     let journal_path = incoming_root.join(worker_execution_journal_incoming_relative_for_id(
         &assignment.id,
     ));
@@ -1302,7 +1327,7 @@ fn render_direct_terminal_worker_prompt(
         })
         .unwrap_or_default();
     let prompt = format!(
-        r#"{cacheable_prefix}{role_prefix}{field_guide_section}{instruction_profile_section}
+        r#"{cacheable_prefix}{runtime_guidance}{role_prefix}{field_guide_section}{instruction_profile_section}
 
 Direct-worker assignment context:
 - Assigned worktree: {worktree_path}
@@ -2129,6 +2154,131 @@ mod regression_tests {
 
     fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
+    }
+
+    #[test]
+    fn vibe_worker_guidance_key_sets_match_generated_worker_schema() {
+        use std::collections::BTreeSet;
+
+        assert!(VIBE_DIRECT_WORKER_GUIDANCE.len() <= 2_000);
+        let schema = schema_artifacts::terminal_worker_output_schema_value();
+        for name in ["findings", "commands_run", "validation_results"] {
+            let prefix = format!("{name} required keys: ");
+            let keys = VIBE_DIRECT_WORKER_GUIDANCE
+                .lines()
+                .find_map(|line| line.strip_prefix(&prefix))
+                .expect("guidance must name each item key set");
+            let (required, optional) = keys.split_once("; optional keys: ").unwrap();
+            let required: BTreeSet<_> = required.split(", ").collect();
+            let optional: BTreeSet<_> = optional
+                .split(", ")
+                .filter(|key| *key != "(none)")
+                .collect();
+            let item = &schema["properties"][name]["items"];
+            let schema_required: BTreeSet<_> = item["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|key| key.as_str().unwrap())
+                .collect();
+            let schema_properties: BTreeSet<_> = item["properties"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(required, schema_required, "{name} required keys drifted");
+            assert!(required.is_disjoint(&optional));
+            assert_eq!(
+                required.union(&optional).copied().collect::<BTreeSet<_>>(),
+                schema_properties,
+                "{name} properties drifted"
+            );
+        }
+    }
+
+    #[test]
+    fn vibe_worker_guidance_is_the_only_runtime_prompt_difference() -> Result<()> {
+        let assignment: OrchestratorAssignment = serde_json::from_value(serde_json::json!({
+            "id": "direct-worker",
+            "phase": "execution",
+            "role": "worker",
+            "role_category": "non_delegating_terminal_worker",
+            "assigned_paths": ["src/supervise/prompts.rs"]
+        }))?;
+        let plan: SupervisorPlan = serde_json::from_value(serde_json::json!({
+            "task": "implement the assigned prompt change",
+            "assignments": []
+        }))?;
+        let worktree = WorktreeRecord {
+            name: assignment.id.clone(),
+            path: PathBuf::from("/workspace/direct-worker"),
+            branch: "maco/direct-worker".to_string(),
+        };
+        let claim = PathClaim {
+            token: ClaimToken::from_u64(1),
+            agent_id: assignment.id.clone(),
+            paths: assignment.assigned_paths.clone(),
+        };
+        let run_dir = Path::new("/workspace/run");
+        let field_guide = SupervisorFieldGuidePrompt::empty()?;
+        let render = |runtime| {
+            render_direct_terminal_worker_prompt(
+                ChildOrchestratorPromptContext {
+                    plan: &plan,
+                    execution_target: None,
+                    assignment: &assignment,
+                    run_dir,
+                    worktree: &worktree,
+                    report_path: &run_dir.join("incoming/direct-worker.json"),
+                    schema_path: &run_dir.join("schemas/orchestrator-review-report.schema.json"),
+                    worker_schema_path: &run_dir.join("schemas/worker-report.schema.json"),
+                    auditor_schema_path: &run_dir.join("schemas/auditor-report.schema.json"),
+                    consultant: &SupervisorConsultantPlan::default(),
+                    claim_context: ChildPromptClaimContext {
+                        claim: &claim,
+                        semantic_intent_token: None,
+                    },
+                },
+                &run_dir.join("incoming"),
+                &field_guide,
+                runtime,
+            )
+        };
+        let prefix = direct_terminal_worker_cacheable_prefix(None)?;
+        let codex = render(SupervisorRuntime::Codex)?.prompt;
+        assert!(codex.starts_with(&prefix));
+        assert!(!codex.contains("Vibe direct-worker guidance:"));
+        let vibe = render(SupervisorRuntime::Vibe)?;
+        assert!(vibe.prompt.starts_with(&prefix));
+        assert_eq!(vibe.measurements.prompts[0].invariant_bytes, prefix.len());
+        let expected = format!(
+            "{prefix}{VIBE_DIRECT_WORKER_GUIDANCE}{}",
+            &codex[prefix.len()..]
+        )
+        .replace(
+            "- Direct worker runtime: codex\n",
+            "- Direct worker runtime: vibe\n",
+        );
+        assert_eq!(vibe.prompt, expected);
+        for runtime in [
+            SupervisorRuntime::Fake,
+            SupervisorRuntime::Grok,
+            SupervisorRuntime::Cursor,
+            SupervisorRuntime::ClaudeCode,
+            SupervisorRuntime::GeminiCli,
+            SupervisorRuntime::DeepSeek,
+        ] {
+            let prompt = render(runtime)?.prompt;
+            assert_eq!(
+                prompt,
+                codex.replace(
+                    "- Direct worker runtime: codex\n",
+                    &format!("- Direct worker runtime: {}\n", runtime.as_str())
+                )
+            );
+        }
+        Ok(())
     }
 
     #[test]

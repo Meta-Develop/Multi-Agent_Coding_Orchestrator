@@ -1,3 +1,4 @@
+use super::journal_observation::run_worker_execution_journal_command_with_environment;
 use super::*;
 use crate::safe_state::FileIdentity;
 use std::os::unix::{
@@ -240,6 +241,219 @@ fn worker_journal_declared_mismatch_is_preserved_and_rejected() {
     );
     assert!(run_worker_execution_journal_command(&path, &identity, &record, true).is_err());
     assert_eq!(fs::read(path).unwrap(), bytes);
+}
+
+fn journal_credential_environment() -> std::collections::BTreeMap<String, String> {
+    std::collections::BTreeMap::from([(
+        "MISTRAL_API_KEY".to_string(),
+        "synthetic-journal-credential".to_string(),
+    )])
+}
+
+#[test]
+fn journal_credential_argv_value_is_refused_before_launch() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = journal_credential_environment();
+    let value = environment["MISTRAL_API_KEY"].as_str();
+    let argv = format!("touch marker-{value}");
+    let record = observed_entry(&worktree, &["/bin/sh", "-c", &argv]);
+    let error = run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("WorkerJournalPrelaunchRejected:"),
+        "{error}"
+    );
+    assert!(error.contains("no command launched; journal unchanged"));
+    assert!(error.contains("MISTRAL_API_KEY"), "{error}");
+    assert!(!error.contains(value), "{error}");
+    assert!(fs::read(&path).unwrap().is_empty());
+    assert!(!worktree.join(format!("marker-{value}")).exists());
+}
+
+#[test]
+fn journal_credential_changed_path_value_is_refused_before_launch() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = std::collections::BTreeMap::from([(
+        "DEEPSEEK_API_KEY".to_string(),
+        "synthetic-deepseek-credential".to_string(),
+    )]);
+    let value = environment["DEEPSEEK_API_KEY"].as_str();
+    let mut record = observed_entry(&worktree, &["/bin/sh", "-c", "touch marker"]);
+    record.changed_paths = vec![PathBuf::from(format!("out-{value}.txt"))];
+    let error = run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("WorkerJournalPrelaunchRejected:"),
+        "{error}"
+    );
+    assert!(error.contains("DEEPSEEK_API_KEY"), "{error}");
+    assert!(!error.contains(value), "{error}");
+    assert!(fs::read(&path).unwrap().is_empty());
+    assert!(!worktree.join("marker").exists());
+}
+
+#[test]
+fn journal_credential_observe_mode_value_is_refused() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = journal_credential_environment();
+    let value = environment["MISTRAL_API_KEY"].as_str();
+    let payload = format!("*** Begin Patch\n*** patch {value}\n*** End Patch");
+    let record = observed_entry(&worktree, &["apply_patch", &payload]);
+    let error = run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        true,
+        &environment,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("WorkerJournalPrelaunchRejected:"),
+        "{error}"
+    );
+    assert!(error.contains("MISTRAL_API_KEY"), "{error}");
+    assert!(!error.contains(value), "{error}");
+    assert!(fs::read(&path).unwrap().is_empty());
+}
+
+#[test]
+fn journal_credential_variable_name_without_value_is_allowed() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = journal_credential_environment();
+    let value = environment["MISTRAL_API_KEY"].as_str();
+    let record = observed_entry(
+        &worktree,
+        &[
+            "/bin/sh",
+            "-c",
+            "printf '%s' '$MISTRAL_API_KEY' > name-only.txt",
+        ],
+    );
+    run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap();
+    assert_eq!(
+        fs::read_to_string(worktree.join("name-only.txt")).unwrap(),
+        "$MISTRAL_API_KEY"
+    );
+    let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+    assert_eq!(records.len(), 2);
+    assert_eq!(
+        records[1].changed_paths,
+        vec![PathBuf::from("name-only.txt")]
+    );
+    assert!(!fs::read_to_string(&path).unwrap().contains(value));
+}
+
+#[test]
+fn journal_credential_absent_environment_allows_command() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = std::collections::BTreeMap::new();
+    let record = observed_entry(&worktree, &["/bin/sh", "-c", "touch plain-marker"]);
+    run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap();
+    assert!(worktree.join("plain-marker").exists());
+    let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+    assert_eq!(records.len(), 2);
+}
+
+#[test]
+fn journal_credential_absolute_changed_path_value_is_refused_before_serialization() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = journal_credential_environment();
+    let value = environment["MISTRAL_API_KEY"].as_str();
+    let mut record = observed_entry(&worktree, &["/bin/sh", "-c", "touch marker"]);
+    record.changed_paths = vec![PathBuf::from(format!("/tmp/{value}"))];
+    let error = run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("WorkerJournalPrelaunchRejected:"),
+        "{error}"
+    );
+    assert!(error.contains("no command launched; journal unchanged"));
+    assert!(error.contains("MISTRAL_API_KEY"), "{error}");
+    assert!(!error.contains(value), "{error}");
+    assert!(fs::read(&path).unwrap().is_empty());
+    assert!(!worktree.join("marker").exists());
+}
+
+#[test]
+fn journal_credential_cwd_value_is_refused_before_launch() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment = journal_credential_environment();
+    let value = environment["MISTRAL_API_KEY"].as_str();
+    let mut record = observed_entry(&worktree, &["/bin/sh", "-c", "touch marker"]);
+    record.cwd = PathBuf::from(format!("/tmp/{value}"));
+    let error = run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(
+        error.starts_with("WorkerJournalPrelaunchRejected:"),
+        "{error}"
+    );
+    assert!(error.contains("no command launched; journal unchanged"));
+    assert!(error.contains("MISTRAL_API_KEY"), "{error}");
+    assert!(!error.contains(value), "{error}");
+    assert!(fs::read(&path).unwrap().is_empty());
+    assert!(!worktree.join("marker").exists());
+}
+
+#[test]
+fn journal_credential_short_value_in_argv_is_not_refused() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    let environment =
+        std::collections::BTreeMap::from([("MISTRAL_API_KEY".to_string(), "short".to_string())]);
+    let record = observed_entry(&worktree, &["/bin/sh", "-c", "touch short-marker"]);
+    run_worker_execution_journal_command_with_environment(
+        &path,
+        &identity,
+        &record,
+        false,
+        &environment,
+    )
+    .unwrap();
+    assert!(worktree.join("short-marker").exists());
+    let records = parse_worker_execution_journal(&fs::read(&path).unwrap(), &path).unwrap();
+    assert_eq!(records.len(), 2);
 }
 
 #[test]

@@ -439,6 +439,11 @@ pub(crate) fn bind_injected_supervisor_parent_acceptance_for_test<'a>(
 mod plan_validation;
 use plan_validation::*;
 
+mod vibe_worker;
+#[cfg(test)]
+#[path = "supervise/vibe_worker_tests.rs"]
+mod vibe_worker_tests;
+
 mod dispatch;
 pub(crate) mod operator_pricing;
 mod pricing_provenance;
@@ -1374,7 +1379,8 @@ pub(crate) fn admit_production_supervisor_catalog_preflight_grant(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => Ok(None),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Vibe => Ok(None),
     }
 }
 
@@ -1431,7 +1437,8 @@ impl RuntimeModelCatalog {
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
-            | SupervisorRuntime::DeepSeek => Ok(Self::OperatorDeclared),
+            | SupervisorRuntime::DeepSeek
+            | SupervisorRuntime::Vibe => Ok(Self::OperatorDeclared),
         }
     }
 

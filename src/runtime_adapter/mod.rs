@@ -19,6 +19,7 @@ pub mod hosted_callback;
 mod identity;
 pub(crate) use identity::effort_matches_request;
 pub use identity::{IdentityBasis, RuntimeIdentityObservation};
+pub(crate) mod vibe;
 
 /// Exact owned bootstrap selection. This is not a capability or identity claim.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -122,6 +123,9 @@ pub enum RuntimeId {
     #[serde(rename = "deepseek")]
     #[value(name = "deepseek", alias = "dsh")]
     DeepSeek,
+    #[serde(rename = "vibe")]
+    #[value(name = "vibe")]
+    Vibe,
 }
 
 /// Common launch boundary implemented by every subprocess runtime adapter.
@@ -350,6 +354,7 @@ pub fn adapter_for(id: AdapterId) -> Box<dyn AgentRuntimeAdapter> {
         AdapterId::ClaudeCode => Box::new(ClaudeCodeAdapter::from_environment()),
         AdapterId::GeminiCli => Box::new(GeminiAdapter::from_environment()),
         AdapterId::DeepSeek => Box::new(DeepSeekAdapter::from_environment()),
+        AdapterId::Vibe => Box::new(VibeAdapter::from_environment()),
     }
 }
 
@@ -369,6 +374,29 @@ impl DeepSeekAdapter {
 impl AgentRuntimeAdapter for DeepSeekAdapter {
     fn adapter_id(&self) -> AdapterId {
         AdapterId::DeepSeek
+    }
+
+    fn config(&self) -> &RuntimeAdapterConfig {
+        &self.config
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VibeAdapter {
+    config: RuntimeAdapterConfig,
+}
+
+impl VibeAdapter {
+    pub fn from_environment() -> Self {
+        Self {
+            config: RuntimeAdapterConfig::from_adapter_environment(AdapterId::Vibe),
+        }
+    }
+}
+
+impl AgentRuntimeAdapter for VibeAdapter {
+    fn adapter_id(&self) -> AdapterId {
+        AdapterId::Vibe
     }
 
     fn config(&self) -> &RuntimeAdapterConfig {
@@ -636,6 +664,13 @@ impl RuntimeAdapterConfig {
                 OutputCaptureMode::Stdout,
                 true,
             ),
+            AdapterId::Vibe => (
+                vibe::immutable_argument_template(),
+                // Vibe capture is stdout; the bounded result directory is
+                // rendered only through the {vibe_output_dir} placeholder.
+                OutputCaptureMode::Stdout,
+                false,
+            ),
             AdapterId::Codex | AdapterId::Fake => (Vec::new(), OutputCaptureMode::default(), false),
         };
         let binary = if adapter == AdapterId::ClaudeCode {
@@ -695,6 +730,7 @@ impl RuntimeAdapterConfig {
             }
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
             AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
+            AdapterId::Vibe => config.restore_immutable_vibe_descriptor(),
             _ => {}
         }
         Ok(config)
@@ -737,6 +773,7 @@ impl RuntimeAdapterConfig {
             AdapterId::Grok => config.restore_immutable_grok_descriptor(),
             AdapterId::ClaudeCode => config.restore_immutable_claude_descriptor(),
             AdapterId::DeepSeek => config.restore_immutable_deepseek_descriptor(),
+            AdapterId::Vibe => config.restore_immutable_vibe_descriptor(),
             _ => {}
         }
         config
@@ -750,10 +787,18 @@ impl RuntimeAdapterConfig {
         self.feed_prompt_on_stdin = true;
     }
 
+    fn restore_immutable_vibe_descriptor(&mut self) {
+        self.argument_template = vibe::immutable_argument_template();
+        self.env_passthrough.clear();
+        self.working_dir_flag = None;
+        self.output_capture = OutputCaptureMode::Stdout;
+        self.feed_prompt_on_stdin = false;
+    }
+
     fn replace_operator_argument_template(&mut self, adapter: AdapterId, args: &str) {
         if matches!(
             adapter,
-            AdapterId::Grok | AdapterId::ClaudeCode | AdapterId::DeepSeek
+            AdapterId::Grok | AdapterId::ClaudeCode | AdapterId::DeepSeek | AdapterId::Vibe
         ) {
             return;
         }
@@ -790,6 +835,37 @@ impl RuntimeAdapterConfig {
         context: &LaunchContext<'_>,
     ) -> Option<claude::ClaudeManagedLaunchContract> {
         claude::prove_managed_launch(self, context)
+    }
+
+    /// Prove the exact immutable Vibe launch contract for one concrete launch.
+    ///
+    /// The selected executable pathname is the only mutable part: the full
+    /// config must equal the Vibe defaults with `self.binary` copied over.
+    /// Operator template, environment passthrough, stdin prompt, cwd flag, and
+    /// output-capture mutations are refused. The selected model must validate
+    /// and the workspace must be absolute. Elevation is per-launch only; the
+    /// static [`RuntimeCapabilities::VIBE`] row stays fail-closed.
+    pub(crate) fn vibe_launch_contract(
+        &self,
+        context: &LaunchContext<'_>,
+    ) -> Result<RuntimeCapabilities> {
+        let mut expected = Self::defaults_for(AdapterId::Vibe);
+        expected.binary = self.binary.clone();
+        if self != &expected {
+            bail!(
+                "Vibe launch contract refused: only MACO_VIBE_BIN may override the adapter; \
+                 argument template, environment passthrough, stdin prompt, cwd flag, and \
+                 output capture must stay at the immutable Vibe defaults"
+            );
+        }
+        vibe::validate_model(context.model)?;
+        if !context.cwd.is_absolute() {
+            bail!("Vibe launch contract refused: workspace must be an absolute path");
+        }
+        Ok(RuntimeCapabilities {
+            side_effect_confinement: SideEffectConfinement::Verified,
+            ..RuntimeCapabilities::VIBE
+        })
     }
 
     pub const fn grok_interaction_protocol(&self) -> GrokInteractionProtocol {
@@ -980,6 +1056,16 @@ impl RuntimeAdapterConfig {
         } else {
             String::new()
         };
+        // The Vibe result directory is parent-owned evidence. A descriptor that
+        // renders it must first prove the exact immutable Vibe launch contract;
+        // this check runs before any placeholder substitution.
+        if self
+            .argument_template
+            .iter()
+            .any(|token| token == "{vibe_output_dir}")
+        {
+            self.vibe_launch_contract(context)?;
+        }
         let values = BTreeMap::from([
             ("prompt", context.prompt.display().to_string()),
             ("prompt_text", prompt_text),
@@ -987,6 +1073,10 @@ impl RuntimeAdapterConfig {
             ("effort", context.effort.unwrap_or_default().to_string()),
             ("cwd", context.cwd.display().to_string()),
             ("output", context.output.display().to_string()),
+            (
+                "vibe_output_dir",
+                vibe::export_directory(context.output).display().to_string(),
+            ),
         ]);
         let mut argv = Vec::new();
         for token in &self.argument_template {
@@ -1133,6 +1223,19 @@ impl RuntimeAdapterConfig {
             .any(|args| args == ["--sandbox", "off"])
         {
             bail!("Grok inner sandbox off requires the verified ExternalGrok runner; uncontained adapter execution refused");
+        }
+        // A Vibe descriptor that renders the parent-owned result directory is
+        // the production Vibe shape; its confinement proof is enforced by the
+        // external production path, never by this generic in-process runner.
+        if self
+            .argument_template
+            .iter()
+            .any(|token| token == "{vibe_output_dir}")
+        {
+            bail!(
+                "uncontained Vibe adapter execution refused; the exact immutable Vibe contract \
+                 must be verified by the external production launch path"
+            );
         }
         self.execute_rendered(context, launch, &resolved)
     }

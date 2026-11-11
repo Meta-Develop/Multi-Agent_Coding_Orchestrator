@@ -92,6 +92,7 @@ pub(crate) fn capture(
         CompletedTargetStaging {
             output: &mut staged,
             codex_home: None,
+            vibe_export: None,
         },
         &mut output,
         &mut log,
