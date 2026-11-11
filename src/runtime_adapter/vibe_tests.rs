@@ -419,3 +419,65 @@ fn vibe_final_assistant_text_rejects_oversized_stream_and_text() {
     );
     assert!(final_assistant_text(&vibe_stream(&[line.as_str()])).is_err());
 }
+
+#[test]
+fn vibe_final_assistant_text_byte_boundary() {
+    const CAP: usize = 256 * 1024;
+    // A single text block whose UTF-8 encoding is exactly the cap: the multibyte
+    // character straddles the boundary, so a byte-wise truncation would split it.
+    let mut single = "x".repeat(CAP - 'é'.len_utf8());
+    single.push('é');
+    assert_eq!(single.len(), CAP);
+    let single_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [{"type": "text", "text": single}],
+    })
+    .to_string();
+    let stream = vibe_stream(&[single_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert_eq!(final_assistant_text(&stream).unwrap(), single);
+
+    // Two text blocks whose joined output, including the two-newline separator,
+    // is exactly the cap.
+    let first = "a".repeat(CAP / 2 - 1);
+    let second = format!("{}é", "b".repeat(CAP - first.len() - 2 - 'é'.len_utf8()));
+    assert_eq!(first.len() + 2 + second.len(), CAP);
+    let joined = format!("{first}\n\n{second}");
+    assert_eq!(joined.len(), CAP);
+    let two_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [
+            {"type": "text", "text": first},
+            {"type": "text", "text": second},
+        ],
+    })
+    .to_string();
+    let stream = vibe_stream(&[two_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert_eq!(final_assistant_text(&stream).unwrap(), joined);
+
+    // One complete multibyte character past the joined-text cap is rejected.
+    // The overflow stays in the second block so the two-block aggregation path,
+    // including the two-newline separator, is what crosses the cap.
+    let over_second = format!("{second}é");
+    assert_eq!(over_second.len(), second.len() + 'é'.len_utf8());
+    let over_joined = format!("{first}\n\n{over_second}");
+    assert_eq!(over_joined.len(), CAP + 'é'.len_utf8());
+    let over_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [
+            {"type": "text", "text": first},
+            {"type": "text", "text": over_second},
+        ],
+    })
+    .to_string();
+    let stream = vibe_stream(&[over_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert!(final_assistant_text(&stream).is_err());
+}
