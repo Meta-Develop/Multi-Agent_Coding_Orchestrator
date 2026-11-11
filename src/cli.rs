@@ -368,6 +368,7 @@ impl Cli {
             .context("failed to configure supported Git repository extensions")?;
 
         match self.command {
+            Command::Doctor(args) => crate::doctor::run(&args.repo, args.json),
             Command::Init(args) => {
                 let info = WorktreeManager::init_repository(args.repo, &args.initial_branch)?;
                 print_repository_info(&info, args.json)
@@ -403,6 +404,8 @@ impl Cli {
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Report default Codex host prerequisites without launching a runtime.
+    Doctor(DoctorArgs),
     /// Initialize a Git repository for orchestrated agent work.
     Init(InitArgs),
     /// Inspect repository structure.
@@ -455,6 +458,16 @@ enum Command {
     Optimizer(OptimizerCommand),
     /// Submit authenticated in-flight steering against registered assignments.
     Steer(SteerCommand),
+}
+
+#[derive(Debug, Args)]
+struct DoctorArgs {
+    /// Git checkout to inspect.
+    #[arg(long, default_value = ".")]
+    repo: PathBuf,
+    /// Emit machine-readable JSON.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]

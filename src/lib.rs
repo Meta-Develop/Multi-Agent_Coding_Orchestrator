@@ -19,6 +19,7 @@ pub mod containment_probe;
 pub mod decision_claim;
 pub mod decision_ref;
 pub mod decision_store;
+pub(crate) mod doctor;
 pub mod eval_harness;
 pub mod evaluation;
 pub mod evaluation_gate_policy;
