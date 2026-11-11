@@ -132,6 +132,34 @@ fn vibe_argument_template_is_exact_and_repeats_enabled_tools() {
         .filter(|argument| argument.as_str() == "--enabled-tools")
         .count();
     assert_eq!(enabled_tools, 4);
+
+    let mut worker: Vec<std::ffi::OsString> = template.iter().map(Into::into).collect();
+    super::journaled_worker_arguments(&mut worker);
+    let tools: Vec<_> = worker
+        .windows(2)
+        .filter(|pair| pair[0] == "--enabled-tools")
+        .map(|pair| pair[1].to_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["bash", "read_file"]);
+    let mut expected: Vec<std::ffi::OsString> = template.iter().map(Into::into).collect();
+    expected.drain(12..16);
+    assert_eq!(worker, expected);
+}
+
+#[test]
+fn vibe_journaled_config_encodes_the_per_attempt_shell_as_data() {
+    let shell = Path::new("/private/attempt 'quoted' \\\"/journal-shell");
+    let config = super::journaled_config_document(MODEL_A, shell).unwrap();
+    let base = config_document(MODEL_A).unwrap();
+    let encoded = config
+        .strip_prefix(&base)
+        .unwrap()
+        .strip_prefix("\n[tools.bash]\nshell = ")
+        .unwrap()
+        .trim_end();
+    // The generated TOML basic string uses the JSON string escape subset.
+    let decoded: String = serde_json::from_str(encoded).unwrap();
+    assert_eq!(decoded, shell.to_str().unwrap());
 }
 
 #[test]

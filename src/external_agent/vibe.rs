@@ -80,6 +80,8 @@ pub(crate) struct VibeStaging {
     /// Fresh `config.toml` inside `VIBE_HOME` pinning the requested model.
     /// Held for capability lifetime only; the digest lives in `evidence`.
     pub(crate) config: ReservedOutputFile,
+    #[cfg(target_os = "linux")]
+    pub(super) journal_shell: Option<JournalShell>,
     /// Private export directory created before launch and held by inode.
     pub(crate) export: SecureOutputRoot,
     /// Private shell HOME/TMPDIR and XDG directories.
@@ -92,6 +94,11 @@ impl VibeStaging {
     /// directories are removed before their containing VIBE_HOME.
     pub(super) fn cleanup(self) -> Result<()> {
         self.home.verify_path_identity()?;
+        #[cfg(target_os = "linux")]
+        if let Some(shell) = self.journal_shell {
+            shell.verify()?;
+            fs::remove_file(&shell.path)?;
+        }
         self.config
             .remove()
             .context("failed to remove the held Vibe config")?;
@@ -346,9 +353,237 @@ pub(super) fn stage(
         },
         home,
         config,
+        #[cfg(target_os = "linux")]
+        journal_shell: None,
         export,
         shell_directories,
     })
+}
+
+/// Executable control leaf retained by descriptor and digest for the attempt.
+#[cfg(target_os = "linux")]
+pub(super) struct JournalShell {
+    pub(super) path: PathBuf,
+    file: fs::File,
+    digest: String,
+}
+
+#[cfg(target_os = "linux")]
+impl JournalShell {
+    fn verify(&self) -> Result<()> {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let held = self.file.metadata()?;
+        let path = fs::symlink_metadata(&self.path)?;
+        let mut bytes = vec![0; usize::try_from(held.len())?];
+        self.file.read_exact_at(&mut bytes, 0)?;
+        if !path.is_file()
+            || held.dev() != path.dev()
+            || held.ino() != path.ino()
+            || path.mode() & 0o7777 != 0o700
+            || path.nlink() != 1
+            || sha256_hex(&bytes) != self.digest
+        {
+            bail!("Vibe journal shell identity or bytes changed");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
+/// Vibe also invokes this shell with -lc to snapshot its environment. Refuse
+/// that setup silently, without executing or journaling the environment dump.
+#[cfg(target_os = "linux")]
+fn journal_shell_document(binding: &BoundWorkerJournalAppend, cwd: &Path) -> Result<String> {
+    if !Path::new("/bin/bash").is_file() {
+        bail!("Vibe journal shell requires the absolute system /bin/bash");
+    }
+    let mut argv = binding.command_prefix()?;
+    argv.extend([
+        "--cwd".into(),
+        cwd.to_str()
+            .context("Vibe journal cwd requires UTF-8")?
+            .into(),
+        "--auto-timestamps".into(),
+        "--".into(),
+        "/bin/bash".into(),
+        "-c".into(),
+    ]);
+    let command = argv
+        .iter()
+        .map(|value| shell_quote(value))
+        .collect::<Vec<_>>()
+        .join(" ");
+    Ok(format!(
+        "#!/bin/bash\nif [ \"$#\" -ne 2 ] || [ \"$1\" != '-c' ]; then\n  exit 64\nfi\nexec {command} \"$2\"\n"
+    ))
+}
+
+/// Vibe 3.1.0's default_orchestrator.py puts project TOML above user TOML.
+/// Match layers/project.py::project_config_candidates: cwd and each ancestor,
+/// stopping BEFORE VIBE_HOME's parent. With --trust these can override the held
+/// shell and other fixed settings. Reject project config rather than merge it.
+/// Independently, agents/registry.py discovers builtin profile overrides via
+/// HarnessFilesManager.project_agents_dirs and paths/_local_config_files.py.
+/// Native argv has no --add-dir: that discovery checks only cwd/.vibe/agents,
+/// without requiring config.toml. Refuse that directory without reading profiles.
+#[cfg(target_os = "linux")]
+fn reject_project_config(cwd: &Path, home: &Path) -> Result<()> {
+    let stop = home.parent().context("Vibe home requires a parent")?;
+    let configs = cwd
+        .ancestors()
+        .take_while(|directory| *directory != stop)
+        .map(|directory| {
+            (
+                directory.join(".vibe/config.toml"),
+                "trusted project TOML can override the managed shell and fixed settings",
+            )
+        });
+    let agents = std::iter::once((
+        cwd.join(".vibe/agents"),
+        "project agent profiles can override the managed shell",
+    ));
+    for (path, reason) in configs.chain(agents) {
+        match fs::symlink_metadata(&path) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => {
+                return Err(error).context(format!(
+                    "cannot exclude Vibe project configuration at {}",
+                    path.display()
+                ));
+            }
+            // Conservatively reject links and non-files too; never read or
+            // interpret project-controlled configuration for this managed path.
+            Ok(_) => bail!(
+                "automatic Vibe journal refuses project configuration at {}: {reason}",
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+/// Runs after native argv authentication and effective prompt staging, before
+/// process construction. The existing binding alone supplies helper custody.
+#[cfg(target_os = "linux")]
+pub(super) fn prepare_journal_shell(
+    staging: &mut VibeStaging,
+    spec: &ExternalAgentCommand,
+    binding: Option<&BoundWorkerJournalAppend>,
+    argv: &mut Vec<OsString>,
+    profile: &mut Option<SideEffectConfinementProfile>,
+) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    if spec.invocation != ExternalAgentInvocation::Vibe
+        || spec.workspace_access != WorkspaceAccess::ReadWrite
+        || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+        || spec
+            .agent_lifecycle
+            .as_ref()
+            .is_none_or(|id| id.role != "worker")
+    {
+        return Ok(());
+    }
+    let binding = binding.context("Vibe writable Worker requires a bound execution journal")?;
+    binding.revalidate()?;
+    let cwd = fs::canonicalize(&spec.cwd)?;
+    if cwd != spec.cwd || staging.evidence.cwd != cwd {
+        bail!("Vibe journal shell requires the exact canonical assigned worktree");
+    }
+    reject_project_config(&cwd, staging.home.path())?;
+    if staging.journal_shell.is_some() {
+        bail!("Vibe journal shell is already staged");
+    }
+    if *argv != runtime_adapter_argv(spec)? {
+        bail!("Vibe journal shell requires the exact native argv");
+    }
+    let Some(SideEffectConfinementProfile::ExternalCodex(mounted)) = profile else {
+        bail!("Vibe journal shell requires the existing ExternalCodex profile");
+    };
+    staging.home.verify_path_identity()?;
+    let path = staging.home.path().join("journal-shell");
+    let document = journal_shell_document(binding, &cwd)?;
+    let mut file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .mode(0o600)
+        .open(&path)?;
+    file.write_all(document.as_bytes())?;
+    file.sync_all()?;
+    file.set_permissions(fs::Permissions::from_mode(0o700))?;
+    drop(file);
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(&path)?;
+    let shell = JournalShell {
+        path,
+        file,
+        digest: sha256_hex(document.as_bytes()),
+    };
+    shell.verify()?;
+    staging.journal_shell = Some(shell);
+    let shell = staging.journal_shell.as_ref().unwrap();
+    let document = crate::runtime_adapter::vibe::journaled_config_document(
+        &staging.evidence.model,
+        &shell.path,
+    )?;
+    staging
+        .config
+        .write_bytes_atomic(document.as_bytes(), MAX_PROMPT_BYTES)?;
+    staging.evidence.config_sha256 = sha256_hex(document.as_bytes());
+    *mounted = mounted
+        .clone()
+        .with_visible_read_only_file(&binding.helper_path)
+        .with_visible_read_only_file(staging.config.path())
+        .with_visible_read_only_file(&shell.path);
+    crate::runtime_adapter::vibe::journaled_worker_arguments(argv);
+    // One explicit initial observation per attempt, through the existing core.
+    // This records retained edits against HEAD without executing or reapplying
+    // them. Never repeat this before individual commands: later unobserved
+    // mutations must still fail the core's baseline continuity check.
+    binding.revalidate()?;
+    crate::supervise::run_worker_execution_journal_command_with_clock(
+        &binding.journal.path,
+        &crate::safe_state::FileIdentity {
+            device: binding.journal.identity.device,
+            file: binding.journal.identity.inode,
+        },
+        &crate::supervise::WorkerExecutionJournalEntry {
+            command: vec!["true".into()],
+            cwd,
+            start_timestamp: String::new(),
+            end_timestamp: String::new(),
+            changed_paths: Vec::new(),
+            observation: None,
+        },
+        true,
+        true,
+    )
+    .context("Vibe initial journal observation failed before launch")?;
+    binding.revalidate()?;
+    Ok(())
+}
+
+/// Recheck held controls immediately before target release.
+#[cfg(target_os = "linux")]
+pub(super) fn verify_journal_shell(staging: &VibeStaging) -> Result<()> {
+    if let Some(shell) = &staging.journal_shell {
+        staging.home.verify_path_identity()?;
+        reject_project_config(&staging.evidence.cwd, staging.home.path())?;
+        shell.verify()?;
+        let document = staging.config.read_bounded(MAX_PROMPT_BYTES)?;
+        if sha256_hex(&document) != staging.evidence.config_sha256 {
+            bail!("Vibe journal config bytes changed");
+        }
+    }
+    Ok(())
 }
 
 /// Applies the private Vibe environment to the sanitized child environment map.

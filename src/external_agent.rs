@@ -1659,6 +1659,14 @@ fn bind_worker_journal_append_operation(
         "\n\nParent-bound Worker journal append operation:\n- Exact argv prefix (JSON array, not a shell command): {prefix}\n- Current MACO executable SHA-256: {}\n{examples}- Start EVERY attempt, including a correction/relaunch, with the copyable observation call BEFORE inspection, editing, or validation. Observe any pending prior-attempt delta without reapplying edits; use this attempt's bound prefix.\n- Invoke this exact executable/prefix; append --cwd <assigned-worktree> --auto-timestamps, then -- and original shell argv. The wrapper records real UTC start/end timestamps itself; do not invent timestamps or run date. This wrapper EXECUTES shell argv once and observes content changes; do not execute argv separately. --changed-path is optional: omit it and let the wrapper derive changed paths. Read-only validation must omit --changed-path; files already dirty from an earlier edit are not changes made by this command.\n- Native apply_patch/Edit workflow: invoke the prefix with --cwd <assigned-worktree> --auto-timestamps --observe-changes -- true BEFORE the first edit to establish a baseline; invoke the native tool; immediately invoke that observation command again; the wrapper records observation time. Do not run another action between the edit and its observation. Alternatively record the full native argv/payload after -- in observation mode; it is never executed.\n{observation_recovery}- Use argument passing, never hand-escaped JSON/printf/echo. No PATH, identity discovery, replacement, truncation, or alternative appender. {failure_rule} Do not recursively journal this wrapper. Its arguments confer no launch, claim, or evidence authority.\n",
         binding.helper_sha256,
     );
+    let appendix = if vibe {
+        format!(
+            "\n\nParent-bound automatic Vibe Worker journal:\n- Bash is automatically executed once through the held MACO appender (SHA-256 {}). Use plain bash, never manually invoke journal-append or native write/edit. read_file may be used for reads.\n- The configured shell binds the exact existing journal device/inode and canonical assigned cwd; commands_run must preserve the journal's exact inner argv and cwd. The inner shell is /bin/bash -c with the complete original script as one argument.\n- Run bash calls serially and retain failed commands and exact observed stdout/stderr. Journal errors are visible failures: stop without repair, reconstruction, or retry. Never replace the precreated journal or change control files.\n",
+            binding.helper_sha256,
+        )
+    } else {
+        appendix
+    };
     if prompt
         .len()
         .checked_add(appendix.len())
@@ -1669,13 +1677,9 @@ fn bind_worker_journal_append_operation(
     }
     *profile = Some(match profile.as_ref() {
         Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) if vibe => {
-            // Vibe keeps the existing ExternalCodex outer containment unchanged;
-            // only this exact running image is exposed as a read-only helper file.
-            SideEffectConfinementProfile::ExternalCodex(
-                codex_profile
-                    .clone()
-                    .with_visible_read_only_file(&binding.helper_path),
-            )
+            // Vibe projects this exact held helper together with its shell and
+            // config after effective prompt staging, before process construction.
+            SideEffectConfinementProfile::ExternalCodex(codex_profile.clone())
         }
         Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) => {
             // Preserve Codex's exact :minimal inner rule as well as the outer mount.
@@ -9271,7 +9275,7 @@ fn run_external_agent_runtime_inner(
             }
         };
         target_spec.prompt = staged_prompt;
-        let profile = match side_effect_profile {
+        let mut profile = match side_effect_profile {
             Some(SideEffectConfinementProfile::ExternalCodex(profile)) => {
                 Some(SideEffectConfinementProfile::ExternalCodex(
                     profile.with_visible_read_only_file(&target_spec.prompt),
@@ -9299,6 +9303,29 @@ fn run_external_agent_runtime_inner(
                 return report;
             }
         };
+        let prepared = output_staging
+            .vibe
+            .as_mut()
+            .context("Vibe private staging is missing")
+            .and_then(|staged| {
+                vibe::prepare_journal_shell(
+                    staged,
+                    &target_spec,
+                    worker_journal_append.as_ref(),
+                    &mut argv,
+                    &mut profile,
+                )?;
+                report.stdout.run_metadata.vibe_launch = Some(staged.evidence.clone());
+                Ok(())
+            });
+        if let Err(error) = prepared {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("Vibe journal shell staging refused: {error:#}"),
+            );
+            return report;
+        }
         bound_argv_digest = match argv_digest(&argv) {
             Ok(digest) => Some(digest),
             Err(error) => {
@@ -9711,6 +9738,18 @@ fn run_external_agent_runtime_inner(
             "external agent was cancelled before target start".to_string(),
         );
         return report;
+    }
+
+    #[cfg(target_os = "linux")]
+    if let Some(staged) = output_staging.vibe.as_ref() {
+        if let Err(error) = vibe::verify_journal_shell(staged) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_external_error(
+                &mut report,
+                format!("Vibe journal controls changed before release: {error:#}"),
+            );
+            return report;
+        }
     }
 
     #[cfg(target_os = "linux")]

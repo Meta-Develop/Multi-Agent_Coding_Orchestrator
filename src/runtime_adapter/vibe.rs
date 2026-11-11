@@ -63,6 +63,34 @@ pub(crate) fn immutable_argument_template() -> Vec<String> {
     .collect()
 }
 
+/// Restrict already authenticated native argv for an automatic journal Worker.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn journaled_worker_arguments(arguments: &mut Vec<std::ffi::OsString>) {
+    let mut index = 0;
+    while index + 1 < arguments.len() {
+        if arguments[index] == "--enabled-tools"
+            && matches!(arguments[index + 1].to_str(), Some("write_file" | "edit"))
+        {
+            arguments.drain(index..index + 2);
+        } else {
+            index += 1;
+        }
+    }
+}
+
+/// Encode the held per-attempt shell path as TOML data, never shell source.
+#[cfg(any(target_os = "linux", test))]
+pub(crate) fn journaled_config_document(model: &str, shell: &Path) -> Result<String> {
+    let shell = shell
+        .to_str()
+        .context("Vibe journal shell requires a UTF-8 path")?;
+    let quoted = serde_json::to_string(shell)?;
+    Ok(format!(
+        "{}\n[tools.bash]\nshell = {quoted}\n",
+        config_document(model)?
+    ))
+}
+
 /// Directory the CLI writes its export into for a given output directory.
 ///
 /// The export is a sibling of the output directory, named after it with a
