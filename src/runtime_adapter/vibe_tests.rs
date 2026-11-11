@@ -132,6 +132,34 @@ fn vibe_argument_template_is_exact_and_repeats_enabled_tools() {
         .filter(|argument| argument.as_str() == "--enabled-tools")
         .count();
     assert_eq!(enabled_tools, 4);
+
+    let mut worker: Vec<std::ffi::OsString> = template.iter().map(Into::into).collect();
+    super::journaled_worker_arguments(&mut worker);
+    let tools: Vec<_> = worker
+        .windows(2)
+        .filter(|pair| pair[0] == "--enabled-tools")
+        .map(|pair| pair[1].to_str().unwrap())
+        .collect();
+    assert_eq!(tools, ["bash", "read_file"]);
+    let mut expected: Vec<std::ffi::OsString> = template.iter().map(Into::into).collect();
+    expected.drain(12..16);
+    assert_eq!(worker, expected);
+}
+
+#[test]
+fn vibe_journaled_config_encodes_the_per_attempt_shell_as_data() {
+    let shell = Path::new("/private/attempt 'quoted' \\\"/journal-shell");
+    let config = super::journaled_config_document(MODEL_A, shell).unwrap();
+    let base = config_document(MODEL_A).unwrap();
+    let encoded = config
+        .strip_prefix(&base)
+        .unwrap()
+        .strip_prefix("\n[tools.bash]\nshell = ")
+        .unwrap()
+        .trim_end();
+    // The generated TOML basic string uses the JSON string escape subset.
+    let decoded: String = serde_json::from_str(encoded).unwrap();
+    assert_eq!(decoded, shell.to_str().unwrap());
 }
 
 #[test]
@@ -390,4 +418,66 @@ fn vibe_final_assistant_text_rejects_oversized_stream_and_text() {
         r#"{{"type":"message","role":"assistant","generationStatus":"completed","content":[{{"type":"text","text":"{long_text}"}}]}}"#
     );
     assert!(final_assistant_text(&vibe_stream(&[line.as_str()])).is_err());
+}
+
+#[test]
+fn vibe_final_assistant_text_byte_boundary() {
+    const CAP: usize = 256 * 1024;
+    // A single text block whose UTF-8 encoding is exactly the cap: the multibyte
+    // character straddles the boundary, so a byte-wise truncation would split it.
+    let mut single = "x".repeat(CAP - 'é'.len_utf8());
+    single.push('é');
+    assert_eq!(single.len(), CAP);
+    let single_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [{"type": "text", "text": single}],
+    })
+    .to_string();
+    let stream = vibe_stream(&[single_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert_eq!(final_assistant_text(&stream).unwrap(), single);
+
+    // Two text blocks whose joined output, including the two-newline separator,
+    // is exactly the cap.
+    let first = "a".repeat(CAP / 2 - 1);
+    let second = format!("{}é", "b".repeat(CAP - first.len() - 2 - 'é'.len_utf8()));
+    assert_eq!(first.len() + 2 + second.len(), CAP);
+    let joined = format!("{first}\n\n{second}");
+    assert_eq!(joined.len(), CAP);
+    let two_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [
+            {"type": "text", "text": first},
+            {"type": "text", "text": second},
+        ],
+    })
+    .to_string();
+    let stream = vibe_stream(&[two_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert_eq!(final_assistant_text(&stream).unwrap(), joined);
+
+    // One complete multibyte character past the joined-text cap is rejected.
+    // The overflow stays in the second block so the two-block aggregation path,
+    // including the two-newline separator, is what crosses the cap.
+    let over_second = format!("{second}é");
+    assert_eq!(over_second.len(), second.len() + 'é'.len_utf8());
+    let over_joined = format!("{first}\n\n{over_second}");
+    assert_eq!(over_joined.len(), CAP + 'é'.len_utf8());
+    let over_line = serde_json::json!({
+        "type": "message",
+        "role": "assistant",
+        "generationStatus": "completed",
+        "content": [
+            {"type": "text", "text": first},
+            {"type": "text", "text": over_second},
+        ],
+    })
+    .to_string();
+    let stream = vibe_stream(&[over_line.as_str()]);
+    assert!(stream.len() <= 8 * 1024 * 1024);
+    assert!(final_assistant_text(&stream).is_err());
 }

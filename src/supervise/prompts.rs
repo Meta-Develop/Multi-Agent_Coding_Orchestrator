@@ -1251,17 +1251,37 @@ Final JSON:
 "#
 }
 
+/// Replace only manual journaling and final-output guidance for this runtime.
+/// All shared scope, permission, Git and evidence checks remain byte-identical.
+fn vibe_direct_worker_prefix(prefix: &str) -> Result<String> {
+    Ok(prefix.replace(
+        &worker_execution_journal_prompt_contract()?,
+        VIBE_AUTOMATIC_JOURNAL_CONTRACT,
+    ).replace(
+        "- Return exactly one WorkerReport JSON object matching the declared worker schema. Do not return an OrchestratorReviewReport, prose, Markdown, or a code fence.",
+        "- Prefer exactly one bare final WorkerReport JSON object matching the declared worker schema. A structurally recovered final JSON after prose or fences retains a recovery warning; recovery alone is not fabricated execution evidence. All semantic evidence checks still apply.",
+    ))
+}
+
+const VIBE_AUTOMATIC_JOURNAL_CONTRACT: &str = r#"- Use plain bash for every command and edit. Its configured shell automatically executes each script ONCE through the parent-bound journal-append helper with automatic UTC timestamps and the exact canonical assigned worktree. Never manually nest journal-append, use native write/edit, or reconstruct journal evidence. read_file may be used for reads.
+- Before launch the parent records this attempt's initial observation, including retained prior-attempt edits, without executing argv or reapplying edits. Its ["true"] journal row is observation evidence, not a command you executed. Later unexpected unobserved edits still fail; do not repair the baseline.
+- Run bash calls one at a time, including read-only validation; wait for each call to finish.
+- The wrapper derives changed_paths and checks all paths, including out-of-scope paths. Never supply invented timestamps or changed paths.
+- Journal errors: stop without repair or retry. No hand JSON, identity discovery, PATH change or alternative appender. For observed environment errors include environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true.
+- The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Do not modify the held shim/config/helper. Invalid journal bindings fail before launch.
+- WorkerReport.commands_run may be a subset of real journal records, failed commands included. Copy each command array element and exact absolute cwd byte-for-byte. Preserve the inner argv: ["/bin/bash","-c","<complete original script>"], with a matching finished journal record. Never split scripts, drop wrappers, paraphrase commands or invent command identities.
+- Preserve actual command outcomes, including failed/repaired calls. stdout and stderr must be empty or copied exactly from the corresponding observed stream, never shortened, reworded or synthesized."#;
+
 const VIBE_DIRECT_WORKER_GUIDANCE: &str = r#"
 Vibe direct-worker guidance:
-The final message is exactly one JSON WorkerReport object with no other text or Markdown fences. Before writing it, read the generated WorkerReport schema at the WorkerReport schema path below with read_file.
+Prefer a bare final JSON WorkerReport object. A structurally recovered final JSON retains the recovery warning and all semantic evidence checks. Before writing it, read the generated WorkerReport schema at the WorkerReport schema path below with read_file.
 Item key sets from that schema (optional keys may be omitted):
 findings required keys: severity, message, paths; optional keys: (none)
 commands_run required keys: command, cwd, status, timeout_seconds, duration_ms, timed_out, stdout, stderr, environment_preflight_results, environment_failures; optional keys: codex_parent_evidence, error, exit_code, fixed_version_probe_evidence, grok_acp_parent_evidence, grok_stream_usage_evidence, runtime_identity, sandbox_denials
 validation_results required keys: name, status, command; optional keys: message
 Every findings item uses message, never summary.
-Every bash tool call, including read-only inspection with cd, ls, cat, grep, sed, wc or git, must be the bound journal-append invocation. Files may also be read with read_file.
+Use plain bash for all commands and edits: the configured shell journals automatically. Never manually nest journal-append or use native write/edit. Files may also be read with read_file.
 commands_run stdout and stderr are either empty or copied byte for byte from the observed output in the corresponding stream, never shortened or reworded. Copy any timestamp in the report from the journal records, readable with read_file at the Execution journal path below, never from an example.
-After each native edit or write, run the bound observation before any other action; observe each edit separately.
 Read only the files and sections the assigned change needs: this session has a fixed token cap.
 "#;
 
@@ -1298,6 +1318,11 @@ fn render_direct_terminal_worker_prompt(
     }
 
     let cacheable_prefix = direct_terminal_worker_cacheable_prefix(execution_target)?;
+    let cacheable_prefix = if launch_runtime == SupervisorRuntime::Vibe {
+        vibe_direct_worker_prefix(&cacheable_prefix)?
+    } else {
+        cacheable_prefix
+    };
     let runtime_guidance = if launch_runtime == SupervisorRuntime::Vibe {
         VIBE_DIRECT_WORKER_GUIDANCE
     } else {
@@ -2250,10 +2275,26 @@ mod regression_tests {
         assert!(codex.starts_with(&prefix));
         assert!(!codex.contains("Vibe direct-worker guidance:"));
         let vibe = render(SupervisorRuntime::Vibe)?;
-        assert!(vibe.prompt.starts_with(&prefix));
-        assert_eq!(vibe.measurements.prompts[0].invariant_bytes, prefix.len());
+        let vibe_prefix = vibe_direct_worker_prefix(&prefix)?;
+        assert!(vibe.prompt.starts_with(&vibe_prefix));
+        assert_eq!(
+            vibe.measurements.prompts[0].invariant_bytes,
+            vibe_prefix.len()
+        );
+        assert!(!vibe.prompt.contains("Native apply_patch/Edit"));
+        assert!(!vibe.prompt.contains("--observe-changes"));
+        assert!(!vibe
+            .prompt
+            .contains("must be the bound journal-append invocation"));
+        assert!(vibe.prompt.contains("Never manually nest journal-append"));
+        assert!(vibe
+            .prompt
+            .contains("recovery alone is not fabricated execution evidence"));
+        assert!(vibe
+            .prompt
+            .contains("Any commands_run entry with non-null error"));
         let expected = format!(
-            "{prefix}{VIBE_DIRECT_WORKER_GUIDANCE}{}",
+            "{vibe_prefix}{VIBE_DIRECT_WORKER_GUIDANCE}{}",
             &codex[prefix.len()..]
         )
         .replace(

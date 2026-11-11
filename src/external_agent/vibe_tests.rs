@@ -2,6 +2,781 @@
 //! installed Vibe, no network, no real credential files are ever opened.
 use super::*;
 
+#[cfg(target_os = "linux")]
+mod automatic_journal {
+    use super::*;
+    use clap::Parser;
+
+    fn fixture() -> Result<(
+        tempfile::TempDir,
+        ExternalAgentCommand,
+        ProtectedWorktreeControls,
+        ExternalOutputStaging,
+        Option<SideEffectConfinementProfile>,
+        BoundWorkerJournalAppend,
+    )> {
+        let (temp, mut spec, controls) = worker_journal_append_binding_tests::fixture();
+        spec = spec
+            .with_runtime_adapter(
+                RuntimeId::Vibe,
+                RuntimeAdapterConfig::defaults(RuntimeId::Vibe),
+            )
+            .with_model_selection(Some("mistral-small-latest".into()), None)
+            .with_writable_runtime_selection("worker", RuntimeId::Vibe, true)?
+            .with_worktree_writable_confinement(WorktreeWritableAdmission {
+                version: WORKTREE_WRITABLE_ADMISSION_SCHEMA_VERSION,
+                assignment_id: "worker".into(),
+                attempt: 1,
+                target: WritableLaunchTarget::ManagedChildWorktree,
+                worktree: ManagedWorktreeAdmission {
+                    kind: ManagedWorktreeAdmissionKind::ManagedDisposable,
+                    worktree_id: "worker".into(),
+                },
+                claims: HeldPathClaimsAdmission {
+                    state: HeldPathClaimsAdmissionState::Held,
+                    token: 41,
+                    paths: vec![PathBuf::from("source.txt")],
+                },
+                native_sandbox: NativeSandboxAdmission {
+                    runtime: RuntimeId::Vibe,
+                    workspace_access: WorkspaceAccess::ReadWrite,
+                    side_effect_confinement: SideEffectConfinement::Verified,
+                },
+            });
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "run",
+            "worker",
+            1,
+            &spec.program,
+            spec.model.as_deref(),
+            "vibe-worker-duty",
+        )?;
+        spec = spec
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+        let repo = git2::Repository::init(&spec.cwd)?;
+        fs::write(spec.cwd.join("source.txt"), "original\n")?;
+        let mut index = repo.index()?;
+        index.add_path(Path::new("source.txt"))?;
+        index.write()?;
+        let oid = index.write_tree()?;
+        let tree = repo.find_tree(oid)?;
+        let signature = git2::Signature::now("Fixture", "fixture@example.invalid")?;
+        repo.commit(Some("HEAD"), &signature, &signature, "fixture", &tree, &[])?;
+        fs::write(&spec.prompt, b"synthetic Worker prompt")?;
+        let mut staging = ExternalOutputStaging::create_under(temp.path(), &spec.cwd)?;
+        staging.stage_vibe_launch(&spec)?;
+        let mut profile = worker_journal_append_binding_tests::profile(&spec);
+        let mut prompt = fs::read(&spec.prompt)?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::ExplicitCustom,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        )?
+        .context("expected Vibe journal binding")?;
+        let prompt = String::from_utf8(prompt)?;
+        assert!(prompt.contains("Parent-bound automatic Vibe Worker journal:"));
+        assert!(!prompt.contains("Native apply_patch/Edit"));
+        assert!(!prompt.contains("--observe-changes"));
+        Ok((temp, spec, controls, staging, profile, binding))
+    }
+
+    #[test]
+    fn vibe_production_journal_shell_pins_config_argv_and_readonly_controls() -> Result<()> {
+        let (_temp, spec, controls, mut staging, mut profile, binding) = fixture()?;
+        // Match production order: effective prompt delivery precedes shim binding.
+        let mut target = spec.clone();
+        target.prompt = staging.stage_worker_effective_prompt(&spec.cwd, b"effective prompt")?;
+        let original_profile = profile.clone();
+        let mut argv = runtime_adapter_argv(&target)?;
+        let mut expected_argv = argv.clone();
+        expected_argv.drain(12..16);
+        vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &target,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        let staged = staging.vibe.as_ref().unwrap();
+        vibe::verify_journal_shell(staged)?;
+        let shell = staged.journal_shell.as_ref().unwrap();
+        let config = fs::read_to_string(staged.config.path())?;
+        let base = crate::runtime_adapter::vibe::config_document(&staged.evidence.model)?;
+        let encoded = config
+            .strip_prefix(&base)
+            .unwrap()
+            .strip_prefix("\n[tools.bash]\nshell = ")
+            .unwrap()
+            .trim_end();
+        assert_eq!(
+            serde_json::from_str::<String>(encoded)?,
+            shell.path.to_str().unwrap()
+        );
+        let source = fs::read_to_string(&shell.path)?;
+        let prefix = binding.command_prefix()?;
+        let mut expected = prefix.clone();
+        expected.extend([
+            "--cwd".into(),
+            spec.cwd.to_str().unwrap().into(),
+            "--auto-timestamps".into(),
+            "--".into(),
+            "/bin/bash".into(),
+            "-c".into(),
+        ]);
+        assert!(source.contains(&format!(
+            "exec {} \"$2\"\n",
+            expected
+                .iter()
+                .map(|value| vibe::shell_quote(value))
+                .collect::<Vec<_>>()
+                .join(" "),
+        )));
+        assert!(!source.contains("SHELL"));
+        assert_eq!(binding.helper_path, env::current_exe()?);
+        assert_eq!(
+            prefix[4],
+            controls.exact_writable_artifact_files[0]
+                .path
+                .to_str()
+                .unwrap()
+        );
+        assert_eq!(
+            prefix[6],
+            controls.exact_writable_artifact_files[0]
+                .identity
+                .device
+                .to_string()
+        );
+        assert_eq!(
+            prefix[8],
+            controls.exact_writable_artifact_files[0]
+                .identity
+                .inode
+                .to_string()
+        );
+        assert_eq!(argv, expected_argv);
+        let tools: Vec<_> = argv
+            .windows(2)
+            .filter(|pair| pair[0] == "--enabled-tools")
+            .map(|pair| pair[1].to_str().unwrap())
+            .collect();
+        assert_eq!(tools, ["bash", "read_file"]);
+        let Some(SideEffectConfinementProfile::ExternalCodex(original)) = original_profile else {
+            panic!("ExternalCodex expected");
+        };
+        assert_eq!(
+            profile,
+            Some(SideEffectConfinementProfile::ExternalCodex(
+                original
+                    .with_visible_read_only_file(&binding.helper_path)
+                    .with_visible_read_only_file(staged.config.path())
+                    .with_visible_read_only_file(&shell.path),
+            ))
+        );
+        assert_eq!(
+            sha256_hex(&fs::read(staged.config.path())?),
+            staged.evidence.config_sha256
+        );
+        assert!(staged.evidence.matches(&spec));
+        staging.vibe.take().unwrap().cleanup()?;
+        Ok(())
+    }
+
+    /// In lib tests the held running image is the test harness, not the CLI.
+    /// Capture only the shim's exec argv, then invoke the real CLI/helper with
+    /// those exact arguments in-process. No caller-selected helper is installed.
+    fn capture_shim_argv(
+        shell: &Path,
+        capture: &Path,
+        flag: &str,
+        script: &str,
+    ) -> Result<std::process::Output> {
+        Ok(std::process::Command::new(shell)
+            .args([flag, script])
+            .env_clear()
+            .env("VIBE_TEST_ARGV", capture)
+            .env(
+                "BASH_FUNC_exec%%",
+                "() { printf '%s\\0' \"$@\" >> \"$VIBE_TEST_ARGV\";\n}",
+            )
+            .output()?)
+    }
+
+    fn captured_args(capture: &Path) -> Result<Vec<String>> {
+        fs::read(capture)?
+            .split(|byte| *byte == 0)
+            .filter(|part| !part.is_empty())
+            .map(|part| Ok(String::from_utf8(part.to_vec())?))
+            .collect()
+    }
+
+    #[test]
+    fn vibe_trusted_project_config_cannot_override_managed_shell() -> Result<()> {
+        // Vibe's --trust enables the higher-priority project layer. Both the
+        // cwd and ancestor discovery locations must fail before shim release.
+        for ancestor in [false, true] {
+            let (temp, spec, controls, mut staging, mut profile, binding) = fixture()?;
+            let directory = if ancestor { temp.path() } else { &spec.cwd };
+            let project = directory.join(".vibe/config.toml");
+            fs::create_dir_all(project.parent().unwrap())?;
+            fs::write(&project, "[tools.bash]\nshell = \"/bin/bash\"\n")?;
+            let staged = staging.vibe.as_mut().unwrap();
+            let config = fs::read(staged.config.path())?;
+            let mut argv = runtime_adapter_argv(&spec)?;
+            assert!(argv.iter().any(|argument| argument == "--trust"));
+            let original_argv = argv.clone();
+            let original_profile = profile.clone();
+            let error =
+                vibe::prepare_journal_shell(staged, &spec, Some(&binding), &mut argv, &mut profile)
+                    .unwrap_err();
+            let diagnostic = format!("{error:#}");
+            assert!(diagnostic.contains("trusted project TOML can override the managed shell"));
+            assert!(diagnostic.contains(project.to_str().unwrap()));
+            assert!(staged.journal_shell.is_none());
+            assert_eq!(fs::read(staged.config.path())?, config);
+            assert_eq!(argv, original_argv);
+            assert_eq!(profile, original_profile);
+            assert!(fs::read(&controls.exact_writable_artifact_files[0].path)?.is_empty());
+
+            // Also check the final pre-release gate, after successful staging.
+            fs::remove_file(&project)?;
+            vibe::prepare_journal_shell(staged, &spec, Some(&binding), &mut argv, &mut profile)?;
+            vibe::verify_journal_shell(staged)?;
+            fs::write(&project, "[tools.bash]\nshell = \"/bin/bash\"\n")?;
+            assert!(vibe::verify_journal_shell(staged).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_project_agent_profile_without_config_cannot_override_managed_shell() -> Result<()> {
+        let (_temp, spec, controls, mut staging, mut profile, binding) = fixture()?;
+        let agents = spec.cwd.join(".vibe/agents");
+        let project = agents.join("auto-approve.toml");
+        let override_profile = "[tools.bash]\nshell = \"/bin/bash\"\n";
+        fs::create_dir_all(&agents)?;
+        fs::write(&project, override_profile)?;
+        assert!(!spec.cwd.join(".vibe/config.toml").exists());
+        let staged = staging.vibe.as_mut().unwrap();
+        let config = fs::read(staged.config.path())?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        assert!(argv
+            .windows(2)
+            .any(|pair| pair[0] == "--agent" && pair[1] == "auto-approve"));
+        let original_argv = argv.clone();
+        let original_profile = profile.clone();
+        let error =
+            vibe::prepare_journal_shell(staged, &spec, Some(&binding), &mut argv, &mut profile)
+                .unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("project agent profiles can override the managed shell"));
+        assert!(diagnostic.contains(agents.to_str().unwrap()));
+        assert!(staged.journal_shell.is_none());
+        assert_eq!(fs::read(staged.config.path())?, config);
+        assert_eq!(argv, original_argv);
+        assert_eq!(profile, original_profile);
+        assert!(fs::read(&controls.exact_writable_artifact_files[0].path)?.is_empty());
+
+        // The same directory must also be refused if it appears after staging.
+        fs::remove_file(&project)?;
+        fs::remove_dir(&agents)?;
+        vibe::prepare_journal_shell(staged, &spec, Some(&binding), &mut argv, &mut profile)?;
+        vibe::verify_journal_shell(staged)?;
+        fs::create_dir(&agents)?;
+        fs::write(&project, override_profile)?;
+        assert!(!spec.cwd.join(".vibe/config.toml").exists());
+        let error = vibe::verify_journal_shell(staged).unwrap_err();
+        let diagnostic = format!("{error:#}");
+        assert!(diagnostic.contains("project agent profiles can override the managed shell"));
+        assert!(diagnostic.contains(agents.to_str().unwrap()));
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_fresh_journal_relaunch_observes_retained_edits_once() -> Result<()> {
+        use std::os::unix::fs::OpenOptionsExt;
+
+        let (temp, mut spec, _controls, mut prior_staging, mut profile, prior_binding) = fixture()?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        vibe::prepare_journal_shell(
+            prior_staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&prior_binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        let prior_shell = &prior_staging
+            .vibe
+            .as_ref()
+            .unwrap()
+            .journal_shell
+            .as_ref()
+            .unwrap()
+            .path;
+        let capture = temp.path().join("prior-argv");
+        assert!(capture_shim_argv(
+            prior_shell,
+            &capture,
+            "-c",
+            "printf 'retained\\n' >> source.txt",
+        )?
+        .status
+        .success());
+        crate::cli::Cli::try_parse_from(captured_args(&capture)?)?.run()?;
+        let retained = fs::read(spec.cwd.join("source.txt"))?;
+        assert_eq!(retained, b"original\nretained\n");
+        let prior_journal = fs::read(&prior_binding.journal.path)?;
+        let prior_records = crate::supervise::parse_worker_execution_journal(
+            &prior_journal,
+            &prior_binding.journal.path,
+        )?;
+        let prior_observation =
+            serde_json::to_value(prior_records.last().unwrap().observation.as_ref().unwrap())?;
+        let head = git2::Repository::open(&spec.cwd)?.head()?.target().unwrap();
+        let WorktreeWritableConfinementAuthority::Direct(mut admission) = spec
+            .worktree_writable_confinement
+            .as_ref()
+            .unwrap()
+            .authority
+            .clone()
+        else {
+            panic!("direct Worker admission expected");
+        };
+        let claims = admission.claims.clone();
+        admission.attempt = 2;
+
+        // A real fresh journal in a new attempt directory; keep the old inode
+        // and bytes intact, with the same cwd, HEAD and held claim authority.
+        let incoming = temp.path().join("relaunch");
+        fs::create_dir_all(incoming.join("worker-journals"))?;
+        let journal = incoming.join("worker-journals/worker.jsonl");
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&journal)?;
+        let identity = exact_writable_artifact_identity(&file.metadata()?)?;
+        let controls = ProtectedWorktreeControls {
+            exact_writable_artifact_files: vec![ExactWritableArtifactFile {
+                worker_id: "worker".into(),
+                path: journal.clone(),
+                held_file: std::sync::Arc::new(file),
+                identity,
+            }],
+            writable_artifact_root: Some(incoming.clone()),
+            ..ProtectedWorktreeControls::default()
+        };
+        spec.worker_journal_artifacts.clear();
+        spec = spec
+            .with_worker_journal_artifact("worker", &incoming, &journal)
+            .with_worktree_writable_confinement(admission);
+        let grant = crate::mutation_taxonomy::admit_assignment_child_process_intent(
+            "run",
+            "worker",
+            2,
+            &spec.program,
+            spec.model.as_deref(),
+            "vibe-worker-duty",
+        )?;
+        spec = spec
+            .with_assignment_process_launch(AssignmentProcessLaunchKind::AssignmentChild, grant);
+        let mut staging = ExternalOutputStaging::create_under(temp.path(), &spec.cwd)?;
+        staging.stage_vibe_launch(&spec)?;
+        let mut profile = worker_journal_append_binding_tests::profile(&spec);
+        let mut prompt = fs::read(&spec.prompt)?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        let binding = bind_worker_journal_append_operation(
+            &spec,
+            &controls,
+            ExternalExecutionRuntime::Verified,
+            ExternalProgramTrust::ExplicitCustom,
+            &mut prompt,
+            &mut profile,
+            &mut argv,
+        )?
+        .context("expected fresh Vibe journal binding")?;
+        assert_ne!(binding.journal.path, prior_binding.journal.path);
+        assert!(fs::read(&journal)?.is_empty());
+        vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        vibe::verify_journal_shell(staging.vibe.as_ref().unwrap())?;
+        assert_eq!(fs::read(spec.cwd.join("source.txt"))?, retained);
+        let initial =
+            crate::supervise::parse_worker_execution_journal(&fs::read(&journal)?, &journal)?;
+        assert_eq!(initial.len(), 1);
+        assert_eq!(initial[0].command, ["true"]);
+        assert_eq!(initial[0].changed_paths, [PathBuf::from("source.txt")]);
+        let observation = serde_json::to_value(initial[0].observation.as_ref().unwrap())?;
+        assert_eq!(observation["phase"], "native_edit");
+        assert_eq!(observation["before"], serde_json::json!({}));
+        assert_eq!(observation["after"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            observation["after"]["source.txt"].as_str().unwrap().len(),
+            64
+        );
+        assert_eq!(observation["after"], prior_observation["after"]);
+        assert_eq!(
+            observation["worktree_identity"],
+            prior_observation["worktree_identity"]
+        );
+        assert_eq!(observation["head_oid"], head.to_string());
+        assert_eq!(observation["worktree"], spec.cwd.to_str().unwrap());
+        assert_eq!(observation["declared_paths"], serde_json::json!([]));
+        assert!(observation.get("failure").is_none());
+
+        let shell = &staging
+            .vibe
+            .as_ref()
+            .unwrap()
+            .journal_shell
+            .as_ref()
+            .unwrap()
+            .path;
+        // The first call can be read-only; no model-issued recovery is needed.
+        let capture = temp.path().join("readonly-argv");
+        let read_script = r#"test "$(/bin/cat source.txt)" = "$(printf 'original\nretained\n')""#;
+        assert!(capture_shim_argv(shell, &capture, "-c", read_script)?
+            .status
+            .success());
+        crate::cli::Cli::try_parse_from(captured_args(&capture)?)?.run()?;
+        let readonly =
+            crate::supervise::parse_worker_execution_journal(&fs::read(&journal)?, &journal)?;
+        assert_eq!(readonly.len(), 3);
+        for record in &readonly[1..] {
+            assert_eq!(record.command, ["/bin/bash", "-c", read_script]);
+            assert_eq!(record.cwd, spec.cwd);
+            assert!(record.changed_paths.is_empty());
+            let current = serde_json::to_value(record.observation.as_ref().unwrap())?;
+            assert_eq!(current["before"], observation["after"]);
+            assert_eq!(current["after"], observation["after"]);
+        }
+        let capture = temp.path().join("relaunch-argv");
+        let script = "printf 'once\\n' >> source.txt";
+        assert!(capture_shim_argv(shell, &capture, "-c", script)?
+            .status
+            .success());
+        crate::cli::Cli::try_parse_from(captured_args(&capture)?)?.run()?;
+        assert_eq!(
+            fs::read(spec.cwd.join("source.txt"))?,
+            b"original\nretained\nonce\n"
+        );
+        let bytes = fs::read(&journal)?;
+        let records = crate::supervise::parse_worker_execution_journal(&bytes, &journal)?;
+        assert_eq!(records.len(), 5);
+        assert_eq!(records[..3], readonly);
+        for (record, phase) in records[3..].iter().zip(["started", "completed"]) {
+            assert_eq!(record.command, ["/bin/bash", "-c", script]);
+            assert_eq!(record.cwd, spec.cwd);
+            assert!(!record.start_timestamp.is_empty() && !record.end_timestamp.is_empty());
+            let current = serde_json::to_value(record.observation.as_ref().unwrap())?;
+            assert_eq!(current["phase"], phase);
+            for key in [
+                "worktree",
+                "worktree_identity",
+                "head_oid",
+                "declared_paths",
+            ] {
+                assert_eq!(current[key], observation[key]);
+            }
+            assert_eq!(current["before"], observation["after"]);
+            assert!(current.get("failure").is_none());
+        }
+        assert!(records[3].changed_paths.is_empty());
+        assert_eq!(records[4].changed_paths, [PathBuf::from("source.txt")]);
+        spec.verified_writable_capabilities(RuntimeId::Vibe)?;
+        let WorktreeWritableConfinementAuthority::Direct(admission) = &spec
+            .worktree_writable_confinement
+            .as_ref()
+            .unwrap()
+            .authority
+        else {
+            panic!("direct Worker admission expected");
+        };
+        assert_eq!(admission.claims, claims);
+
+        // A subsequent unobserved mutation is NOT silently absorbed by the shim.
+        fs::write(spec.cwd.join("source.txt"), "unexpected mutation\n")?;
+        let capture = temp.path().join("refused-argv");
+        assert!(capture_shim_argv(
+            shell,
+            &capture,
+            "-c",
+            "printf 'must not execute\\n' >> source.txt",
+        )?
+        .status
+        .success());
+        let error = crate::cli::Cli::try_parse_from(captured_args(&capture)?)?
+            .run()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("WorkerJournalObservationRequired"));
+        assert_eq!(fs::read(&journal)?, bytes);
+        assert_eq!(
+            fs::read_to_string(spec.cwd.join("source.txt"))?,
+            "unexpected mutation\n"
+        );
+        assert_eq!(fs::read(&prior_binding.journal.path)?, prior_journal);
+        assert_eq!(
+            git2::Repository::open(&spec.cwd)?.head()?.target(),
+            Some(head)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_journal_shell_refuses_login_dump_and_preserves_exact_script_once() -> Result<()> {
+        let (temp, spec, controls, mut staging, mut profile, binding) = fixture()?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        let shell = &staging
+            .vibe
+            .as_ref()
+            .unwrap()
+            .journal_shell
+            .as_ref()
+            .unwrap()
+            .path;
+        let capture = temp.path().join("captured-argv");
+        let journal = &controls.exact_writable_artifact_files[0].path;
+        let initial_journal = fs::read(journal)?;
+        let marker = temp.path().join("login-must-not-run");
+        let dump = format!(
+            "touch {}; printf 'synthetic private environment dump'",
+            vibe::shell_quote(marker.to_str().unwrap())
+        );
+        for flag in ["-lc", "-x", "--command"] {
+            let refused = capture_shim_argv(shell, &capture, flag, &dump)?;
+            assert_eq!(refused.status.code(), Some(64));
+            assert!(refused.stdout.is_empty() && refused.stderr.is_empty());
+            assert!(!marker.exists() && !capture.exists());
+            assert_eq!(fs::read(journal)?, initial_journal);
+        }
+
+        let script = "value=\"single ' quote \\\\ and spaces\"\nprintf '%s\\n' \"$value\" >> source.txt\n/bin/bash -c 'printf \"nested\\n\"' >> source.txt\nprintf 'real stdout\\n'\nprintf 'real stderr\\n' >&2";
+        let output = capture_shim_argv(shell, &capture, "-c", script)?;
+        assert!(output.status.success());
+        assert!(output.stdout.is_empty() && output.stderr.is_empty());
+        let args = captured_args(&capture)?;
+        let mut expected = binding.command_prefix()?;
+        expected.extend([
+            "--cwd".into(),
+            spec.cwd.to_str().unwrap().into(),
+            "--auto-timestamps".into(),
+            "--".into(),
+            "/bin/bash".into(),
+            "-c".into(),
+            script.into(),
+        ]);
+        assert_eq!(args, expected);
+        assert_eq!(
+            fs::read_to_string(spec.cwd.join("source.txt"))?,
+            "original\n"
+        );
+        crate::cli::Cli::try_parse_from(args)?.run()?;
+        let records =
+            crate::supervise::parse_worker_execution_journal(&fs::read(journal)?, journal)?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].command, ["true"]);
+        for record in &records[1..] {
+            assert_eq!(record.command, ["/bin/bash", "-c", script]);
+            assert_eq!(record.cwd, spec.cwd);
+            assert!(!record.start_timestamp.is_empty() && !record.end_timestamp.is_empty());
+        }
+        assert_eq!(records[2].changed_paths, [PathBuf::from("source.txt")]);
+        assert_eq!(
+            fs::read_to_string(spec.cwd.join("source.txt"))?,
+            "original\nsingle ' quote \\ and spaces\nnested\n"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_journal_shell_keeps_command_and_journal_failures_visible() -> Result<()> {
+        let (temp, spec, controls, mut staging, mut profile, binding) = fixture()?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        let shell = &staging
+            .vibe
+            .as_ref()
+            .unwrap()
+            .journal_shell
+            .as_ref()
+            .unwrap()
+            .path;
+        let output = std::process::Command::new(shell)
+            .args(["-c", "exit 0"])
+            .env_clear()
+            .env(
+                "BASH_FUNC_exec%%",
+                "() { printf 'helper stdout\\n'; printf 'helper stderr\\n' >&2; return 37;\n}",
+            )
+            .output()?;
+        assert_eq!(output.status.code(), Some(37));
+        assert_eq!(output.stdout, b"helper stdout\n");
+        assert_eq!(output.stderr, b"helper stderr\n");
+
+        let capture = temp.path().join("failure-argv");
+        let script = "printf 'mutation before failure\\n' >> source.txt; exit 23";
+        assert!(capture_shim_argv(shell, &capture, "-c", script)?
+            .status
+            .success());
+        let error = crate::cli::Cli::try_parse_from(captured_args(&capture)?)?
+            .run()
+            .unwrap_err();
+        assert!(format!("{error:#}").contains("exit status: 23"));
+        let journal = &controls.exact_writable_artifact_files[0].path;
+        let records =
+            crate::supervise::parse_worker_execution_journal(&fs::read(journal)?, journal)?;
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[0].command, ["true"]);
+        assert_eq!(records[2].command, ["/bin/bash", "-c", script]);
+        assert_eq!(records[2].changed_paths, [PathBuf::from("source.txt")]);
+        assert_eq!(
+            fs::read_to_string(spec.cwd.join("source.txt"))?,
+            "original\nmutation before failure\n"
+        );
+        // A wrong inode fails in the real appender before executing the script.
+        let mut args = binding.command_prefix()?;
+        args[8] = (binding.journal.identity.inode + 1).to_string();
+        args.extend([
+            "--cwd".into(),
+            spec.cwd.to_str().unwrap().into(),
+            "--auto-timestamps".into(),
+            "--".into(),
+            "/bin/bash".into(),
+            "-c".into(),
+            "printf 'must not execute' >> source.txt".into(),
+        ]);
+        let before = fs::read(journal)?;
+        assert!(crate::cli::Cli::try_parse_from(args)?.run().is_err());
+        assert_eq!(fs::read(journal)?, before);
+        assert!(!fs::read_to_string(spec.cwd.join("source.txt"))?.contains("must not execute"));
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_journal_shell_requires_binding_and_detects_control_changes() -> Result<()> {
+        let (_temp, spec, _controls, mut staging, mut profile, mut binding) = fixture()?;
+        let mut argv = runtime_adapter_argv(&spec)?;
+        assert!(vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            None,
+            &mut argv,
+            &mut profile,
+        )
+        .is_err());
+        let original = argv.clone();
+        for shape in ["readonly", "primary", "auditor", "codex"] {
+            let mut changed = spec.clone();
+            match shape {
+                "readonly" => changed.workspace_access = WorkspaceAccess::ReadOnly,
+                "primary" => changed.writable_launch_target = WritableLaunchTarget::PrimaryWorktree,
+                "auditor" => changed.agent_lifecycle.as_mut().unwrap().role = "auditor".into(),
+                "codex" => changed.invocation = ExternalAgentInvocation::CodexSupervisor,
+                _ => unreachable!(),
+            }
+            let before = profile.clone();
+            vibe::prepare_journal_shell(
+                staging.vibe.as_mut().unwrap(),
+                &changed,
+                None,
+                &mut argv,
+                &mut profile,
+            )?;
+            assert_eq!(argv, original);
+            assert_eq!(profile, before);
+            assert!(staging.vibe.as_ref().unwrap().journal_shell.is_none());
+        }
+        let digest = binding.helper_sha256.clone();
+        binding.helper_sha256 = "0".repeat(64);
+        assert!(vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )
+        .is_err());
+        binding.helper_sha256 = digest;
+        let original_profile = profile.clone();
+        profile = None;
+        assert!(vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )
+        .is_err());
+        profile = original_profile;
+        argv.push("--extra-tool".into());
+        assert!(vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )
+        .is_err());
+        argv = original;
+        // Projection uses the production builder even if the incoming profile
+        // does not already contain the exact bound helper.
+        profile = worker_journal_append_binding_tests::profile(&spec);
+        vibe::prepare_journal_shell(
+            staging.vibe.as_mut().unwrap(),
+            &spec,
+            Some(&binding),
+            &mut argv,
+            &mut profile,
+        )?;
+        let staged = staging.vibe.as_ref().unwrap();
+        let Some(SideEffectConfinementProfile::ExternalCodex(mounted)) = &profile else {
+            panic!("ExternalCodex expected");
+        };
+        for control in [
+            &binding.helper_path,
+            staged.config.path(),
+            &staged.journal_shell.as_ref().unwrap().path,
+        ] {
+            assert!(mounted
+                .visible_read_only_files()
+                .contains(&control.to_path_buf()));
+        }
+        let config = fs::read(staged.config.path())?;
+        fs::write(staged.config.path(), "tampered")?;
+        assert!(vibe::verify_journal_shell(staged).is_err());
+        fs::write(staged.config.path(), config)?;
+        vibe::verify_journal_shell(staged)?;
+        let shell = &staged.journal_shell.as_ref().unwrap().path;
+        fs::write(shell, "#!/bin/bash\nexit 0\n")?;
+        assert!(vibe::verify_journal_shell(staged).is_err());
+        Ok(())
+    }
+}
+
 fn vibe_command() -> ExternalAgentCommand {
     let mut command = ExternalAgentCommand::codex(
         "/opt/vibe-venv/bin/vibe",
