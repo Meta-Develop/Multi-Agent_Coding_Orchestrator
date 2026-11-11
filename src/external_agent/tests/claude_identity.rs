@@ -137,6 +137,7 @@ pub(crate) fn record_claude_completion_for_test(
         CompletedTargetStaging {
             output: &mut staged,
             codex_home: None,
+            vibe_export: None,
         },
         &mut output,
         &mut log,

@@ -281,6 +281,9 @@ pub(super) fn execute_nested_worker_attempt(
         ),
         &context.budget_policy,
     );
+    if runtime == SupervisorRuntime::Vibe {
+        super::super::vibe_worker::refuse_nested_worker_launch()?;
+    }
     if runtime == SupervisorRuntime::Fake {
         bail!("nested executor requires a real managed launch path");
     }

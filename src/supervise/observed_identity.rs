@@ -133,13 +133,31 @@ impl RuntimeIdentityObservation {
                         .map(|_| IdentityBasis::Requested);
                 }
             }
+            SupervisorRuntime::Vibe => {
+                // The held export attests token counters only. The served model
+                // and any served effort stay unknown; the requested model is
+                // recorded as requested, never promoted to provider-reported.
+                if run.vibe_requested_model() == command.model.as_deref() && command.model.is_some()
+                {
+                    identity.model_basis = command.model.as_ref().map(|_| IdentityBasis::Requested);
+                    // Vibe has no reasoning-effort flag, so no served effort can
+                    // ever be claimed. A requested effort stays requested-only.
+                    identity.effort_basis = command
+                        .reasoning_effort
+                        .as_ref()
+                        .map(|_| IdentityBasis::Requested);
+                }
+            }
             SupervisorRuntime::Fake => {}
         }
         if identity.model.is_some() {
             identity.model_basis = Some(IdentityBasis::ProviderReported);
             if identity.effort.is_some() {
                 identity.effort_basis = Some(IdentityBasis::ProviderReported);
-            } else if runtime != SupervisorRuntime::GeminiCli {
+            } else if !matches!(
+                runtime,
+                SupervisorRuntime::GeminiCli | SupervisorRuntime::Vibe
+            ) {
                 identity.effort_basis = command
                     .reasoning_effort
                     .as_ref()

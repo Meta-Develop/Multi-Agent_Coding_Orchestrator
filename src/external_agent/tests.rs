@@ -9204,6 +9204,7 @@ fn record_verified_acp_publication(
         CompletedTargetStaging {
             output: &mut staged_output,
             codex_home: None,
+            vibe_export: None,
         },
         &mut output_reservation,
         &mut json_log_reservation,
@@ -11361,6 +11362,7 @@ fn grok_stream_usage_evidence_persists_through_completed_target_and_external_run
             CompletedTargetStaging {
                 output: &mut staged_output,
                 codex_home: None,
+                vibe_export: None,
             },
             &mut output_reservation,
             &mut json_log_reservation,
@@ -12902,6 +12904,7 @@ fn verified_nonzero_target_retains_permission_and_containment_evidence() -> Resu
         CompletedTargetStaging {
             output: &mut staged_output,
             codex_home: None,
+            vibe_export: None,
         },
         &mut output_reservation,
         &mut json_log_reservation,

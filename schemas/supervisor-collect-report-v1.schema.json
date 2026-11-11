@@ -4598,7 +4598,8 @@
                         "cursor",
                         "claude-code",
                         "gemini-cli",
-                        "deepseek"
+                        "deepseek",
+                        "vibe"
                       ]
                     },
                     "selection_source": {
@@ -11726,7 +11727,8 @@
                               "cursor",
                               "claude-code",
                               "gemini-cli",
-                              "deepseek"
+                              "deepseek",
+                              "vibe"
                             ]
                           },
                           "selection_source": {
@@ -21187,7 +21189,8 @@
                                                                 "cursor",
                                                                 "claude-code",
                                                                 "gemini-cli",
-                                                                "deepseek"
+                                                                "deepseek",
+                                                                "vibe"
                                                               ]
                                                             }
                                                           },
@@ -26255,7 +26258,8 @@
                                         "cursor",
                                         "claude-code",
                                         "gemini-cli",
-                                        "deepseek"
+                                        "deepseek",
+                                        "vibe"
                                       ]
                                     }
                                   },
@@ -26700,7 +26704,8 @@
                               "cursor",
                               "claude-code",
                               "gemini-cli",
-                              "deepseek"
+                              "deepseek",
+                              "vibe"
                             ]
                           }
                         },
@@ -27025,7 +27030,8 @@
         "cursor",
         "claude-code",
         "gemini-cli",
-        "deepseek"
+        "deepseek",
+        "vibe"
       ],
       "type": "string"
     },

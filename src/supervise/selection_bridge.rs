@@ -1177,6 +1177,13 @@ pub(super) fn initialize_supervisor_selection_with_shapes(
                 } else {
                     account_selection_catalogs(account_observations, &input.task, &input.priors)?
                 };
+                append_vibe_worker_catalog(
+                    &mut input.catalogs,
+                    role,
+                    input.debug_override.as_ref(),
+                    &input.task,
+                    &input.priors,
+                )?;
             }
             selection_preflight::apply_frozen_quota(
                 &mut input,
@@ -2012,7 +2019,7 @@ pub(super) fn frozen_review_account_binding(
                 .map(|binding| binding.to_selected_binding()),
             SupervisorRuntime::Cursor => authority::cursor_run_account_binding(run)
                 .map(|binding| binding.to_selected_binding()),
-            SupervisorRuntime::DeepSeek | SupervisorRuntime::Fake => None,
+            SupervisorRuntime::DeepSeek | SupervisorRuntime::Vibe | SupervisorRuntime::Fake => None,
         };
     binding
         .map(Some)
@@ -2871,7 +2878,7 @@ fn selection_input_for_role_with_assessment(
         .map(|snapshot| snapshot.outcomes_for(&task))
         .unwrap_or_default();
     let runtime_name = runtime_name(runtime);
-    let catalogs = constructed_selection_catalogs(
+    let mut catalogs = constructed_selection_catalogs(
         runtime,
         catalog,
         advertised,
@@ -2879,6 +2886,10 @@ fn selection_input_for_role_with_assessment(
         &priors,
         account_observation,
     )?;
+    // Account catalogs are combined before adding operator-declared lanes.
+    if account_observation.is_none() {
+        append_vibe_worker_catalog(&mut catalogs, role, debug_override.as_ref(), &task, &priors)?;
+    }
     let profile = priors
         .objective_profiles
         .first()
@@ -2993,6 +3004,13 @@ fn selection_input_for_role_with_assessment_and_accounts(
     let mut input = combined.context("account catalog set is empty")?;
     let account_catalog_count = input.catalogs.len();
     append_deepseek_research_catalog(&mut input.catalogs, &input.task, &input.priors)?;
+    append_vibe_worker_catalog(
+        &mut input.catalogs,
+        args.role,
+        args.debug_override.as_ref(),
+        &input.task,
+        &input.priors,
+    )?;
     if input.catalogs.len() != account_catalog_count {
         let primary_pool = input
             .pools
@@ -3005,7 +3023,11 @@ fn selection_input_for_role_with_assessment_and_accounts(
             runtime_name(args.runtime),
             primary_pool,
         ));
-        input.constraints.allowed_runtimes.insert("deepseek".into());
+        input.constraints.allowed_runtimes.extend(
+            input.catalogs[account_catalog_count..]
+                .iter()
+                .map(|catalog| catalog.runtime.clone()),
+        );
     }
     if let Some(quota_context) = args.quota_context {
         apply_live_quota_selection_input(
@@ -3254,6 +3276,42 @@ fn append_deepseek_research_catalog(
         task,
         priors,
     )?;
+    if !catalog.models.is_empty() {
+        let binding = serde_json::to_vec(&program)?;
+        catalog.revision = format!(
+            "{};frozen-executable-sha256:{}",
+            catalog.revision,
+            crate::artifacts::state_auth::sha256_hex(&binding)
+        );
+        catalogs.push(catalog);
+    }
+    Ok(())
+}
+
+/// Vibe is an explicit terminal Worker lane, never an automatic alternative.
+/// Like DeepSeek, its operator-declared menu requires a frozen executable and
+/// task-provided priors; a role_models effort remains part of the selector key.
+fn append_vibe_worker_catalog(
+    catalogs: &mut Vec<RuntimeCatalog>,
+    role: AgentRole,
+    debug_override: Option<&DebugOverride>,
+    task: &TaskProfile,
+    priors: &selection::PriorDataset,
+) -> Result<()> {
+    if role != AgentRole::Worker
+        || debug_override.is_none_or(|request| request.candidate.runtime != "vibe")
+        || task.authority_role != AuthorityRole::TerminalLeaf
+        || catalogs.iter().any(|catalog| catalog.runtime == "vibe")
+    {
+        return Ok(());
+    }
+    let Some(program) = super::runtime_executables::bound_catalog_program(SupervisorRuntime::Vibe)
+    else {
+        return Ok(());
+    };
+    super::runtime_executables::validate_executable(&program)?;
+    let mut catalog =
+        runtime_catalog_from_priors("vibe", &RuntimeModelCatalog::OperatorDeclared, task, priors)?;
     if !catalog.models.is_empty() {
         let binding = serde_json::to_vec(&program)?;
         catalog.revision = format!(
@@ -4991,6 +5049,7 @@ pub(super) fn runtime_from_name(runtime: &str) -> Result<SupervisorRuntime> {
         "claude-code" | "claude" => Ok(SupervisorRuntime::ClaudeCode),
         "gemini-cli" | "gemini" => Ok(SupervisorRuntime::GeminiCli),
         "deepseek" | "dsh" => Ok(SupervisorRuntime::DeepSeek),
+        "vibe" => Ok(SupervisorRuntime::Vibe),
         _ => bail!("selector runtime '{runtime}' is not executable by the supervisor"),
     }
 }
@@ -5031,6 +5090,327 @@ pub(super) mod tests {
     include!("qualification_selection_tests.rs");
     #[cfg(target_os = "linux")]
     include!("deepseek_selection_tests.rs");
+    // These tests need the private selection, account and assignment-shape fixtures.
+    #[cfg(target_os = "linux")]
+    mod vibe_selection {
+        use super::*;
+        use std::os::unix::fs::PermissionsExt;
+
+        const MODEL: &str = "deepseek-v4-1-flash-1017";
+
+        fn bind_prior(
+            repo: &Path,
+        ) -> Result<super::super::super::prior_input::OperatorPriorDataGuard> {
+            let mut prior = codex_prior_for(|_| true)?;
+            prior.runtime = "vibe".into();
+            prior.model = MODEL.into();
+            prior.source_id = "synthetic-vibe-selection-regression".into();
+            prior
+                .class_fit
+                .retain(|fit| fit.task_class == AUTOMATIC_SELECTION_TASK_CLASS);
+            for fit in &mut prior.class_fit {
+                fit.effort = SelectorEffort::High;
+            }
+            prior.class_fit.truncate(1);
+            assert_eq!(prior.class_fit.len(), 1);
+            std::fs::write(
+                repo.join("prior.json"),
+                serde_json::to_vec(&json!({
+                    "schema_version": 1, "dataset_id": "vibe-selection-fixture",
+                    "revision": "synthetic-v1", "published_on": "2026-11-04",
+                    "models": [prior], "capability_policy": default_model_capability_policy(),
+                }))?,
+            )?;
+            super::super::super::prior_input::bind_operator_prior_data(repo, "prior.json")
+        }
+
+        fn bind_program(
+            repo: &Path,
+            vibe: bool,
+        ) -> Result<super::super::super::runtime_executables::RuntimeExecutableGuard> {
+            let primary = repo.join("codex-bin");
+            let program = repo.join("vibe-bin");
+            for path in [&primary, &program] {
+                std::fs::write(path, "#!/bin/sh\nexit 0\n")?;
+                std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+            }
+            super::super::super::runtime_executables::bind_new(
+                repo,
+                &RunId::new("vibe-selection")?,
+                SupervisorRuntime::Codex,
+                &primary,
+                &if vibe {
+                    vec![(SupervisorRuntime::Vibe, program)]
+                } else {
+                    vec![]
+                },
+            )
+        }
+
+        fn plan_for(role: AgentRole) -> Result<SupervisorPlan> {
+            let mut plan = test_plan();
+            plan.task = "Fix one documentation typo".into();
+            plan.assignments = vec![serde_json::from_value(json!({
+                "id": "vibe-selection", "phase": "execution", "role": role,
+                "runtime": "vibe", "assigned_paths": ["README.md"],
+                "role_category": if role == AgentRole::Worker {
+                    Some("non_delegating_terminal_worker")
+                } else { None },
+            }))?];
+            plan.role_models
+                .insert(role, role_selection(MODEL.into(), Some("high")));
+            Ok(plan)
+        }
+
+        fn resolve(
+            plan: &mut SupervisorPlan,
+            accounts: &[(SupervisorRuntime, AccountObserveResult)],
+            declared_shape: bool,
+        ) -> Result<SupervisorSelectionResolution> {
+            let frozen = crate::selection::routing_policy::current_routing_policy()
+                .context("fixture policy")?;
+            let shapes = if declared_shape {
+                let schedule = vec![AssignmentScheduleEntry {
+                    assignment_id: plan.assignments[0].id.clone(),
+                    parent_assignment_id: None,
+                    depth: MIN_SUPERVISOR_DEPTH,
+                    flattened_index: 0,
+                }];
+                plan.assignments[0].assignment_shape = Some(AssignmentShapeDeclaration::assess(
+                    plan,
+                    0,
+                    &schedule,
+                    &frozen,
+                    AssignmentEffects::RepositoryWrite,
+                )?);
+                AssignmentSelectionShapes::validate(plan, &schedule, Some(&frozen))?
+            } else {
+                AssignmentSelectionShapes::default()
+            };
+            let (assessment, _, _) = fixture_task_assessment(plan)?;
+            super::super::initialize_supervisor_selection_with_shapes(
+                plan,
+                SupervisorRuntime::Codex,
+                &codex_catalog()?,
+                &test_admission(),
+                &AdvertisedCatalogSet::empty(),
+                Some(&default_resolved_profile()),
+                SupervisorQuotaSelectionInput::default(),
+                None,
+                accounts,
+                Some(&assessment),
+                &shapes,
+            )
+        }
+
+        #[test]
+        fn vibe_selection_explicit_worker_preserves_codex_roles_and_catalog_rebuilds() -> Result<()>
+        {
+            let _policy = bind_fixture_routing_policy()?;
+            let (_temporary, repo) = super::super::super::tests::injected_repository();
+            let _binding = bind_program(&repo, true)?;
+            let _prior = bind_prior(&repo)?;
+            for accounts in [
+                vec![],
+                vec![(
+                    SupervisorRuntime::Codex,
+                    qualified_account_fixture("codex-cli", FRONTIER_PROFILE_MODEL, "xhigh"),
+                )],
+            ] {
+                for declared_shape in [false, true] {
+                    let mut baseline_plan = plan_for(AgentRole::Worker)?;
+                    baseline_plan.assignments[0].runtime = Some(SupervisorRuntime::Codex);
+                    baseline_plan.role_models.clear();
+                    let baseline = resolve(&mut baseline_plan, &accounts, declared_shape)?;
+                    assert!(baseline.selection_preflight_failure.is_none());
+                    let selected =
+                        resolve(&mut plan_for(AgentRole::Worker)?, &accounts, declared_shape)?;
+                    assert!(
+                        selected.selection_preflight_failure.is_none(),
+                        "{:?}",
+                        selected.selection_preflight_failure
+                    );
+                    for event in &selected.decisions {
+                        let decision = &event.provenance;
+                        let choice = decision.choice.as_ref().context("selected role")?;
+                        if event.role != AgentRole::Worker {
+                            let original = baseline
+                                .decisions
+                                .iter()
+                                .find(|original| original.role == event.role)
+                                .context("baseline Codex role")?;
+                            assert_eq!(
+                                choice.candidate,
+                                original
+                                    .provenance
+                                    .choice
+                                    .as_ref()
+                                    .context("baseline choice")?
+                                    .candidate
+                            );
+                            assert_eq!(choice.candidate.runtime, "codex");
+                            assert!(decision
+                                .candidate_set
+                                .iter()
+                                .all(|candidate| candidate.candidate.runtime != "vibe"));
+                            continue;
+                        }
+                        assert_eq!(
+                            choice.candidate,
+                            CandidateKey {
+                                runtime: "vibe".into(),
+                                model: MODEL.into(),
+                                effort: SelectorEffort::High,
+                            }
+                        );
+                        assert_eq!(choice.reason, selection::ChoiceReason::DebugOverride);
+                        assert_eq!(
+                            decision
+                                .debug_override
+                                .as_ref()
+                                .context("override receipt")?
+                                .disposition,
+                            selection::DebugOverrideDisposition::Applied
+                        );
+                        let input = &decision.normalized_input;
+                        let catalogs = input
+                            .catalogs
+                            .iter()
+                            .filter(|catalog| catalog.runtime == "vibe")
+                            .collect::<Vec<_>>();
+                        assert_eq!(catalogs.len(), 1);
+                        let binding = serde_json::to_vec(&repo.join("vibe-bin"))?;
+                        assert!(catalogs[0].revision.ends_with(&format!(
+                            ";frozen-executable-sha256:{}",
+                            crate::artifacts::state_auth::sha256_hex(&binding)
+                        )));
+                        assert_eq!(
+                            input
+                                .pools
+                                .iter()
+                                .filter(|pool| pool.runtime == "vibe")
+                                .count(),
+                            1
+                        );
+                        assert!(input.constraints.allowed_runtimes.contains("vibe"));
+                    }
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn vibe_selection_missing_program_or_prior_rejects_without_fallback() -> Result<()> {
+            let _policy = bind_fixture_routing_policy()?;
+            let (_temporary, repo) = super::super::super::tests::injected_repository();
+            for (program, prior) in [(false, true), (true, false)] {
+                let _binding = bind_program(&repo, program)?;
+                let _prior = if prior {
+                    Some(bind_prior(&repo)?)
+                } else {
+                    None
+                };
+                for accounts in [
+                    vec![],
+                    vec![(
+                        SupervisorRuntime::Codex,
+                        qualified_account_fixture("codex-cli", FRONTIER_PROFILE_MODEL, "xhigh"),
+                    )],
+                ] {
+                    let refused = resolve(&mut plan_for(AgentRole::Worker)?, &accounts, false)?;
+                    assert!(refused.selection_preflight_failure.is_some());
+                    let decision = &refused
+                        .decisions
+                        .iter()
+                        .find(|event| event.role == AgentRole::Worker)
+                        .context("refused Worker")?
+                        .provenance;
+                    assert!(decision.choice.is_none());
+                    assert_eq!(
+                        decision
+                            .debug_override
+                            .as_ref()
+                            .context("override refusal")?
+                            .disposition,
+                        selection::DebugOverrideDisposition::Rejected
+                    );
+                    assert!(decision
+                        .normalized_input
+                        .catalogs
+                        .iter()
+                        .all(|catalog| catalog.runtime != "vibe"));
+                }
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn vibe_selection_other_roles_reject_without_candidates_or_fallback() -> Result<()> {
+            let _policy = bind_fixture_routing_policy()?;
+            let (_temporary, repo) = super::super::super::tests::injected_repository();
+            let _binding = bind_program(&repo, true)?;
+            let _prior = bind_prior(&repo)?;
+            for role in [
+                AgentRole::Researcher,
+                AgentRole::Auditor,
+                AgentRole::GateClassifier,
+                AgentRole::Supervisor,
+                AgentRole::ChildOrchestrator,
+            ] {
+                let refused = resolve(&mut plan_for(role)?, &[], false)?;
+                assert!(refused.selection_preflight_failure.is_some(), "{role:?}");
+                let decision = &refused
+                    .decisions
+                    .iter()
+                    .find(|event| event.role == role)
+                    .context("refused role")?
+                    .provenance;
+                assert!(decision.choice.is_none(), "{role:?}");
+                assert_eq!(
+                    decision
+                        .debug_override
+                        .as_ref()
+                        .context("override refusal")?
+                        .disposition,
+                    selection::DebugOverrideDisposition::Rejected
+                );
+                assert!(refused.decisions.iter().all(|event| event
+                    .provenance
+                    .candidate_set
+                    .iter()
+                    .all(|candidate| candidate.candidate.runtime != "vibe")));
+            }
+            Ok(())
+        }
+
+        #[test]
+        fn vibe_selection_requires_explicit_override_and_reasoning_effort() -> Result<()> {
+            let _policy = bind_fixture_routing_policy()?;
+            let (_temporary, repo) = super::super::super::tests::injected_repository();
+            let _binding = bind_program(&repo, true)?;
+            let _prior = bind_prior(&repo)?;
+            let mut automatic = plan_for(AgentRole::Worker)?;
+            automatic.assignments[0].runtime = Some(SupervisorRuntime::Codex);
+            automatic.role_models.clear();
+            let selected = resolve(&mut automatic, &[], false)?;
+            assert!(selected.selection_preflight_failure.is_none());
+            assert!(selected.decisions.iter().all(|event| event
+                .provenance
+                .candidate_set
+                .iter()
+                .all(|candidate| candidate.candidate.runtime != "vibe")));
+            let mut missing_effort = plan_for(AgentRole::Worker)?;
+            missing_effort
+                .role_models
+                .get_mut(&AgentRole::Worker)
+                .unwrap()
+                .reasoning_effort = None;
+            let error =
+                resolve(&mut missing_effort, &[], false).expect_err("effort remains mandatory");
+            assert!(format!("{error:#}").contains("require a reasoning_effort"));
+            Ok(())
+        }
+    }
     #[cfg(target_os = "linux")]
     use coding_agent_manager_lib::account_authority::{
         CategoryObservation, ObservationError, ObservationErrorKind, SelectedAccountBinding,

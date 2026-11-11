@@ -126,6 +126,7 @@ fn cli_literal_entrypoint_preserves_explicit_subcommands_and_top_level_help_and_
 ) -> Result<()> {
     for subcommand in [
         "init",
+        "doctor",
         "repo",
         "state",
         "worktree",
@@ -183,6 +184,128 @@ fn cli_literal_entrypoint_preserves_explicit_subcommands_and_top_level_help_and_
     ] {
         assert!(help_stdout.contains(guidance), "{help_stdout}");
     }
+    Ok(())
+}
+
+const DOCTOR_CHECK_IDS: [&str; 11] = [
+    "platform",
+    "repository",
+    "runtime_executable",
+    "containment_helpers",
+    "delegated_cgroup",
+    "runtime_directory",
+    "runtime_contract",
+    "live_qualification",
+    "authentication",
+    "catalogs",
+    "launch_configuration",
+];
+
+fn init_doctor_repo() -> Result<TempDir> {
+    let repo_dir = TempDir::new().context("create doctor repository directory")?;
+    Repository::init(repo_dir.path()).context("init doctor git repository")?;
+    Ok(repo_dir)
+}
+
+fn run_doctor(repo_path: &Path, json: bool) -> Result<Output> {
+    let mut command = cli_without_machine_global_bindings();
+    command.arg("doctor").arg("--repo").arg(repo_path);
+    if json {
+        command.arg("--json");
+    }
+    command.output().context("run maco doctor")
+}
+
+fn parse_doctor_json(output: &Output) -> Result<Value> {
+    let stdout = String::from_utf8(output.stdout.clone()).context("decode doctor json report")?;
+    serde_json::from_str(&stdout).context("parse doctor json report as one object")
+}
+
+#[test]
+fn doctor_json_reports_the_eleven_rows_in_order() -> Result<()> {
+    let repo_dir = init_doctor_repo()?;
+    let output = run_doctor(repo_dir.path(), true)?;
+    let report = parse_doctor_json(&output)?;
+
+    let object = report
+        .as_object()
+        .context("doctor json report is not an object")?;
+    let mut top_level_keys: Vec<&str> = object.keys().map(String::as_str).collect();
+    top_level_keys.sort_unstable();
+    assert_eq!(
+        top_level_keys,
+        ["checks", "has_failures", "schema_version", "scope"]
+    );
+    assert_eq!(object["schema_version"], 1);
+    assert_eq!(object["scope"], "default_codex_host_prerequisites");
+    let has_failures = object["has_failures"]
+        .as_bool()
+        .context("has_failures is not a boolean")?;
+
+    let checks = object["checks"]
+        .as_array()
+        .context("checks is not an array")?;
+    assert_eq!(checks.len(), 11);
+    for (check, expected_id) in checks.iter().zip(DOCTOR_CHECK_IDS) {
+        let check_object = check.as_object().context("doctor check is not an object")?;
+        let mut keys: Vec<&str> = check_object.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, ["id", "reason", "remedy", "status"]);
+        assert_eq!(check["id"], expected_id);
+        let status = check["status"]
+            .as_str()
+            .context("check status is not a string")?;
+        assert!(
+            matches!(status, "PASS" | "WARN" | "FAIL"),
+            "unexpected status {status}"
+        );
+    }
+    for check in checks.iter().skip(6) {
+        assert_eq!(check["status"], "WARN");
+    }
+    assert_eq!(checks[1]["status"], "PASS");
+
+    let any_fail = checks.iter().any(|check| check["status"] == "FAIL");
+    assert_eq!(has_failures, any_fail);
+    assert_eq!(output.status.success(), !has_failures);
+    Ok(())
+}
+
+#[test]
+fn doctor_text_report_matches_the_json_rows() -> Result<()> {
+    let repo_dir = init_doctor_repo()?;
+    let json_output = run_doctor(repo_dir.path(), true)?;
+    let report = parse_doctor_json(&json_output)?;
+    let checks = report["checks"]
+        .as_array()
+        .context("checks is not an array")?
+        .clone();
+
+    let text_output = run_doctor(repo_dir.path(), false)?;
+    let text = String::from_utf8(text_output.stdout).context("decode doctor text report")?;
+    let lines: Vec<&str> = text.lines().collect();
+    assert_eq!(lines.len(), 13, "{text}");
+    assert_eq!(lines[0], "default Codex host prerequisites");
+    for (line, check) in lines[1..=11].iter().zip(checks.iter()) {
+        let status = check["status"]
+            .as_str()
+            .context("check status is not a string")?;
+        let id = check["id"].as_str().context("check id is not a string")?;
+        let prefix = format!("{status} {id}: ");
+        assert!(
+            line.starts_with(&prefix),
+            "line {line:?} lacks prefix {prefix:?}"
+        );
+        assert!(line.contains("; remedy: "), "line {line:?} lacks remedy");
+    }
+    let failures = checks
+        .iter()
+        .filter(|check| check["status"] == "FAIL")
+        .count();
+    assert_eq!(
+        lines[12],
+        format!("{failures} FAIL rows; readiness incomplete: WARN rows were not checked")
+    );
     Ok(())
 }
 

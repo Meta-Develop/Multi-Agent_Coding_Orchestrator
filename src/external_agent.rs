@@ -88,6 +88,9 @@ use std::{
 pub(crate) mod codex_app_server;
 mod codex_parent_evidence;
 mod deepseek_capture;
+mod vibe;
+
+pub use vibe::VibeUsageCapture;
 #[allow(dead_code, unused_imports)]
 #[doc(hidden)]
 pub mod executor;
@@ -1506,8 +1509,9 @@ fn bind_worker_journal_append_operation(
     let codex = trust == ExternalProgramTrust::TrustedSystemCodex
         && spec.invocation == ExternalAgentInvocation::CodexSupervisor;
     let grok = spec.invocation == ExternalAgentInvocation::Grok;
+    let vibe = spec.invocation == ExternalAgentInvocation::Vibe;
     if runtime != ExternalExecutionRuntime::Verified
-        || (!codex && !grok)
+        || (!codex && !grok && !vibe)
         || spec.workspace_access != WorkspaceAccess::ReadWrite
         || spec.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
         || spec
@@ -1571,7 +1575,7 @@ fn bind_worker_journal_append_operation(
             bail!("worker journal appender requires the exact existing inner filesystem rule");
         }
         Some(positions[0])
-    } else {
+    } else if grok {
         spec.verified_writable_capabilities(RuntimeId::Grok)?;
         spec.verify_grok_run_account_binding(&identity.run_id)?;
         if !matches!(profile, Some(SideEffectConfinementProfile::ExternalGrok(_)))
@@ -1579,6 +1583,19 @@ fn bind_worker_journal_append_operation(
             || &*argv != runtime_adapter_argv(spec)?.as_slice()
         {
             bail!("Grok worker journal appender requires the exact qualified native argv/profile");
+        }
+        None
+    } else {
+        // Vibe reuses the established helper binding without any codex-specific
+        // inner argv rule: only the exact qualified native argv/profile and the
+        // writable Vibe confinement proof are required.
+        spec.verified_writable_capabilities(RuntimeId::Vibe)?;
+        if !matches!(
+            profile,
+            Some(SideEffectConfinementProfile::ExternalCodex(_))
+        ) || &*argv != runtime_adapter_argv(spec)?.as_slice()
+        {
+            bail!("Vibe worker journal appender requires the exact qualified native argv/profile");
         }
         None
     };
@@ -1651,6 +1668,15 @@ fn bind_worker_journal_append_operation(
         bail!("worker journal append operation exceeds the existing prompt byte limit");
     }
     *profile = Some(match profile.as_ref() {
+        Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) if vibe => {
+            // Vibe keeps the existing ExternalCodex outer containment unchanged;
+            // only this exact running image is exposed as a read-only helper file.
+            SideEffectConfinementProfile::ExternalCodex(
+                codex_profile
+                    .clone()
+                    .with_visible_read_only_file(&binding.helper_path),
+            )
+        }
         Some(SideEffectConfinementProfile::ExternalCodex(codex_profile)) => {
             // Preserve Codex's exact :minimal inner rule as well as the outer mount.
             let mut inner_controls = controls.clone();
@@ -2690,6 +2716,20 @@ pub(crate) const WRITABLE_GEMINI_CONFINEMENT_PROOF_STALE: &str =
     "writable_gemini_confinement_proof_stale";
 pub(crate) const WRITABLE_GEMINI_CONFINEMENT_UNVERIFIED: &str =
     "writable_gemini_confinement_unverified";
+pub(crate) const WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED: &str =
+    "writable_vibe_terminal_worker_required";
+pub(crate) const WRITABLE_VIBE_SELECTION_EVIDENCE_MISSING: &str =
+    "writable_vibe_selection_evidence_missing";
+pub(crate) const WRITABLE_VIBE_SELECTION_EVIDENCE_STALE: &str =
+    "writable_vibe_selection_evidence_stale";
+pub(crate) const WRITABLE_VIBE_ADAPTER_CONFIGURATION_UNVERIFIED: &str =
+    "writable_vibe_adapter_configuration_unverified";
+pub(crate) const WRITABLE_VIBE_CONFINEMENT_PROOF_MISSING: &str =
+    "writable_vibe_confinement_proof_missing";
+pub(crate) const WRITABLE_VIBE_CONFINEMENT_PROOF_STALE: &str =
+    "writable_vibe_confinement_proof_stale";
+pub(crate) const WRITABLE_VIBE_CONFINEMENT_UNVERIFIED: &str =
+    "writable_vibe_confinement_unverified";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct WritableRuntimeSelectionEvidence {
@@ -2994,13 +3034,19 @@ pub enum ExternalAgentInvocation {
     ClaudeCode,
     GeminiCli,
     DeepSeek,
+    Vibe,
 }
 
 impl ExternalAgentInvocation {
     pub const fn is_adapter_subprocess(self) -> bool {
         matches!(
             self,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek
+            Self::Grok
+                | Self::Cursor
+                | Self::ClaudeCode
+                | Self::GeminiCli
+                | Self::DeepSeek
+                | Self::Vibe
         )
     }
 
@@ -3012,6 +3058,7 @@ impl ExternalAgentInvocation {
             Self::Cursor => Some(AdapterId::Cursor),
             Self::GeminiCli => Some(AdapterId::GeminiCli),
             Self::DeepSeek => Some(AdapterId::DeepSeek),
+            Self::Vibe => Some(AdapterId::Vibe),
         }
     }
 }
@@ -3903,6 +3950,7 @@ impl ExternalAgentCommand {
                 RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
                 RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
                 RuntimeId::DeepSeek => ExternalAgentInvocation::DeepSeek,
+                RuntimeId::Vibe => ExternalAgentInvocation::Vibe,
                 RuntimeId::Codex | RuntimeId::Fake => {
                     return self;
                 }
@@ -3964,13 +4012,19 @@ impl ExternalAgentCommand {
         }
         if !matches!(
             runtime,
-            RuntimeId::Grok | RuntimeId::ClaudeCode | RuntimeId::GeminiCli | RuntimeId::Cursor
+            RuntimeId::Grok
+                | RuntimeId::ClaudeCode
+                | RuntimeId::GeminiCli
+                | RuntimeId::Cursor
+                | RuntimeId::Vibe
         ) || !non_delegating_terminal_worker
         {
             let reason = if runtime == RuntimeId::ClaudeCode {
                 WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
             } else if runtime == RuntimeId::GeminiCli {
                 WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED
+            } else if runtime == RuntimeId::Vibe {
+                WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED
             } else {
                 WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
             };
@@ -3983,6 +4037,7 @@ impl ExternalAgentCommand {
             RuntimeId::ClaudeCode => ExternalAgentInvocation::ClaudeCode,
             RuntimeId::GeminiCli => ExternalAgentInvocation::GeminiCli,
             RuntimeId::Cursor => ExternalAgentInvocation::Cursor,
+            RuntimeId::Vibe => ExternalAgentInvocation::Vibe,
             _ => unreachable!("filtered above"),
         };
         if self.invocation != expected_invocation {
@@ -3990,10 +4045,36 @@ impl ExternalAgentCommand {
                 WRITABLE_CLAUDE_SELECTION_EVIDENCE_STALE
             } else if runtime == RuntimeId::GeminiCli {
                 WRITABLE_GEMINI_SELECTION_EVIDENCE_STALE
+            } else if runtime == RuntimeId::Vibe {
+                WRITABLE_VIBE_SELECTION_EVIDENCE_STALE
             } else {
                 WRITABLE_GROK_SELECTION_EVIDENCE_STALE
             };
             bail!("{reason}: selected native runtime does not match the executable invocation");
+        }
+        if runtime == RuntimeId::Vibe {
+            // Vibe is admitted only for the writable execution-phase terminal
+            // Worker: the exact Worker lifecycle role and the AssignmentChild
+            // process kind, never a ParentAuditor or any other phase.
+            let identity = self.agent_lifecycle.as_ref().with_context(|| {
+                format!("{WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED}: writable Vibe requires the exact Worker lifecycle binding")
+            })?;
+            if identity.role != "worker" {
+                bail!(
+                    "{WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED}: writable Vibe requires the Worker lifecycle role"
+                );
+            }
+            // Selection precedes issuance of the assignment process grant.
+            // The execution boundary requires AssignmentChild once the grant
+            // is attached; an explicitly different kind is already invalid here.
+            if self
+                .assignment_process_launch_kind
+                .is_some_and(|kind| kind != AssignmentProcessLaunchKind::AssignmentChild)
+            {
+                bail!(
+                    "{WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED}: writable Vibe requires the AssignmentChild process kind"
+                );
+            }
         }
         self.writable_runtime_selection = Some(WritableRuntimeSelectionEvidence::from_command(
             assignment_id,
@@ -4258,6 +4339,39 @@ impl ExternalAgentCommand {
             }
             return Ok(crate::runtime_adapter::RuntimeCapabilities::CURSOR_MANAGED);
         }
+        if runtime == RuntimeId::Vibe {
+            if self.invocation != ExternalAgentInvocation::Vibe
+                || self.workspace_access != WorkspaceAccess::ReadWrite
+                || self.writable_launch_target != WritableLaunchTarget::ManagedChildWorktree
+            {
+                bail!("writable Vibe requires an admitted managed-child worktree launch");
+            }
+            let selected = self
+                .writable_runtime_selection
+                .as_ref()
+                .with_context(|| WRITABLE_VIBE_SELECTION_EVIDENCE_MISSING.to_string())?;
+            if !selected.matches_command(self, RuntimeId::Vibe)
+                || expected_assignment_id.is_some_and(|expected| selected.assignment_id != expected)
+            {
+                bail!("{WRITABLE_VIBE_SELECTION_EVIDENCE_STALE}: writable Vibe selection evidence is missing or stale");
+            }
+            let config = self.runtime_adapter.as_ref().with_context(|| {
+                format!("{WRITABLE_VIBE_ADAPTER_CONFIGURATION_UNVERIFIED}: writable Vibe requires the immutable adapter configuration")
+            })?;
+            if config.binary_path() != self.program {
+                bail!("{WRITABLE_VIBE_ADAPTER_CONFIGURATION_UNVERIFIED}: Vibe executable differs from its adapter");
+            }
+            let context = LaunchContext {
+                prompt: &self.prompt,
+                model: self.model.as_deref(),
+                effort: self.reasoning_effort.as_deref(),
+                cwd: &self.cwd,
+                output: &self.output_last_message,
+            };
+            return config
+                .vibe_launch_contract(&context)
+                .with_context(|| WRITABLE_VIBE_ADAPTER_CONFIGURATION_UNVERIFIED.to_string());
+        }
         let capabilities = match runtime {
             RuntimeId::Grok => self.current_grok_writable_contract()?.capabilities(),
             RuntimeId::ClaudeCode => self.current_claude_writable_contract()?.capabilities(),
@@ -4314,16 +4428,23 @@ impl ExternalAgentCommand {
         let capabilities = self.selected_writable_capabilities(runtime, None)?;
         if !matches!(
             runtime,
-            RuntimeId::Grok | RuntimeId::ClaudeCode | RuntimeId::GeminiCli | RuntimeId::Cursor
+            RuntimeId::Grok
+                | RuntimeId::ClaudeCode
+                | RuntimeId::GeminiCli
+                | RuntimeId::Cursor
+                | RuntimeId::Vibe
         ) {
             return Ok(capabilities);
         }
         let gemini = runtime == RuntimeId::GeminiCli;
+        let vibe = runtime == RuntimeId::Vibe;
         let selected = self.writable_runtime_selection.as_ref().with_context(|| {
             if runtime == RuntimeId::ClaudeCode {
                 format!("{WRITABLE_CLAUDE_SELECTION_EVIDENCE_MISSING}: writable Claude selection evidence disappeared before confinement verification")
             } else if gemini {
                 format!("{WRITABLE_GEMINI_SELECTION_EVIDENCE_MISSING}: writable Gemini selection evidence disappeared before confinement verification")
+            } else if vibe {
+                format!("{WRITABLE_VIBE_SELECTION_EVIDENCE_MISSING}: writable Vibe selection evidence disappeared before confinement verification")
             } else {
                 format!("{WRITABLE_GROK_SELECTION_EVIDENCE_MISSING}: writable Grok selection evidence disappeared before confinement verification")
             }
@@ -4333,6 +4454,8 @@ impl ExternalAgentCommand {
                 format!("{WRITABLE_CLAUDE_CONFINEMENT_PROOF_MISSING}: writable Claude has no MACO-owned managed-worktree confinement proof")
             } else if gemini {
                 format!("{WRITABLE_GEMINI_CONFINEMENT_PROOF_MISSING}: writable Gemini has no MACO-owned managed-worktree confinement proof")
+            } else if vibe {
+                format!("{WRITABLE_VIBE_CONFINEMENT_PROOF_MISSING}: writable Vibe has no MACO-owned managed-worktree confinement proof")
             } else {
                 format!("{WRITABLE_GROK_CONFINEMENT_PROOF_MISSING}: writable Grok has no MACO-owned managed-worktree confinement proof")
             }
@@ -4350,6 +4473,8 @@ impl ExternalAgentCommand {
                 WRITABLE_CLAUDE_CONFINEMENT_PROOF_STALE
             } else if runtime == RuntimeId::GeminiCli {
                 WRITABLE_GEMINI_CONFINEMENT_PROOF_STALE
+            } else if vibe {
+                WRITABLE_VIBE_CONFINEMENT_PROOF_STALE
             } else {
                 WRITABLE_GROK_CONFINEMENT_PROOF_STALE
             };
@@ -4430,6 +4555,8 @@ impl ExternalAgentCommand {
                 WRITABLE_CLAUDE_CONFINEMENT_UNVERIFIED
             } else if runtime == RuntimeId::GeminiCli {
                 WRITABLE_GEMINI_CONFINEMENT_UNVERIFIED
+            } else if vibe {
+                WRITABLE_VIBE_CONFINEMENT_UNVERIFIED
             } else {
                 WRITABLE_GROK_CONFINEMENT_UNVERIFIED
             };
@@ -5467,6 +5594,76 @@ impl ExternalAgentRun {
         &self.stdout.bytes
     }
 
+    /// Parent-owned Vibe token usage for this run, with a completeness flag.
+    ///
+    /// Returns `Some((usage, complete))` only when `command` is the exact Vibe
+    /// launch this report belongs to. Failed targets can still consume tokens.
+    /// Missing or invalid export evidence leaves usage unavailable.
+    /// The served model remains UNKNOWN: only the requested model is recorded
+    /// (`vibe_requested_model`). Cost is always None, even when the export
+    /// reports `cost_usd: 0.0`.
+    pub fn vibe_usage(
+        &self,
+        command: &ExternalAgentCommand,
+    ) -> Option<(vibe::VibeUsageCapture, bool)> {
+        if command.invocation != ExternalAgentInvocation::Vibe
+            || self.cwd != command.cwd
+            || !self
+                .stdout
+                .run_metadata
+                .vibe_launch
+                .as_ref()?
+                .matches(command)
+        {
+            return None;
+        }
+        let usage = self.stdout.run_metadata.vibe_usage?;
+        let complete = self.stdout.run_metadata.vibe_usage_complete;
+        Some((usage, complete))
+    }
+
+    /// The requested Vibe model only. The served model remains UNKNOWN.
+    pub fn vibe_requested_model(&self) -> Option<&str> {
+        self.stdout.run_metadata.vibe_requested_model.as_deref()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn retain_vibe_fixture_for_test(
+        &mut self,
+        command: &ExternalAgentCommand,
+        export: Option<&[u8]>,
+        stream: &[u8],
+    ) -> Result<()> {
+        let model = crate::runtime_adapter::vibe::validate_model(command.model.as_deref())?;
+        self.stdout.bytes = stream.to_vec();
+        self.stdout.raw_truncated = Some(false);
+        self.stdout.target_launch_attempted = true;
+        self.stdout.run_metadata.vibe_requested_model = Some(model.to_string());
+        self.stdout.run_metadata.vibe_launch = Some(vibe::VibeLaunchEvidence {
+            model: model.to_string(),
+            config_sha256: sha256_hex(
+                crate::runtime_adapter::vibe::config_document(model)?.as_bytes(),
+            ),
+            export_dir: crate::runtime_adapter::vibe::export_directory(
+                &command.output_last_message,
+            ),
+            program: command.program.clone(),
+            cwd: command.cwd.clone(),
+            prompt: command.prompt.clone(),
+            output_last_message: command.output_last_message.clone(),
+            reasoning_effort: command.reasoning_effort.clone(),
+        });
+        let usage = export.and_then(|bytes| crate::runtime_adapter::vibe::parse_usage(bytes).ok());
+        self.stdout.run_metadata.vibe_usage_complete = usage.is_some();
+        self.stdout.run_metadata.vibe_usage = usage.map(|usage| VibeUsageCapture {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            cached_input_tokens: usage.cached_input_tokens,
+            total_tokens: usage.total_tokens,
+        });
+        Ok(())
+    }
+
     /// Scratch output may be discarded only when the main target was never
     /// released and no preflight probe started, or every launched process is
     /// proven empty with verified side-effect confinement.
@@ -5753,6 +5950,14 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
 struct ExternalAgentRunMetadata {
     /// Live snapshot custody; public launch descriptions never restore this evidence.
     deepseek_launch_patch: Option<deepseek_capture::LaunchPatch>,
+    /// Parent-held Vibe launch evidence; never serialized or restored from reports.
+    vibe_launch: Option<vibe::VibeLaunchEvidence>,
+    /// Requested model only. The served model remains UNKNOWN.
+    vibe_requested_model: Option<String>,
+    /// Parent-owned token counts captured from the held export leaf before
+    /// staging cleanup. Cost is never derived (always None).
+    vibe_usage: Option<vibe::VibeUsageCapture>,
+    vibe_usage_complete: bool,
     selected_merge_completion: Option<SelectedMergeCompletionBinding>,
     gemini_bridge: Option<gemini_bridge::HeldEvidence>,
     read_only_input_snapshots: Vec<crate::process_runner::ReadOnlyInputSnapshot>,
@@ -7179,16 +7384,25 @@ fn assignment_process_launch_kind_allowed_for_invocation(
             ExternalAgentInvocation::CodexConsultant | ExternalAgentInvocation::CodexSupervisor
         ),
         AssignmentProcessLaunchKind::AssignmentChild
-        | AssignmentProcessLaunchKind::ParentAuditor => match spec.invocation {
-            ExternalAgentInvocation::CodexSupervisor
-            | ExternalAgentInvocation::Grok
-            | ExternalAgentInvocation::Cursor
-            | ExternalAgentInvocation::ClaudeCode
-            | ExternalAgentInvocation::GeminiCli
-            | ExternalAgentInvocation::DeepSeek => true,
-            ExternalAgentInvocation::CodexConsultant
-            | ExternalAgentInvocation::ClaudeConsultant => false,
-        },
+        | AssignmentProcessLaunchKind::ParentAuditor => {
+            if spec.invocation == ExternalAgentInvocation::Vibe {
+                // Vibe is admitted only for the execution-phase AssignmentChild;
+                // a ParentAuditor process kind is never a Vibe launch phase.
+                kind == AssignmentProcessLaunchKind::AssignmentChild
+            } else {
+                match spec.invocation {
+                    ExternalAgentInvocation::CodexSupervisor
+                    | ExternalAgentInvocation::Grok
+                    | ExternalAgentInvocation::Cursor
+                    | ExternalAgentInvocation::ClaudeCode
+                    | ExternalAgentInvocation::GeminiCli
+                    | ExternalAgentInvocation::DeepSeek => true,
+                    ExternalAgentInvocation::CodexConsultant
+                    | ExternalAgentInvocation::ClaudeConsultant => false,
+                    ExternalAgentInvocation::Vibe => unreachable!("filtered above"),
+                }
+            }
+        }
         AssignmentProcessLaunchKind::MergeArbiter => {
             if spec.selected_merge_arbiter.is_some() {
                 validate_selected_merge_command(spec).is_ok()
@@ -7497,6 +7711,36 @@ fn run_external_agent_runtime_inner(
             assignment_process_launch_refusal(error),
         );
     }
+    if spec.invocation == ExternalAgentInvocation::Vibe {
+        // Vibe is admitted only for the writable execution-phase non-delegating
+        // terminal Worker. Every other role or phase is refused at this boundary.
+        if spec.workspace_access != WorkspaceAccess::ReadWrite {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                format!(
+                    "{WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED}: Vibe execution is admitted only for the writable execution-phase non-delegating terminal Worker"
+                ),
+            );
+        }
+        let identity = spec.agent_lifecycle.as_ref();
+        if identity.is_none_or(|identity| identity.role != "worker")
+            || spec.assignment_process_launch_kind
+                != Some(AssignmentProcessLaunchKind::AssignmentChild)
+        {
+            return failed_external_run(
+                spec,
+                started,
+                command_display(&spec.program, &[]),
+                false,
+                format!(
+                    "{WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED}: writable Vibe requires the Worker lifecycle role and the AssignmentChild process kind"
+                ),
+            );
+        }
+    }
     if spec.workspace_access == WorkspaceAccess::ReadWrite {
         if spec.invocation == ExternalAgentInvocation::DeepSeek {
             let bound = spec.agent_lifecycle.as_ref().is_some_and(|identity| {
@@ -7519,6 +7763,7 @@ fn run_external_agent_runtime_inner(
                 AdapterId::ClaudeCode => Some(RuntimeId::ClaudeCode),
                 AdapterId::GeminiCli => Some(RuntimeId::GeminiCli),
                 AdapterId::Cursor => Some(RuntimeId::Cursor),
+                AdapterId::Vibe => Some(RuntimeId::Vibe),
                 _ => None,
             };
             let capabilities =
@@ -8612,6 +8857,33 @@ fn run_external_agent_runtime_inner(
             }
         }
     }
+    if spec.invocation == ExternalAgentInvocation::Vibe {
+        let staged_vibe = match output_staging.stage_vibe_launch(spec) {
+            Ok(staged) => staged,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(external_sandbox_requirement(spec.invocation)),
+                    format!("Vibe private launch staging refused: {error:#}"),
+                );
+                return report;
+            }
+        };
+        if let Err(error) = vibe::apply_environment(staged_vibe, &mut external_environment) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::MissingCredential,
+                None,
+                format!("Vibe launch privacy environment refused: {error:#}"),
+            );
+            return report;
+        }
+        report.stdout.run_metadata.vibe_requested_model = Some(staged_vibe.evidence.model.clone());
+        report.stdout.run_metadata.vibe_launch = Some(staged_vibe.evidence.clone());
+    }
     #[cfg(target_os = "linux")]
     if let Some(session) = grok_session.as_ref() {
         if let Err(error) =
@@ -8918,6 +9190,29 @@ fn run_external_agent_runtime_inner(
             // Already sealed with its effective pathname prompt and credential
             // profile before Grok preflight. Never augment it a second time.
             Ok(None)
+        } else if spec.invocation == ExternalAgentInvocation::Vibe {
+            // Output staging changes the pathname output argument. Authenticate
+            // the original selected command, then deliver the held effective
+            // prompt through the staged target below.
+            let mut original_argv = match runtime_adapter_argv(spec) {
+                Ok(argv) => argv,
+                Err(error) => {
+                    record_external_error(
+                        &mut report,
+                        format!("Vibe journal argv refused: {error:#}"),
+                    );
+                    return report;
+                }
+            };
+            bind_worker_journal_append_operation(
+                spec,
+                &target_controls,
+                runtime,
+                program_trust,
+                &mut prompt,
+                &mut profile,
+                &mut original_argv,
+            )
         } else {
             bind_worker_journal_append_operation(
                 &target_spec,
@@ -8955,6 +9250,67 @@ fn run_external_agent_runtime_inner(
             report.command = command_display(&resolved_program, &argv);
         }
         (prompt, profile, binding)
+    };
+    #[cfg(target_os = "linux")]
+    let (prompt, side_effect_profile) = if runtime == ExternalExecutionRuntime::Verified
+        && target_spec.invocation == ExternalAgentInvocation::Vibe
+    {
+        // Vibe reads its prompt by pathname. Deliver the exact effective
+        // prompt (including any bound journal appendix) as a held staging
+        // leaf and re-render the immutable argv against that leaf. The
+        // prompt text never travels on argv.
+        let staged_prompt = match output_staging.stage_worker_effective_prompt(&spec.cwd, &prompt) {
+            Ok(path) => path,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("Vibe effective prompt staging refused: {error:#}"),
+                );
+                return report;
+            }
+        };
+        target_spec.prompt = staged_prompt;
+        let profile = match side_effect_profile {
+            Some(SideEffectConfinementProfile::ExternalCodex(profile)) => {
+                Some(SideEffectConfinementProfile::ExternalCodex(
+                    profile.with_visible_read_only_file(&target_spec.prompt),
+                ))
+            }
+            _ => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_environment_failure(
+                    &mut report,
+                    EnvironmentFailureCategory::SandboxUnavailable,
+                    Some(external_sandbox_requirement(target_spec.invocation)),
+                    "Vibe effective prompt requires the fixed ExternalCodex sandbox".to_string(),
+                );
+                return report;
+            }
+        };
+        argv = match command_argv_with_controls(&target_spec, &target_controls) {
+            Ok(argv) => argv,
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(
+                    &mut report,
+                    format!("Vibe launch configuration is invalid: {error:#}"),
+                );
+                return report;
+            }
+        };
+        bound_argv_digest = match argv_digest(&argv) {
+            Ok(digest) => Some(digest),
+            Err(error) => {
+                report.duration_ms = duration_millis(started.elapsed());
+                record_external_error(&mut report, format!("Vibe argv binding failed: {error:#}"));
+                return report;
+            }
+        };
+        report.command = command_display(&resolved_program, &argv);
+        (prompt, profile)
+    } else {
+        (prompt, side_effect_profile)
     };
     let app_server_prompt = if app_server_required {
         match String::from_utf8(prompt.clone()) {
@@ -9293,6 +9649,22 @@ fn run_external_agent_runtime_inner(
         }
     };
 
+    if runtime == ExternalExecutionRuntime::Verified
+        && target_spec.invocation == ExternalAgentInvocation::Vibe
+    {
+        // The private Vibe HOME/XDG/TMPDIR control directories are already
+        // projected; stop the shared runner from overwriting them.
+        if let Err(error) = vibe::seal_private_runtime_home(&mut process_spec) {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::SandboxUnavailable,
+                Some(external_sandbox_requirement(target_spec.invocation)),
+                format!("failed to seal private Vibe runtime directories: {error:#}"),
+            );
+            return report;
+        }
+    }
     if matches!(runtime, ExternalExecutionRuntime::Verified)
         && matches!(
             target_spec.invocation,
@@ -9492,7 +9864,7 @@ fn run_external_agent_runtime_inner(
         }
     };
     // The shell directories must survive every return/panic while the target may live.
-    if !output_staging.shell_directories.is_empty() {
+    if !output_staging.shell_directories.is_empty() || output_staging.vibe.is_some() {
         output_staging.preserve_unquiescent = true;
     }
     report.stdout.target_launch_attempted = true;
@@ -10207,10 +10579,11 @@ fn run_external_agent_runtime_inner(
             record_grok_journal_custody_failure(&mut report, &error);
         }
     }
-    let worker_journal_artifacts =
+    let mut worker_journal_artifacts =
         capture_worker_journal_artifacts(&protected_controls, report.scratch_quiescence_verified());
-    #[cfg(target_os = "linux")]
-    let mut worker_journal_artifacts = worker_journal_artifacts;
+    if matches!(spec.invocation, ExternalAgentInvocation::Vibe) {
+        vibe::withhold_credential_journals(&mut worker_journal_artifacts, &credential_redactor);
+    }
     #[cfg(target_os = "linux")]
     if let Some(binding) = worker_journal_append
         .as_ref()
@@ -10219,9 +10592,7 @@ fn run_external_agent_runtime_inner(
         binding.attach_command_binding(&mut worker_journal_artifacts, &target_spec.cwd);
     }
     report.replace_worker_journal_artifacts(worker_journal_artifacts);
-    if !output_staging.shell_directories.is_empty() {
-        output_staging.preserve_unquiescent = !report.scratch_quiescence_verified();
-    }
+    output_staging.record_target_quiescence(report.scratch_quiescence_verified());
     match output_staging.cleanup() {
         Ok(ExternalOutputCleanup::Quarantined(operation)) => {
             if let Err(error) = persist_machine_global_retention_receipt(&spec.json_log, &operation)
@@ -11638,6 +12009,14 @@ fn runtime_adapter_captured_output_with_claude_evidence(
             deepseek_capture::capture(spec, stdout)?,
         ));
     }
+    if spec.invocation == ExternalAgentInvocation::Vibe {
+        if !target_completed_successfully {
+            return Ok(RuntimeAdapterCapturedOutput::Unavailable);
+        }
+        return Ok(RuntimeAdapterCapturedOutput::Captured(
+            vibe::capture_report_text(stdout)?,
+        ));
+    }
     if spec.invocation == ExternalAgentInvocation::Grok {
         if grok_acp_stdio_protocol_selected(spec) {
             return Ok(RuntimeAdapterCapturedOutput::ExistingStagedOutput);
@@ -11695,6 +12074,8 @@ struct CompletedTargetStaging<'a> {
     output: &'a mut ReservedOutputFile,
     /// The parent-owned Codex home, present only for supervisor launches.
     codex_home: Option<&'a SecureOutputRoot>,
+    /// The parent-held private Vibe export directory, present only for Vibe launches.
+    vibe_export: Option<&'a SecureOutputRoot>,
 }
 
 fn record_completed_app_server_target(
@@ -11901,6 +12282,7 @@ fn record_completed_target(
     let CompletedTargetStaging {
         output: staged_output,
         codex_home,
+        vibe_export,
     } = staging;
     let safety_verified = output.safety_evidence_verified();
     retain_grok_stream_auth_failure(
@@ -11914,6 +12296,8 @@ fn record_completed_target(
         && output.process_error.is_none()
         && output.stdin_error.is_none()
         && (context.spec.invocation != ExternalAgentInvocation::DeepSeek
+            || !output.stdout.is_truncated())
+        && (context.spec.invocation != ExternalAgentInvocation::Vibe
             || !output.stdout.is_truncated());
     let mut claude_native_evidence =
         (context.spec.invocation == ExternalAgentInvocation::ClaudeCode).then(|| {
@@ -11980,6 +12364,13 @@ fn record_completed_target(
         report.error = append_external_error(
             report.error.take(),
             Some("DeepSeek stdout capture is truncated".into()),
+        );
+    }
+    if context.spec.invocation == ExternalAgentInvocation::Vibe && output.stdout.is_truncated() {
+        // A truncated NDJSON stream cannot prove the run's final report.
+        report.error = append_external_error(
+            report.error.take(),
+            Some("Vibe stdout capture is truncated".into()),
         );
     }
     if let Some(evidence) = context.grok_acp_parent_evidence {
@@ -12054,7 +12445,12 @@ fn record_completed_target(
         Ok(RuntimeAdapterCapturedOutput::Captured(captured)) => {
             // DeepSeek reports are JSON text nested inside the event stream. Keep the
             // parent's intermediate report staging free of launch credentials too.
-            let captured = if context.spec.invocation == ExternalAgentInvocation::DeepSeek {
+            let captured = if matches!(
+                context.spec.invocation,
+                ExternalAgentInvocation::DeepSeek | ExternalAgentInvocation::Vibe
+            ) {
+                // Keep the parent's intermediate report staging free of launch
+                // credentials too.
                 credential_redactor.redact_bytes(&captured)
             } else {
                 captured
@@ -12106,6 +12502,24 @@ fn record_completed_target(
                         "external-agent output reservation changed: {error}"
                     )),
                 );
+            }
+        }
+    }
+    if context.spec.invocation == ExternalAgentInvocation::Vibe && safety_verified {
+        // Capture usage from the held export directory after verified process
+        // quiescence and retain it parent-owned before staging cleanup. A
+        // missing, replaced, oversized or malformed export means usage is
+        // unavailable or incomplete, never a silent success.
+        let export = vibe_export
+            .context("private Vibe export directory became unavailable before usage capture");
+        match export.and_then(vibe::capture_usage) {
+            Ok(usage) => {
+                report.stdout.run_metadata.vibe_usage = Some(usage);
+                report.stdout.run_metadata.vibe_usage_complete = true;
+            }
+            Err(error) => {
+                report.stdout.run_metadata.vibe_usage_complete = false;
+                tracing::debug!(reason = %error, "Vibe usage is unavailable");
             }
         }
     }
@@ -12389,6 +12803,9 @@ struct ExternalOutputStaging {
     /// Fresh shell HOME/TMPDIR below the artifact root admitted by both sandbox layers.
     /// Held until target quiescence, then removed or quarantined with output staging.
     shell_directories: Vec<SecureOutputRoot>,
+    /// Parent-held private Vibe home, config, shell/XDG directories, and export
+    /// directory. Held until target quiescence so usage is captured before cleanup.
+    vibe: Option<vibe::VibeStaging>,
     machine_global_retention: Option<ExternalMachineGlobalRetentionBinding>,
     bound_store: Option<MachineGlobalStore>,
     bound_root_reservation: Option<ReservedDirectory>,
@@ -12459,6 +12876,7 @@ impl ExternalOutputStaging {
                 worker_effective_prompt: None,
                 codex_home: None,
                 shell_directories: Vec::new(),
+                vibe: None,
                 machine_global_retention: Some(binding),
                 bound_store: Some(store),
                 bound_root_reservation: Some(root_reservation),
@@ -12535,6 +12953,7 @@ impl ExternalOutputStaging {
                 worker_effective_prompt: None,
                 codex_home: None,
                 shell_directories: Vec::new(),
+                vibe: None,
                 machine_global_retention: None,
                 bound_store: None,
                 bound_root_reservation: None,
@@ -12592,6 +13011,18 @@ impl ExternalOutputStaging {
         Ok(self.codex_home.insert(home).path())
     }
 
+    /// Stages the per-attempt private Vibe home (fresh `config.toml`), shell/XDG
+    /// directories, and the private export directory below the staging root.
+    /// The export directory identity is established before launch and held by inode.
+    fn stage_vibe_launch(&mut self, spec: &ExternalAgentCommand) -> Result<&vibe::VibeStaging> {
+        if self.vibe.is_some() {
+            bail!("private output staging already holds a Vibe launch");
+        }
+        let staged_output = self.path()?.to_path_buf();
+        let staging = vibe::stage(spec, &mut self.root, &staged_output)?;
+        Ok(self.vibe.insert(staging))
+    }
+
     /// Materializes shell state beneath the artifact root already projected into both the
     /// outer unit and Codex's inner filesystem profile. The unit RuntimeDirectory contains
     /// control files and possibly auth; it is deliberately not an inner writable root.
@@ -12640,6 +13071,7 @@ impl ExternalOutputStaging {
         Ok(CompletedTargetStaging {
             output,
             codex_home: self.codex_home.as_ref(),
+            vibe_export: self.vibe.as_ref().map(|staging| &staging.export),
         })
     }
 
@@ -12660,6 +13092,12 @@ impl ExternalOutputStaging {
         self.reservation
             .as_mut()
             .context("private output staging reservation was already cleaned")
+    }
+
+    fn record_target_quiescence(&mut self, verified: bool) {
+        if !self.shell_directories.is_empty() || self.vibe.is_some() {
+            self.preserve_unquiescent = !verified;
+        }
     }
 
     fn cleanup(&mut self) -> Result<ExternalOutputCleanup> {
@@ -12712,6 +13150,8 @@ impl ExternalOutputStaging {
                 // The staged Codex home travels with the quarantined staging root.
                 self.codex_home.take();
                 self.shell_directories.clear();
+                // All held Vibe paths travel with the quarantined staging root.
+                self.vibe.take();
                 self.bound_root_reservation.take();
                 self.bound_store.take();
                 self.cleanup_completed = true;
@@ -12737,6 +13177,9 @@ impl ExternalOutputStaging {
         }
         for directory in self.shell_directories.drain(..) {
             remove_staged_codex_home(directory)?;
+        }
+        if let Some(vibe) = self.vibe.take() {
+            vibe.cleanup()?;
         }
         self.root.verify_path_identity()?;
         fs::remove_dir(&self.root_path).with_context(|| {
@@ -13514,10 +13957,20 @@ fn evaluate_environment_requirement(
         }
         EnvironmentRequirement::Network { access } => {
             // The outer Codex profile delegates command networking to the selected inner profile.
+            // The Vibe full unit is network-enabled explicitly; it must never
+            // inherit an offline claim just because the Codex development
+            // network flag is unset.
+            let verified_networked_vibe = invocation == ExternalAgentInvocation::Vibe
+                && verified_confinement == Some(SideEffectConfinementProfileKind::ExternalCodex)
+                && matches!(
+                    side_effect_profile,
+                    SideEffectConfinementProfile::ExternalCodex(_)
+                );
             let enforced_offline = verified_confinement
                 == Some(SideEffectConfinementProfileKind::ExternalCodex)
-                && !codex_network_enabled;
-            let verified_networked_codex = codex_network_enabled
+                && !codex_network_enabled
+                && !verified_networked_vibe;
+            let verified_networked_codex = (codex_network_enabled
                 && matches!(
                     invocation,
                     ExternalAgentInvocation::CodexSupervisor
@@ -13527,7 +13980,8 @@ fn evaluate_environment_requirement(
                 && matches!(
                     side_effect_profile,
                     SideEffectConfinementProfile::ExternalCodex(_)
-                );
+                ))
+                || verified_networked_vibe;
             let verified_networked_grok = verified_confinement
                 == Some(SideEffectConfinementProfileKind::ExternalGrok)
                 && matches!(
@@ -13862,6 +14316,8 @@ pub(crate) mod deepseek_tests;
 mod managed_readonly_route_tests;
 #[cfg(test)]
 mod tests;
+#[cfg(all(test, unix))]
+pub(crate) mod vibe_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod managed_parent_fixture;

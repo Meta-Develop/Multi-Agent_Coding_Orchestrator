@@ -52,7 +52,8 @@
                   "cursor",
                   "claude-code",
                   "gemini-cli",
-                  "deepseek"
+                  "deepseek",
+                  "vibe"
                 ]
               }
             },

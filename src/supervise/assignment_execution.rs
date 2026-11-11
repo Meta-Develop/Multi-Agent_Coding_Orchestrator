@@ -171,7 +171,8 @@ pub(crate) fn selected_runtime_program(
         }
         SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
-        | SupervisorRuntime::GeminiCli => Ok(
+        | SupervisorRuntime::GeminiCli
+        | SupervisorRuntime::Vibe => Ok(
             crate::runtime_adapter::RuntimeAdapterConfig::try_from_environment(launch_runtime)?
                 .binary
                 .filter(|path| !path.as_os_str().is_empty())
@@ -200,7 +201,8 @@ fn bind_runtime_output_schema(
         SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => None,
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Vibe => None,
     };
     Ok(command)
 }
@@ -622,6 +624,10 @@ fn bind_selected_runtime_launch(
     if launch_runtime == SupervisorRuntime::Codex {
         command = command.with_development_codex_network(options.development_codex_network);
     }
+    // Vibe admission is decided on the effective launch runtime, before any
+    // researcher or read-only admission, so a selector override cannot bypass
+    // the direct execution-phase terminal Worker requirement.
+    super::vibe_worker::validate_assignment(assignment, launch_runtime)?;
     if assignment.role == AgentRole::Researcher {
         validate_researcher_assignment(assignment)?;
         if !matches!(
@@ -655,6 +661,19 @@ fn bind_selected_runtime_launch(
     }
     let configured = effective_role_model_selection(plan, assignment.role);
     let resolution = catalog.resolve_role_model_selection(&configured, launch_runtime)?;
+    if launch_runtime == SupervisorRuntime::Vibe {
+        // Vibe has no served-effort guarantee, so only the model id is
+        // validated: it must be operator-declared by the role catalog and a
+        // plain provider identifier before it reaches argv.
+        crate::runtime_adapter::vibe::validate_model(resolution.selection.model.as_deref())
+            .with_context(|| {
+                format!(
+                    "Vibe assignment '{}' requires an operator-declared model for role '{}'",
+                    assignment.id,
+                    assignment.role.as_str()
+                )
+            })?;
+    }
     let loaded_route = crate::selection::routing_policy::current_routing_policy().is_some()
         && launch_runtime != SupervisorRuntime::Fake;
     if loaded_route {
@@ -831,12 +850,14 @@ fn bind_selected_native_execution_workspace(
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
             | SupervisorRuntime::Cursor
+            | SupervisorRuntime::Vibe
     ) {
         return Ok(command);
     }
     if command.workspace_access != WorkspaceAccess::ReadWrite {
         return Ok(command);
     }
+    super::vibe_worker::validate_assignment(assignment, launch_runtime)?;
     let is_writable_terminal_worker = writable_execution
         && assignment.phase == AssignmentPhase::Execution
         && assignment.role == AgentRole::Worker
@@ -846,6 +867,8 @@ fn bind_selected_native_execution_workspace(
         crate::external_agent::WRITABLE_CLAUDE_TERMINAL_WORKER_REQUIRED
     } else if launch_runtime == SupervisorRuntime::GeminiCli {
         crate::external_agent::WRITABLE_GEMINI_TERMINAL_WORKER_REQUIRED
+    } else if launch_runtime == SupervisorRuntime::Vibe {
+        crate::external_agent::WRITABLE_VIBE_TERMINAL_WORKER_REQUIRED
     } else {
         crate::external_agent::WRITABLE_GROK_TERMINAL_WORKER_REQUIRED
     };
@@ -1263,6 +1286,13 @@ fn dispatch_isolated_parent_workers_inner(
     for (ordinal, grant) in grants.iter().enumerate() {
         grant.revalidate(context, parent_preflight)?;
         let worker = grant.worker();
+        let runtime = nested_worker_launch_runtime(
+            assignment_launch_runtime(&parent_preflight.assignment, context.options, policy),
+            policy,
+        );
+        if runtime == SupervisorRuntime::Vibe {
+            super::vibe_worker::refuse_nested_worker_launch()?;
+        }
         if grant.identity().0 != ordinal + 1
             || parent_preflight.assignment.worker_assignments.get(ordinal) != Some(worker)
         {
@@ -1272,10 +1302,7 @@ fn dispatch_isolated_parent_workers_inner(
             assignment_shape: None,
             id: worker.id.clone(),
             phase: AssignmentPhase::Execution,
-            runtime: Some(nested_worker_launch_runtime(
-                assignment_launch_runtime(&parent_preflight.assignment, context.options, policy),
-                policy,
-            )),
+            runtime: Some(runtime),
             role: AgentRole::Worker,
             role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
             selection_source: worker.selection_source,
@@ -3858,6 +3885,7 @@ fn launch_runtime_binds_assignment_messaging(runtime: SupervisorRuntime) -> bool
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
+            | SupervisorRuntime::Vibe
     )
 }
 
@@ -4319,6 +4347,7 @@ fn dispatch_and_capture_child_attempt_with_release_state<'a>(
             | SupervisorRuntime::Cursor
             | SupervisorRuntime::ClaudeCode
             | SupervisorRuntime::GeminiCli
+            | SupervisorRuntime::Vibe
             | SupervisorRuntime::DeepSeek,
         ) => {
             if let Some(state) = release_state {
@@ -7485,6 +7514,9 @@ fn dispatch_and_collect_parent_auditor(
         }
         SupervisorRuntime::DeepSeek => {
             bail!("DeepSeek headless is admitted only as a read-only Researcher");
+        }
+        SupervisorRuntime::Vibe => {
+            bail!("Vibe is admitted only for execution-phase terminal Workers, not auditors");
         }
         SupervisorRuntime::Fake => {
             if let Err(error) = auditor_budget_reservation.mark_invoked_for_runtime(launch_runtime)

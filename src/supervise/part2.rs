@@ -367,6 +367,9 @@ impl DispatchBudgetReservation<'_> {
                 run.stdout_bytes(),
                 command.model.as_deref(),
             ),
+            // Vibe's held export attests token counters only. The served model
+            // stays unknown; the requested model is never promoted to served.
+            SupervisorRuntime::Vibe => None,
             _ => command.model.clone(),
         };
         let pricing = match launch_runtime {
@@ -374,6 +377,9 @@ impl DispatchBudgetReservation<'_> {
             // Neither native stream attests provider pricing. Reservation estimates do not
             // establish actual money spent.
             SupervisorRuntime::Grok | SupervisorRuntime::ClaudeCode => None,
+            // Vibe cost is always unknown: the export carries no attributable
+            // price, and configured operator rates are never actual spend.
+            SupervisorRuntime::Vibe => None,
             _ => model.as_deref().and_then(|model| {
                 self.ledger
                     .operator_pricing
@@ -391,6 +397,11 @@ impl DispatchBudgetReservation<'_> {
                 .authenticated_grok_usage(command)
                 .is_some_and(|(_, complete)| complete),
             SupervisorRuntime::ClaudeCode => run.authenticated_claude_usage_complete(),
+            // Complete Vibe accounting is the parent-held export capture, not a
+            // re-parse of stdout or of a mutable export after staging cleanup.
+            SupervisorRuntime::Vibe => run
+                .vibe_usage(command)
+                .is_some_and(|(_, complete)| complete),
             SupervisorRuntime::DeepSeek => {
                 crate::runtime_adapter::deepseek::run_completed(
                     run.stdout_bytes(),
@@ -630,7 +641,8 @@ fn test_runtime_model_catalog(
         | SupervisorRuntime::Cursor
         | SupervisorRuntime::ClaudeCode
         | SupervisorRuntime::GeminiCli
-        | SupervisorRuntime::DeepSeek => Ok(RuntimeModelCatalog::OperatorDeclared),
+        | SupervisorRuntime::DeepSeek
+        | SupervisorRuntime::Vibe => Ok(RuntimeModelCatalog::OperatorDeclared),
     }
 }
 

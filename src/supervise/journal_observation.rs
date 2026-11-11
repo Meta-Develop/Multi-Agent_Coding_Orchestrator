@@ -124,6 +124,47 @@ pub(crate) fn validate_worker_journal_observations(
     Ok(())
 }
 
+/// Credential environment keys whose values must never appear in a journaled
+/// command, matching CredentialRedactor::from_runtime in external_agent/part2.rs.
+const WORKER_JOURNAL_CREDENTIAL_ENV_KEYS: [&str; 6] = [
+    "ANTHROPIC_API_KEY",
+    "OPENAI_API_KEY",
+    "CODEX_API_KEY",
+    "CODEX_ACCESS_TOKEN",
+    "DEEPSEEK_API_KEY",
+    "MISTRAL_API_KEY",
+];
+
+/// The credential variable whose value appears in the journaled entry, if any.
+/// Unset variables and values shorter than 8 bytes are ignored. The value is
+/// only compared, never copied into the returned diagnostic.
+fn worker_journal_credential_key(
+    entry: &WorkerExecutionJournalEntry,
+    environment: &BTreeMap<String, String>,
+) -> Option<&'static str> {
+    for key in WORKER_JOURNAL_CREDENTIAL_ENV_KEYS {
+        let Some(value) = environment.get(key) else {
+            continue;
+        };
+        if value.len() < 8 {
+            continue;
+        }
+        let contained = entry
+            .command
+            .iter()
+            .any(|argument| argument.contains(value.as_str()))
+            || entry.cwd.to_string_lossy().contains(value.as_str())
+            || entry
+                .changed_paths
+                .iter()
+                .any(|path| path.to_string_lossy().contains(value.as_str()));
+        if contained {
+            return Some(key);
+        }
+    }
+    None
+}
+
 /// Execute shell argv under the existing confinement, or observe an immediately
 /// preceding native edit. The journal lock is held across observation and action.
 #[cfg(test)]
@@ -136,6 +177,26 @@ pub(crate) fn run_worker_execution_journal_command(
     run_worker_execution_journal_command_with_clock(path, expected, entry, observe_changes, false)
 }
 
+/// Test-only variant with an injected environment so the credential refusal can
+/// be exercised without touching the test process environment.
+#[cfg(test)]
+pub(crate) fn run_worker_execution_journal_command_with_environment(
+    path: &Path,
+    expected: &crate::safe_state::FileIdentity,
+    entry: &WorkerExecutionJournalEntry,
+    observe_changes: bool,
+    environment: &BTreeMap<String, String>,
+) -> Result<()> {
+    run_worker_execution_journal_command_with_environment_and_clock(
+        path,
+        expected,
+        entry,
+        observe_changes,
+        false,
+        environment,
+    )
+}
+
 pub(crate) fn run_worker_execution_journal_command_with_clock(
     path: &Path,
     expected: &crate::safe_state::FileIdentity,
@@ -143,6 +204,45 @@ pub(crate) fn run_worker_execution_journal_command_with_clock(
     observe_changes: bool,
     auto_timestamps: bool,
 ) -> Result<()> {
+    let environment = std::env::vars_os()
+        .filter_map(|(key, value)| {
+            Some((
+                key.to_str()?.to_string(),
+                value.to_string_lossy().into_owned(),
+            ))
+        })
+        .collect::<BTreeMap<_, _>>();
+    run_worker_execution_journal_command_with_environment_and_clock(
+        path,
+        expected,
+        entry,
+        observe_changes,
+        auto_timestamps,
+        &environment,
+    )
+}
+
+fn run_worker_execution_journal_command_with_environment_and_clock(
+    path: &Path,
+    expected: &crate::safe_state::FileIdentity,
+    entry: &WorkerExecutionJournalEntry,
+    observe_changes: bool,
+    auto_timestamps: bool,
+    environment: &BTreeMap<String, String>,
+) -> Result<()> {
+    // Refuse a credential-bearing invocation before the journal file is opened,
+    // before anything is appended and before anything is launched, in both the
+    // command mode and the --observe-changes mode. This must run before the
+    // timestamp handling and before the entry is serialized or validated,
+    // because those steps can quote a supplied field in an error. The
+    // diagnostic names the variable but never contains the credential value.
+    if let Some(key) = worker_journal_credential_key(entry, environment) {
+        bail!(
+            "WorkerJournalPrelaunchRejected: no command launched; journal unchanged; \
+             {key} credential value never belongs in a journaled command; \
+             pass the variable name instead of expanding its value"
+        );
+    }
     let mut timed_entry = entry.clone();
     if auto_timestamps {
         if !entry.start_timestamp.is_empty() || !entry.end_timestamp.is_empty() {

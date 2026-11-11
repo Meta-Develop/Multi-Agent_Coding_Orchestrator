@@ -294,6 +294,7 @@ impl<'a> AssignmentAttemptAuthority<'a> {
                 crate::external_agent::ExternalAgentInvocation::GeminiCli
             }
             SupervisorRuntime::DeepSeek => crate::external_agent::ExternalAgentInvocation::DeepSeek,
+            SupervisorRuntime::Vibe => crate::external_agent::ExternalAgentInvocation::Vibe,
             SupervisorRuntime::Fake => bail!("assignment admission refuses a simulated runtime"),
         };
         if command.invocation != expected_invocation {

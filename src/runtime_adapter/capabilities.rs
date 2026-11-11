@@ -26,6 +26,8 @@ pub enum AdapterId {
     GeminiCli,
     #[serde(rename = "deepseek")]
     DeepSeek,
+    #[serde(rename = "vibe")]
+    Vibe,
 }
 
 impl AdapterId {
@@ -59,7 +61,7 @@ impl AdapterId {
         Ok(self.managed_parent_control_protocol())
     }
 
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Codex,
         Self::Fake,
         Self::Grok,
@@ -67,6 +69,7 @@ impl AdapterId {
         Self::ClaudeCode,
         Self::GeminiCli,
         Self::DeepSeek,
+        Self::Vibe,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -78,6 +81,7 @@ impl AdapterId {
             Self::ClaudeCode => "claude-code",
             Self::GeminiCli => "gemini-cli",
             Self::DeepSeek => "deepseek",
+            Self::Vibe => "vibe",
         }
     }
 
@@ -90,6 +94,7 @@ impl AdapterId {
             "claude-code" | "claude" => Some(Self::ClaudeCode),
             "gemini-cli" | "gemini" => Some(Self::GeminiCli),
             "deepseek" | "dsh" => Some(Self::DeepSeek),
+            "vibe" => Some(Self::Vibe),
             _ => None,
         }
     }
@@ -104,6 +109,7 @@ impl AdapterId {
             Self::GeminiCli => "gemini",
             // Resolution refuses this bare name. Launch requires absolute MACO_DSH_BIN.
             Self::DeepSeek => "dsh",
+            Self::Vibe => "vibe",
         }
     }
 
@@ -114,6 +120,7 @@ impl AdapterId {
             Self::ClaudeCode => Some("MACO_CLAUDE"),
             Self::GeminiCli => Some("MACO_GEMINI"),
             Self::DeepSeek => Some("MACO_DSH"),
+            Self::Vibe => Some("MACO_VIBE"),
             Self::Codex | Self::Fake => None,
         }
     }
@@ -131,6 +138,7 @@ impl AdapterId {
             RuntimeId::ClaudeCode => Self::ClaudeCode,
             RuntimeId::GeminiCli => Self::GeminiCli,
             RuntimeId::DeepSeek => Self::DeepSeek,
+            RuntimeId::Vibe => Self::Vibe,
         }
     }
 
@@ -143,6 +151,7 @@ impl AdapterId {
             Self::ClaudeCode => Some(RuntimeId::ClaudeCode),
             Self::GeminiCli => Some(RuntimeId::GeminiCli),
             Self::DeepSeek => Some(RuntimeId::DeepSeek),
+            Self::Vibe => Some(RuntimeId::Vibe),
         }
     }
 
@@ -172,6 +181,7 @@ impl AdapterId {
             Self::ClaudeCode => RuntimeCapabilities::CLAUDE_CODE,
             Self::GeminiCli => RuntimeCapabilities::GEMINI_CLI,
             Self::DeepSeek => RuntimeCapabilities::DEEPSEEK,
+            Self::Vibe => RuntimeCapabilities::VIBE,
         }
     }
 
@@ -180,9 +190,12 @@ impl AdapterId {
         match self {
             Self::Codex => AdapterTrustClass::TrustedSystem,
             Self::Fake => AdapterTrustClass::LocalDeterministic,
-            Self::Grok | Self::Cursor | Self::ClaudeCode | Self::GeminiCli | Self::DeepSeek => {
-                AdapterTrustClass::ExplicitCustom
-            }
+            Self::Grok
+            | Self::Cursor
+            | Self::ClaudeCode
+            | Self::GeminiCli
+            | Self::DeepSeek
+            | Self::Vibe => AdapterTrustClass::ExplicitCustom,
         }
     }
 
@@ -214,6 +227,10 @@ impl AdapterId {
             Self::DeepSeek => Some(PrivateRuntimeStateHome {
                 env_var: "DSH_HOME",
                 relative_path: ".dsh",
+            }),
+            Self::Vibe => Some(PrivateRuntimeStateHome {
+                env_var: "VIBE_HOME",
+                relative_path: ".vibe",
             }),
             Self::Fake => None,
         }
@@ -501,6 +518,17 @@ impl RuntimeCapabilities {
         writable_workspace: WorkspaceWritability::Unsupported,
         session_resume: SessionResume::Unsupported,
         ..Self::DEEPSEEK
+    };
+
+    /// Static Vibe row. Side effects stay unverified until a launch proves the
+    /// exact immutable Vibe contract; writable admission stays closed.
+    pub const VIBE: Self = Self {
+        blocking_pre_action_callback: BlockingPreActionCallback::None,
+        writable_workspace: WorkspaceWritability::Partial,
+        side_effect_confinement: SideEffectConfinement::Unverified,
+        model_catalog: ModelCatalogSource::OperatorDeclared,
+        usage_reporting: UsageReporting::Aggregate,
+        session_resume: SessionResume::Unsupported,
     };
 
     pub const fn matrix_cells(self) -> [(&'static str, MatrixStatus); 6] {
@@ -1031,6 +1059,7 @@ mod tests {
             (AdapterId::ClaudeCode, "CLAUDE_CONFIG_DIR", ".claude"),
             (AdapterId::GeminiCli, "GEMINI_CLI_HOME", ".gemini"),
             (AdapterId::DeepSeek, "DSH_HOME", ".dsh"),
+            (AdapterId::Vibe, "VIBE_HOME", ".vibe"),
         ];
         for (adapter, env_var, relative_path) in homes {
             let home = adapter
