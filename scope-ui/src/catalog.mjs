@@ -75,11 +75,13 @@ export function liveHref(row) {
 
 export const EVIDENCE_SCHEMA_VERSION = 1;
 export const UNKNOWN_MODEL = "Unknown";
-export const MODEL_GROUPINGS = ["resolved", "requested"];
+export const MODEL_GROUPINGS = ["resolved", "requested", "role", "role_requested"];
 
 const MODEL_GROUPING_LABELS = {
   resolved: "Resolved / observed model",
   requested: "Requested model",
+  role: "Role category",
+  role_requested: "Role category x requested model",
 };
 
 export function modelGroupingLabel(grouping) {
@@ -131,7 +133,7 @@ function identityKey(record) {
   const run = textOrNull(record.optimization_run_id);
   const invocation = textOrNull(record.invocation_id);
   if (!run || !invocation) return null;
-  return run + "\u0000" + invocation;
+  return JSON.stringify([run, invocation, textOrNull(record.started_at)]);
 }
 
 // Every field that can distinguish two rows for the same invocation. Raw
@@ -175,6 +177,8 @@ function describeConflict(existing, incoming) {
     run +
     "/" +
     invocation +
+    " @ " +
+    (textOrNull(incoming.started_at) || "null") +
     " (" +
     (fields.length ? fields.join("; ") : "differing measurement fields") +
     ")"
@@ -230,17 +234,19 @@ export function parseEvidenceArtifact(text, label) {
     records.push(entry);
   });
   if (errors.length > 0) return { ok: false, records: [], errors };
-  return { ok: true, records, errors };
+  return { ok: true, records, errors, collection: isPlainObject(document.collection) ? document.collection : null };
 }
 
-// Merge parsed artifacts, deduplicating by optimization_run_id + invocation_id.
-// Identical duplicates collapse; conflicting rows are rejected and reported.
+// Identity is (optimization_run_id, invocation_id, started_at), including null.
+// Identical duplicates collapse; all rows of a conflicting identity are excluded.
 // Artifacts that failed to parse contribute no records at all.
 export function mergeEvidenceArtifacts(artifacts) {
   const list = Array.isArray(artifacts) ? artifacts : [];
   const errors = [];
   const byKey = new Map();
+  const conflictedKeys = new Set();
   const records = [];
+  const collections = [];
   let duplicates = 0;
   let conflicts = 0;
   let rejectedArtifacts = 0;
@@ -254,6 +260,7 @@ export function mergeEvidenceArtifacts(artifacts) {
       rejectedArtifacts += 1;
       continue;
     }
+    if (isPlainObject(parsed.collection)) collections.push(parsed.collection);
     for (const record of parsed.records || []) {
       const key = identityKey(record);
       if (!key) continue;
@@ -268,12 +275,14 @@ export function mergeEvidenceArtifacts(artifacts) {
         continue;
       }
       conflicts += 1;
+      conflictedKeys.add(key);
       errors.push(describeConflict(existing, record));
     }
   }
   return {
     ok: errors.length === 0,
-    records,
+    records: records.filter((record) => !conflictedKeys.has(identityKey(record))),
+    collections,
     errors,
     duplicates,
     conflicts,
@@ -287,9 +296,14 @@ function groupLabel(record, grouping) {
   return textOrNull(record[field]) || UNKNOWN_MODEL;
 }
 
-// Percentages stay defined even when the aggregate exceeds Number's safe
-// integer range: each record is individually safe, so the ratio is computed
-// from finite doubles rather than requiring a safe-integer total.
+function roleCategory(role) {
+  const raw = (textOrNull(role) || "").toLowerCase();
+  if (["manager", "childorchestrator", "orchestrator", "supervisor"].includes(raw)) return "Manager";
+  if (["auditor", "reviewer", "review"].includes(raw)) return "Review";
+  return raw === "worker" ? "Worker" : "Other";
+}
+
+// A missing or unsafe denominator leaves the percentage unavailable.
 function percentOf(part, whole) {
   if (typeof whole !== "number" || !Number.isFinite(whole) || whole <= 0) return null;
   if (typeof part !== "number" || !Number.isFinite(part) || part < 0) return null;
@@ -307,12 +321,15 @@ export function evidenceGroups(records, grouping) {
   let measuredRecords = 0;
   const masses = [];
   for (const record of list) {
-    const label = groupLabel(record, mode);
-    let bucket = buckets.get(label);
+    const category = mode === "role" || mode === "role_requested" ? roleCategory(record.role) : null;
+    const label = groupLabel(record, mode === "role_requested" ? "requested" : mode);
+    const key = category ? JSON.stringify([category, mode === "role_requested" ? label : null]) : label;
+    let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { label, invocations: 0, measuredInvocations: 0, masses: [] };
-      buckets.set(label, bucket);
+      bucket = { label, category, roles: new Set(), invocations: 0, measuredInvocations: 0, masses: [] };
+      buckets.set(key, bucket);
     }
+    bucket.roles.add(textOrNull(record.role) || "Unknown");
     bucket.invocations += 1;
     const mass = measuredTokenMass(record);
     if (mass == null) continue;
@@ -330,7 +347,10 @@ export function evidenceGroups(records, grouping) {
     const measured = bucket.measuredInvocations > 0;
     const tokens = measured ? exactToNumber(exact) : null;
     return {
-      label: bucket.label,
+      label: bucket.category
+        ? bucket.category + " (" + [...bucket.roles].sort().join(", ") + ")" +
+          (mode === "role_requested" ? " × " + bucket.label : "")
+        : bucket.label,
       invocations: bucket.invocations,
       invocationShare: percentOf(bucket.invocations, list.length),
       measuredInvocations: bucket.measuredInvocations,

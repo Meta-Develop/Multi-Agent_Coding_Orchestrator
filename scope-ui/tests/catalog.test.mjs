@@ -191,7 +191,7 @@ test("mergeEvidenceArtifacts rejects conflicting measurement rows visibly", () =
   const merged = mergeEvidenceArtifacts([first, second]);
   assert.equal(merged.ok, false);
   assert.equal(merged.conflicts, 1);
-  assert.equal(merged.records.length, 1);
+  assert.equal(merged.records.length, 0);
   assert.match(merged.errors.join(" "), /Conflicting duplicate invocation run-a\/inv-1/);
   assert.match(merged.errors.join(" "), /input_tokens/);
 });
@@ -471,6 +471,7 @@ test("mixed roles and models group once per invocation across artifacts", () => 
 // Minimal DOM stand-in: enough for catalog-view.js to build rows and charts
 // without a browser, a GUI or any network access.
 function makeNode(tag) {
+  const listeners = new Map();
   return {
     tagName: tag,
     children: [],
@@ -487,7 +488,14 @@ function makeNode(tag) {
     replaceChildren() {
       this.children = [];
     },
-    addEventListener() {},
+    addEventListener(type, listener) {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(listener);
+    },
+    dispatchEvent(event) {
+      event.target = this;
+      for (const listener of listeners.get(event.type) || []) listener(event);
+    },
     setAttribute() {},
     querySelectorAll() {
       return [];
@@ -536,6 +544,7 @@ const VIEW_IDS = [
   "evidenceError",
   "evidenceNotice",
   "evidenceBody",
+  "evidenceGroupHeading",
   "invocationChart",
   "tokenChart",
   "invocationChartTitle",
@@ -561,6 +570,8 @@ async function loadView(document) {
   await viewModulePromise;
   const view = globalThis.MacoScope.catalogView;
   view.clearEvidence();
+  document.nodes.get("evidenceGrouping").value = "resolved";
+  document.nodes.get("evidenceGrouping").dispatchEvent({ type: "change" });
   return view;
 }
 
@@ -583,10 +594,15 @@ test("headless view imports artifacts and renders both charts", async () => {
 
   const invocationRows = document.nodes.get("invocationChart").children;
   assert.equal(invocationRows.length, 2);
+  const unknownCount = invocationRows.find((row) => textOf(row).includes("model-b"));
+  assert.equal(unknownCount.className, "chart-row");
+  assert.match(textOf(unknownCount), /1 · 50\.0%/);
+  assert.equal(unknownCount.children[1].children[0].style.width, "50%");
   const tokenRows = document.nodes.get("tokenChart").children;
   assert.equal(tokenRows.length, 2);
   const unmeasured = tokenRows.find((row) => textOf(row).includes("model-b"));
   assert.match(textOf(unmeasured), /unavailable/);
+  assert.equal(unmeasured.className, "chart-row is-unavailable");
   assert.equal(textOf(unmeasured).includes("0 · 0.0%"), false);
   assert.match(textOf(tokenRows.find((row) => textOf(row).includes("model-a"))), /100 · 100\.0%/);
 
@@ -595,8 +611,8 @@ test("headless view imports artifacts and renders both charts", async () => {
   assert.match(note, /1 of 2 invocations have measured usage \(50\.0% coverage\)/);
 
   // Grouping control switches attribution without re-importing.
-  view.evidenceState.grouping = "requested";
-  view.renderEvidence();
+  document.nodes.get("evidenceGrouping").value = "requested";
+  document.nodes.get("evidenceGrouping").dispatchEvent({ type: "change" });
   assert.match(document.nodes.get("invocationChartTitle").textContent, /requested model/);
 
 });
@@ -628,4 +644,145 @@ test("model grouping labels and formatters are explicit", () => {
   assert.equal(formatPercent(null), "—");
   assert.equal(formatCount(7), "7");
   assert.equal(formatCount(null), "—");
+});
+
+test("identity distinguishes trial starts and collapses missing and null starts", () => {
+  const first = invocation({ started_at: "2026-11-01T00:00:00Z" });
+  const later = invocation({ started_at: "2026-11-02T00:00:00Z", input_tokens: 200 });
+  const merged = mergeEvidenceArtifacts([
+    { text: artifact([first, later, invocation(), invocation({ started_at: null }), first]) },
+  ]);
+  assert.equal(merged.ok, true);
+  assert.equal(merged.records.length, 3);
+  assert.equal(merged.duplicates, 2);
+  assert.equal(evidenceGroups(merged.records).totalInvocations, 3);
+
+  // Neither import order nor later repetitions may resurrect a conflicted identity.
+  for (const rows of [
+    [first, { ...first, cached_input_tokens: 99 }, first, later],
+    [{ ...first, cached_input_tokens: 99 }, first, later],
+  ]) {
+    const conflict = mergeEvidenceArtifacts([{ text: artifact(rows) }]);
+    assert.equal(conflict.ok, false);
+    assert.deepEqual(conflict.records, [later]);
+    assert.match(conflict.errors.join(" "), /2026-11-01T00:00:00Z.*cached_input_tokens/);
+  }
+});
+
+test("role categories match all aliases without losing raw role labels", () => {
+  const roles = ["Manager", "CHILDORCHESTRATOR", "orchestrator", "Supervisor",
+    "Auditor", "REVIEWER", "review", "Worker", "custom", null];
+  const records = roles.map((role, index) => invocation({ invocation_id: String(index), role }));
+  const groups = evidenceGroups(records, "role");
+  const category = (name) => groups.rows.find((row) => row.label.startsWith(name + " ("));
+  assert.equal(groups.rows.length, 4);
+  assert.equal(category("Manager").invocations, 4);
+  assert.equal(category("Manager").tokens, 480);
+  for (const role of roles.slice(0, 4)) assert.ok(category("Manager").label.includes(role));
+  assert.equal(category("Review").invocations, 3);
+  assert.equal(category("Worker").label, "Worker (Worker)");
+  assert.equal(category("Other").label, "Other (Unknown, custom)");
+});
+
+test("headless grouping change handler drives both role charts and requested models", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  await view.importFiles([{ name: "roles.json", text: async () => artifact([
+    invocation({ invocation_id: "r1", role: "Auditor", requested_model: "<model-a>", resolved_model: "observed", input_tokens: 10, output_tokens: 0 }),
+    invocation({ invocation_id: "r2", role: "reviewer", requested_model: "model-b", resolved_model: "observed", input_tokens: 30, output_tokens: 0 }),
+    invocation({ invocation_id: "w1", role: "worker", requested_model: "model-b", input_tokens: null, output_tokens: null }),
+  ]) }]);
+
+  const control = document.nodes.get("evidenceGrouping");
+  control.value = "role";
+  control.dispatchEvent({ type: "change" });
+  assert.equal(view.evidenceState.grouping, "role");
+  assert.equal(document.nodes.get("evidenceGroupHeading").textContent, "Role category");
+  for (const id of ["invocationChart", "tokenChart"]) {
+    assert.equal(document.nodes.get(id).children.length, 2);
+    assert.equal(document.nodes.get(id).children[0].children[0].textContent, "Review (Auditor, reviewer)");
+  }
+  assert.match(textOf(document.nodes.get("invocationChart").children[0]), /2 · 66\.7%/);
+  assert.match(textOf(document.nodes.get("tokenChart").children[0]), /40 · 100\.0%/);
+
+  control.value = "role_requested";
+  control.dispatchEvent({ type: "change" });
+  assert.equal(view.evidenceState.grouping, "role_requested");
+  for (const id of ["invocationChart", "tokenChart"]) {
+    const rows = document.nodes.get(id).children;
+    assert.equal(rows.length, 3);
+    assert.ok(rows.some((row) => row.children[0].textContent === "Review (Auditor) × <model-a>"));
+  }
+  const tokenRows = document.nodes.get("tokenChart").children;
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("Auditor"))), /10 · 25\.0%/);
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("reviewer"))), /30 · 75\.0%/);
+  assert.match(document.nodes.get("tokenChartTitle").textContent, /role category x requested model/);
+});
+
+test("headless measured zero and oversized totals retain their values", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  await view.importFiles([{ name: "totals.json", text: async () => artifact([
+    invocation({ invocation_id: "big1", resolved_model: "big", input_tokens: Number.MAX_SAFE_INTEGER, output_tokens: 0 }),
+    invocation({ invocation_id: "big2", resolved_model: "big", input_tokens: 2, output_tokens: 0 }),
+    invocation({ invocation_id: "zero", resolved_model: "zero", input_tokens: 0, output_tokens: 0 }),
+  ]) }]);
+  const rows = document.nodes.get("tokenChart").children;
+  assert.match(textOf(rows.find((row) => textOf(row).includes("big"))), /9007199254740993 · —/);
+  assert.match(textOf(rows.find((row) => textOf(row).includes("zero"))), /0 · —/);
+  for (const row of rows) assert.equal(row.className, "chart-row");
+  const tableRows = document.nodes.get("evidenceBody").children;
+  assert.ok(tableRows.some((row) => textOf(row).includes("9007199254740993")));
+});
+
+test("Clear invalidates pending successful and failed reads through its click handler", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  for (const fails of [false, true]) {
+    let finish;
+    const pending = view.importFiles([{ name: "late.json", text: () => new Promise((resolve, reject) => {
+      finish = () => fails ? reject(new Error("late failure")) : resolve(artifact([invocation()]));
+    }) }]);
+    document.nodes.get("evidenceClear").dispatchEvent({ type: "click" });
+    // New imports after Clear must survive even when the old read finishes later.
+    await view.importFiles([{ name: "new.json", text: async () => artifact([invocation({ invocation_id: "new" })]) }]);
+    finish();
+    await pending;
+    assert.equal(view.evidenceState.artifacts.length, 1);
+    assert.equal(view.evidenceState.merged.records[0].invocation_id, "new");
+    assert.equal(document.nodes.get("evidenceError").textContent, "");
+    document.nodes.get("evidenceClear").dispatchEvent({ type: "click" });
+    assert.equal(view.evidenceState.merged, null);
+    assert.equal(document.nodes.get("evidenceStatus").textContent, "No artifacts imported");
+  }
+});
+
+test("collected artifacts show one collection notice and accept exec JSONL records", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  const collection = {
+    files_scanned: 12, artifacts_parsed: 3, identical_duplicates: 2,
+    invalid_artifacts: ["bad-a", "bad-b"], conflicts: [], external_sources: ["external"],
+  };
+  const text = JSON.stringify({ schema_version: 1, collection, invocations: [invocation({ record_source: "codex_exec_jsonl" })] });
+  const parsed = parseEvidenceArtifact(text, "collected.json");
+  assert.equal(parsed.ok, true);
+  assert.deepEqual(parsed.collection, collection);
+  await view.importFiles([{ name: "collected.json", text: async () => text }]);
+  assert.equal(view.evidenceState.merged.records.length, 1);
+  assert.match(textOf(document.nodes.get("tokenChart").children[0]), /120 · 100\.0%/);
+  const notice = document.nodes.get("evidenceNotice").textContent;
+  assert.equal(notice.split("Collection:").length - 1, 1);
+  assert.ok(notice.includes("Collection: files_scanned: 12, artifacts_parsed: 3, identical_duplicates: 2, invalid_artifacts: 2, conflicts: 0, external_sources: 1."));
+
+  view.clearEvidence();
+  await view.importFiles([{ name: "sparse.json", text: async () => JSON.stringify({
+    schema_version: 1, invocations: [invocation()],
+    collection: { files_scanned: 0, artifacts_parsed: "3", external_sources: [] },
+  }) }]);
+  const sparse = document.nodes.get("evidenceNotice").textContent;
+  assert.ok(sparse.includes("Collection: files_scanned: 0, external_sources: 0."));
+  for (const absent of ["artifacts_parsed", "identical_duplicates", "invalid_artifacts", "conflicts:"]) {
+    assert.equal(sparse.includes(absent), false);
+  }
 });

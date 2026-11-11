@@ -43,6 +43,8 @@
       <select id="evidenceGrouping">
         <option value="resolved" selected>Resolved / observed model</option>
         <option value="requested">Requested model</option>
+        <option value="role">Role category</option>
+        <option value="role_requested">Role category x requested model</option>
       </select>
       <button id="evidenceClear" type="button">Clear</button>
     </div>
@@ -63,7 +65,7 @@
     <table class="data-table" aria-label="Evidence coverage">
       <thead>
         <tr>
-          <th>Model group</th>
+          <th id="evidenceGroupHeading">Resolved / observed model</th>
           <th>Invocations</th>
           <th>Invocation share</th>
           <th>Measured invocations</th>

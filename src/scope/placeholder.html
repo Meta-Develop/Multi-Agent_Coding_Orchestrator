@@ -555,6 +555,8 @@ tr[data-frontier="true"] td:last-child { color: var(--amber); }
       <select id="evidenceGrouping">
         <option value="resolved" selected>Resolved / observed model</option>
         <option value="requested">Requested model</option>
+        <option value="role">Role category</option>
+        <option value="role_requested">Role category x requested model</option>
       </select>
       <button id="evidenceClear" type="button">Clear</button>
     </div>
@@ -575,7 +577,7 @@ tr[data-frontier="true"] td:last-child { color: var(--amber); }
     <table class="data-table" aria-label="Evidence coverage">
       <thead>
         <tr>
-          <th>Model group</th>
+          <th id="evidenceGroupHeading">Resolved / observed model</th>
           <th>Invocations</th>
           <th>Invocation share</th>
           <th>Measured invocations</th>
@@ -964,11 +966,13 @@ function liveHref(row) {
 
 const EVIDENCE_SCHEMA_VERSION = 1;
 const UNKNOWN_MODEL = "Unknown";
-const MODEL_GROUPINGS = ["resolved", "requested"];
+const MODEL_GROUPINGS = ["resolved", "requested", "role", "role_requested"];
 
 const MODEL_GROUPING_LABELS = {
   resolved: "Resolved / observed model",
   requested: "Requested model",
+  role: "Role category",
+  role_requested: "Role category x requested model",
 };
 
 function modelGroupingLabel(grouping) {
@@ -1020,7 +1024,7 @@ function identityKey(record) {
   const run = textOrNull(record.optimization_run_id);
   const invocation = textOrNull(record.invocation_id);
   if (!run || !invocation) return null;
-  return run + "\u0000" + invocation;
+  return JSON.stringify([run, invocation, textOrNull(record.started_at)]);
 }
 
 // Every field that can distinguish two rows for the same invocation. Raw
@@ -1064,6 +1068,8 @@ function describeConflict(existing, incoming) {
     run +
     "/" +
     invocation +
+    " @ " +
+    (textOrNull(incoming.started_at) || "null") +
     " (" +
     (fields.length ? fields.join("; ") : "differing measurement fields") +
     ")"
@@ -1119,17 +1125,19 @@ function parseEvidenceArtifact(text, label) {
     records.push(entry);
   });
   if (errors.length > 0) return { ok: false, records: [], errors };
-  return { ok: true, records, errors };
+  return { ok: true, records, errors, collection: isPlainObject(document.collection) ? document.collection : null };
 }
 
-// Merge parsed artifacts, deduplicating by optimization_run_id + invocation_id.
-// Identical duplicates collapse; conflicting rows are rejected and reported.
+// Identity is (optimization_run_id, invocation_id, started_at), including null.
+// Identical duplicates collapse; all rows of a conflicting identity are excluded.
 // Artifacts that failed to parse contribute no records at all.
 function mergeEvidenceArtifacts(artifacts) {
   const list = Array.isArray(artifacts) ? artifacts : [];
   const errors = [];
   const byKey = new Map();
+  const conflictedKeys = new Set();
   const records = [];
+  const collections = [];
   let duplicates = 0;
   let conflicts = 0;
   let rejectedArtifacts = 0;
@@ -1143,6 +1151,7 @@ function mergeEvidenceArtifacts(artifacts) {
       rejectedArtifacts += 1;
       continue;
     }
+    if (isPlainObject(parsed.collection)) collections.push(parsed.collection);
     for (const record of parsed.records || []) {
       const key = identityKey(record);
       if (!key) continue;
@@ -1157,12 +1166,14 @@ function mergeEvidenceArtifacts(artifacts) {
         continue;
       }
       conflicts += 1;
+      conflictedKeys.add(key);
       errors.push(describeConflict(existing, record));
     }
   }
   return {
     ok: errors.length === 0,
-    records,
+    records: records.filter((record) => !conflictedKeys.has(identityKey(record))),
+    collections,
     errors,
     duplicates,
     conflicts,
@@ -1176,9 +1187,14 @@ function groupLabel(record, grouping) {
   return textOrNull(record[field]) || UNKNOWN_MODEL;
 }
 
-// Percentages stay defined even when the aggregate exceeds Number's safe
-// integer range: each record is individually safe, so the ratio is computed
-// from finite doubles rather than requiring a safe-integer total.
+function roleCategory(role) {
+  const raw = (textOrNull(role) || "").toLowerCase();
+  if (["manager", "childorchestrator", "orchestrator", "supervisor"].includes(raw)) return "Manager";
+  if (["auditor", "reviewer", "review"].includes(raw)) return "Review";
+  return raw === "worker" ? "Worker" : "Other";
+}
+
+// A missing or unsafe denominator leaves the percentage unavailable.
 function percentOf(part, whole) {
   if (typeof whole !== "number" || !Number.isFinite(whole) || whole <= 0) return null;
   if (typeof part !== "number" || !Number.isFinite(part) || part < 0) return null;
@@ -1196,12 +1212,15 @@ function evidenceGroups(records, grouping) {
   let measuredRecords = 0;
   const masses = [];
   for (const record of list) {
-    const label = groupLabel(record, mode);
-    let bucket = buckets.get(label);
+    const category = mode === "role" || mode === "role_requested" ? roleCategory(record.role) : null;
+    const label = groupLabel(record, mode === "role_requested" ? "requested" : mode);
+    const key = category ? JSON.stringify([category, mode === "role_requested" ? label : null]) : label;
+    let bucket = buckets.get(key);
     if (!bucket) {
-      bucket = { label, invocations: 0, measuredInvocations: 0, masses: [] };
-      buckets.set(label, bucket);
+      bucket = { label, category, roles: new Set(), invocations: 0, measuredInvocations: 0, masses: [] };
+      buckets.set(key, bucket);
     }
+    bucket.roles.add(textOrNull(record.role) || "Unknown");
     bucket.invocations += 1;
     const mass = measuredTokenMass(record);
     if (mass == null) continue;
@@ -1219,7 +1238,10 @@ function evidenceGroups(records, grouping) {
     const measured = bucket.measuredInvocations > 0;
     const tokens = measured ? exactToNumber(exact) : null;
     return {
-      label: bucket.label,
+      label: bucket.category
+        ? bucket.category + " (" + [...bucket.roles].sort().join(", ") + ")" +
+          (mode === "role_requested" ? " × " + bucket.label : "")
+        : bucket.label,
       invocations: bucket.invocations,
       invocationShare: percentOf(bucket.invocations, list.length),
       measuredInvocations: bucket.measuredInvocations,
@@ -3083,6 +3105,7 @@ function pageFromLocation(location) {
     merged: null,
     grouping: "resolved",
   };
+  var evidenceImportGeneration = 0;
 
   var evidenceFiles = document.getElementById("evidenceFiles");
   var evidenceGrouping = document.getElementById("evidenceGrouping");
@@ -3132,7 +3155,7 @@ function pageFromLocation(location) {
     return row;
   }
 
-  function renderChart(container, rows, valueOf, shareOf, emptyText) {
+  function renderChart(container, rows, valueOf, shareOf, emptyText, unavailableOf) {
     if (!container) return;
     container.replaceChildren();
     if (!rows.length) {
@@ -3144,7 +3167,7 @@ function pageFromLocation(location) {
     }
     rows.forEach(function (row) {
       container.appendChild(
-        chartRow(row.label, valueOf(row), shareOf(row), row.tokens === null),
+        chartRow(row.label, valueOf(row), shareOf(row), unavailableOf ? unavailableOf(row) : false),
       );
     });
   }
@@ -3152,12 +3175,12 @@ function pageFromLocation(location) {
   // A group with no measured usage has no token value at all: show the
   // unavailable marker rather than a fabricated zero.
   function tokenValueText(row) {
-    if (row.tokens == null) return "unavailable";
+    if (row.measuredInvocations === 0) return "unavailable";
     return catalog.formatExactCount(row.tokensExact);
   }
 
   function tokenShareText(row) {
-    if (row.tokens == null) return "—";
+    if (row.measuredInvocations === 0) return "—";
     return catalog.formatPercent(row.tokenShare);
   }
 
@@ -3166,6 +3189,10 @@ function pageFromLocation(location) {
     var groups = catalog.evidenceGroups(merged ? merged.records : [], evidence.grouping);
     var summary = catalog.evidenceSummary(merged ? merged.records : []);
     var groupingLabel = catalog.modelGroupingLabel(evidence.grouping);
+    var groupHeading = document.getElementById("evidenceGroupHeading");
+    if (groupHeading) groupHeading.textContent = groupingLabel;
+    if (invocationChart) invocationChart.setAttribute("aria-label", "Recorded invocations by " + groupingLabel.toLowerCase());
+    if (tokenChart) tokenChart.setAttribute("aria-label", "Measured tokens by " + groupingLabel.toLowerCase());
 
     if (invocationChartTitle) {
       invocationChartTitle.textContent = "Recorded invocations by " + groupingLabel.toLowerCase();
@@ -3201,6 +3228,9 @@ function pageFromLocation(location) {
         return row.tokenShare;
       },
       "No measured tokens imported.",
+      function (row) {
+        return row.measuredInvocations === 0;
+      },
     );
 
     if (invocationChartNote) {
@@ -3262,6 +3292,18 @@ function pageFromLocation(location) {
           " duplicates collapsed",
       );
       var notices = [];
+      (merged.collections || []).forEach(function (collection) {
+        var values = [];
+        ["files_scanned", "artifacts_parsed", "identical_duplicates"].forEach(function (field) {
+          if (typeof collection[field] === "number" && isFinite(collection[field])) {
+            values.push(field + ": " + collection[field]);
+          }
+        });
+        ["invalid_artifacts", "conflicts", "external_sources"].forEach(function (field) {
+          if (Array.isArray(collection[field])) values.push(field + ": " + collection[field].length);
+        });
+        notices.push("Collection" + (values.length ? ": " + values.join(", ") : " summary present") + ".");
+      });
       if (summary.roles.length) notices.push("Roles present: " + summary.roles.join(", ") + ".");
       if (summary.unknownUsageInvocations > 0) {
         notices.push(
@@ -3272,7 +3314,7 @@ function pageFromLocation(location) {
       if (merged.conflicts > 0) {
         notices.push(
           catalog.formatCount(merged.conflicts) +
-            " conflicting duplicate invocations were rejected.",
+            " conflicts found; all rows with those identities were excluded.",
         );
       }
       if (merged.rejectedArtifacts > 0) {
@@ -3305,6 +3347,7 @@ function pageFromLocation(location) {
   async function importFiles(fileList) {
     var files = Array.prototype.slice.call(fileList || []);
     if (!files.length) return;
+    var generation = evidenceImportGeneration;
     setEvidenceError("");
     var loaded = [];
     var failures = [];
@@ -3317,6 +3360,7 @@ function pageFromLocation(location) {
       } catch (cause) {
         failures.push(label + ": could not be read (" + cause.message + ")");
       }
+      if (generation !== evidenceImportGeneration) return;
     }
     evidence.artifacts = evidence.artifacts.concat(loaded);
     evidence.merged = catalog.mergeEvidenceArtifacts(evidence.artifacts);
@@ -3326,6 +3370,7 @@ function pageFromLocation(location) {
   }
 
   function clearEvidence() {
+    evidenceImportGeneration += 1;
     evidence.artifacts = [];
     evidence.merged = null;
     setEvidenceError("");
@@ -3340,7 +3385,7 @@ function pageFromLocation(location) {
   }
   if (evidenceGrouping) {
     evidenceGrouping.addEventListener("change", function (event) {
-      evidence.grouping = event.target.value === "requested" ? "requested" : "resolved";
+      evidence.grouping = catalog.MODEL_GROUPINGS.includes(event.target.value) ? event.target.value : "resolved";
       renderEvidence();
     });
   }

@@ -88,6 +88,7 @@
     merged: null,
     grouping: "resolved",
   };
+  var evidenceImportGeneration = 0;
 
   var evidenceFiles = document.getElementById("evidenceFiles");
   var evidenceGrouping = document.getElementById("evidenceGrouping");
@@ -137,7 +138,7 @@
     return row;
   }
 
-  function renderChart(container, rows, valueOf, shareOf, emptyText) {
+  function renderChart(container, rows, valueOf, shareOf, emptyText, unavailableOf) {
     if (!container) return;
     container.replaceChildren();
     if (!rows.length) {
@@ -149,7 +150,7 @@
     }
     rows.forEach(function (row) {
       container.appendChild(
-        chartRow(row.label, valueOf(row), shareOf(row), row.tokens === null),
+        chartRow(row.label, valueOf(row), shareOf(row), unavailableOf ? unavailableOf(row) : false),
       );
     });
   }
@@ -157,12 +158,12 @@
   // A group with no measured usage has no token value at all: show the
   // unavailable marker rather than a fabricated zero.
   function tokenValueText(row) {
-    if (row.tokens == null) return "unavailable";
+    if (row.measuredInvocations === 0) return "unavailable";
     return catalog.formatExactCount(row.tokensExact);
   }
 
   function tokenShareText(row) {
-    if (row.tokens == null) return "—";
+    if (row.measuredInvocations === 0) return "—";
     return catalog.formatPercent(row.tokenShare);
   }
 
@@ -171,6 +172,10 @@
     var groups = catalog.evidenceGroups(merged ? merged.records : [], evidence.grouping);
     var summary = catalog.evidenceSummary(merged ? merged.records : []);
     var groupingLabel = catalog.modelGroupingLabel(evidence.grouping);
+    var groupHeading = document.getElementById("evidenceGroupHeading");
+    if (groupHeading) groupHeading.textContent = groupingLabel;
+    if (invocationChart) invocationChart.setAttribute("aria-label", "Recorded invocations by " + groupingLabel.toLowerCase());
+    if (tokenChart) tokenChart.setAttribute("aria-label", "Measured tokens by " + groupingLabel.toLowerCase());
 
     if (invocationChartTitle) {
       invocationChartTitle.textContent = "Recorded invocations by " + groupingLabel.toLowerCase();
@@ -206,6 +211,9 @@
         return row.tokenShare;
       },
       "No measured tokens imported.",
+      function (row) {
+        return row.measuredInvocations === 0;
+      },
     );
 
     if (invocationChartNote) {
@@ -267,6 +275,18 @@
           " duplicates collapsed",
       );
       var notices = [];
+      (merged.collections || []).forEach(function (collection) {
+        var values = [];
+        ["files_scanned", "artifacts_parsed", "identical_duplicates"].forEach(function (field) {
+          if (typeof collection[field] === "number" && isFinite(collection[field])) {
+            values.push(field + ": " + collection[field]);
+          }
+        });
+        ["invalid_artifacts", "conflicts", "external_sources"].forEach(function (field) {
+          if (Array.isArray(collection[field])) values.push(field + ": " + collection[field].length);
+        });
+        notices.push("Collection" + (values.length ? ": " + values.join(", ") : " summary present") + ".");
+      });
       if (summary.roles.length) notices.push("Roles present: " + summary.roles.join(", ") + ".");
       if (summary.unknownUsageInvocations > 0) {
         notices.push(
@@ -277,7 +297,7 @@
       if (merged.conflicts > 0) {
         notices.push(
           catalog.formatCount(merged.conflicts) +
-            " conflicting duplicate invocations were rejected.",
+            " conflicts found; all rows with those identities were excluded.",
         );
       }
       if (merged.rejectedArtifacts > 0) {
@@ -310,6 +330,7 @@
   async function importFiles(fileList) {
     var files = Array.prototype.slice.call(fileList || []);
     if (!files.length) return;
+    var generation = evidenceImportGeneration;
     setEvidenceError("");
     var loaded = [];
     var failures = [];
@@ -322,6 +343,7 @@
       } catch (cause) {
         failures.push(label + ": could not be read (" + cause.message + ")");
       }
+      if (generation !== evidenceImportGeneration) return;
     }
     evidence.artifacts = evidence.artifacts.concat(loaded);
     evidence.merged = catalog.mergeEvidenceArtifacts(evidence.artifacts);
@@ -331,6 +353,7 @@
   }
 
   function clearEvidence() {
+    evidenceImportGeneration += 1;
     evidence.artifacts = [];
     evidence.merged = null;
     setEvidenceError("");
@@ -345,7 +368,7 @@
   }
   if (evidenceGrouping) {
     evidenceGrouping.addEventListener("change", function (event) {
-      evidence.grouping = event.target.value === "requested" ? "requested" : "resolved";
+      evidence.grouping = catalog.MODEL_GROUPINGS.includes(event.target.value) ? event.target.value : "resolved";
       renderEvidence();
     });
   }

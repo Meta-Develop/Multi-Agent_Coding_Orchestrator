@@ -29,8 +29,13 @@ Two horizontal bar charts are rendered:
 - recorded invocation counts and shares per model group;
 - measured `input_tokens + output_tokens` and shares per model group.
 
-A **Group by** control switches between the resolved/observed model
-(`resolved_model`) and the requested model (`requested_model`). A missing model
+A **Group by** control switches both charts between the resolved/observed model
+(`resolved_model`), requested model (`requested_model`), Role category, and
+Role category x requested model. Role matching ignores case: Manager includes
+manager, childorchestrator, orchestrator and supervisor; Review includes auditor,
+reviewer and review; Worker includes worker; Other includes missing or any other
+role. Category labels list their raw roles, for example `Review (Auditor)`.
+A missing model
 is shown as `Unknown`; a missing `resolved_model` is never replaced by
 `requested_model`. `cached_input_tokens` is already part of `input_tokens` and
 is never added again.
@@ -41,7 +46,8 @@ negative, fractional or unsafe usage stays unknown and is excluded, never
 counted as zero; a known zero is valid. Token percentages are explicitly over
 the known measured subtotal, and measured tokens with an unknown model stay in
 `Unknown`. Counts, numeric percentages and coverage are shown next to every
-bar. A model group with no measured usage shows `unavailable` and an em dash
+bar. Every group retains its invocation count bar and percentage regardless of
+token availability. In the token chart, a group with no measured usage shows `unavailable` and an em dash
 rather than a fabricated zero. When no measured tokens exist at all the share
 is an em dash rather than `NaN`, infinity or an arbitrary 100%.
 
@@ -50,14 +56,23 @@ Totals are accumulated exactly, so individually safe records that sum beyond
 subtotal cannot be represented as a `Number`, the percentage is shown as
 unavailable instead of a rounded or fabricated share.
 
-Records are deduplicated by `optimization_run_id` plus `invocation_id` across
+Records are deduplicated by (`optimization_run_id`, `invocation_id`, `started_at`)
+with missing `started_at` treated as null, across
 all imported files and repeated snapshots. Identical duplicates collapse;
-conflicting rows are rejected and listed in the error region instead of being
+all rows of a conflicting identity are excluded and listed in the error region instead of being
 silently chosen. Conflicts are detected on `role`, `backend`, `provider`,
 `requested_model`, `resolved_model`, `input_tokens`, `cached_input_tokens` and
 `output_tokens`, including fractional or unsafe counters that never qualify
 for token mass. Malformed or empty artifacts are rejected with an actionable
 message, and a rejected artifact contributes no records to the charts.
+
+Collected schema-version-1 artifacts import the same way, including invocations
+with `record_source: "codex_exec_jsonl"`. An optional top-level `collection`
+object adds one notice listing numeric `files_scanned`, `artifacts_parsed` and
+`identical_duplicates`, plus the lengths of `invalid_artifacts`, `conflicts` and
+`external_sources` arrays; missing values are omitted. The collector command
+`node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--summary] ROOT...`
+writes one importable artifact. Clear also invalidates pending file reads.
 
 All recorded roles are in scope, including control/review roles, retries and
 failed attempts, each invocation counted once. The charts describe the supplied
