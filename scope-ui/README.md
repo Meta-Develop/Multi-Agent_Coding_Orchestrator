@@ -105,6 +105,11 @@ a native outcome by the sorted, de-duplicated `requested_model` values of
 their Worker invocations (`(no Worker)` when a run has none). Each row
 counts every role of each run: accepted and not accepted runs, total known
 tokens, tokens per accepted run, and how many runs are incomplete.
+The collector also reads each scanned run's `selection-attempts` records into
+`collection.attempt_outcomes` (and `attempt_outcome_conflicts` for disagreeing
+duplicates). When there are any, `--summary` adds a `By Worker model per
+attempt:` section with each Worker model's parent review results and the
+attempts it needed to accept.
 
 All recorded roles are in scope, including control/review roles, retries and
 failed attempts, each invocation counted once. The charts describe the supplied

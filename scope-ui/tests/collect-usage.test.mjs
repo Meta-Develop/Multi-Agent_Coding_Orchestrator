@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import { test } from "node:test";
 
 import {
+  collectAttemptOutcomes,
   mergeInvocations,
   parseArtifact,
   parseExternalTranscript,
@@ -1057,4 +1058,144 @@ test("CLI writes both --svg and --out files", (t) => {
   assert.ok(svg.trimEnd().endsWith("</svg>"));
   const doc = JSON.parse(readFileSync(outFile, "utf8"));
   assert.equal(doc.invocations.length, 1);
+});
+
+test("collectAttemptOutcomes reads selection-attempts records and reports invalid files", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-a", null, []);
+  const dir = join(root, "run-a", "selection-attempts");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "task-1.attempt-1.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 1,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: "high",
+    parent_result: "rejected",
+    parent_cause: "defects",
+  }));
+  writeFileSync(join(dir, "task-1.attempt-2.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 2,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: null,
+    parent_result: "accepted",
+    parent_cause: null,
+  }));
+  writeFileSync(join(dir, "broken.json"), "not json");
+  writeFileSync(join(dir, "no-attempt.json"), JSON.stringify({ run_id: "run-a", assignment_id: "task-2" }));
+  writeRunTree(root, "run-b", null, []);
+  const { files } = scanRoot(root);
+  const errors = [];
+  const { attempt_outcomes, attempt_outcome_conflicts } = collectAttemptOutcomes(files, errors);
+  assert.deepEqual(attempt_outcomes, [
+    {
+      run_id: "run-a",
+      assignment_id: "task-1",
+      attempt: 1,
+      role: "worker",
+      requested_runtime: "vibe",
+      requested_model: "model-a",
+      requested_effort: "high",
+      parent_result: "rejected",
+      parent_cause: "defects",
+      path: join(dir, "task-1.attempt-1.json"),
+    },
+    {
+      run_id: "run-a",
+      assignment_id: "task-1",
+      attempt: 2,
+      role: "worker",
+      requested_runtime: "vibe",
+      requested_model: "model-a",
+      requested_effort: null,
+      parent_result: "accepted",
+      parent_cause: null,
+      path: join(dir, "task-1.attempt-2.json"),
+    },
+  ]);
+  assert.deepEqual(attempt_outcome_conflicts, []);
+  assert.equal(errors.length, 2);
+  assert.equal(errors[0].path, join(dir, "broken.json"));
+  assert.match(errors[0].reason, /^invalid JSON: /);
+  assert.deepEqual(errors[1], {
+    path: join(dir, "no-attempt.json"),
+    reason: "attempt outcome has no valid run_id, assignment_id or attempt",
+  });
+});
+
+test("summarize adds a By Worker model per attempt section", () => {
+  const invocations = [invocation({ invocation_id: "inv-1" })];
+  const runOutcomes = [
+    { run_id: "run-1", success: true, accepted: true, publishable: true, status: "succeeded", path: "p" },
+  ];
+  const attemptOutcomes = [
+    { run_id: "run-1", assignment_id: "task-a", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-a", requested_effort: "high", parent_result: "rejected", parent_cause: "defects", path: "p1" },
+    { run_id: "run-1", assignment_id: "task-a", attempt: 2, role: "worker", requested_runtime: "vibe", requested_model: "model-a", requested_effort: "high", parent_result: "accepted", parent_cause: null, path: "p2" },
+    { run_id: "run-1", assignment_id: "task-b", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-b", requested_effort: null, parent_result: "accepted", parent_cause: null, path: "p3" },
+    { run_id: "run-2", assignment_id: "task-c", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-b", requested_effort: null, parent_result: null, parent_cause: null, path: "p4" },
+    { run_id: "run-1", assignment_id: "task-d", attempt: 1, role: "auditor", requested_runtime: "vibe", requested_model: "model-c", requested_effort: null, parent_result: "accepted", parent_cause: null, path: "p5" },
+  ];
+  const withAttempts = summarize(invocations, runOutcomes, attemptOutcomes);
+  const without = summarize(invocations, runOutcomes);
+  const heading = "By Worker model per attempt:";
+  const lines = withAttempts.split("\n");
+  const index = lines.indexOf(heading);
+  assert.notEqual(index, -1);
+  assert.equal(lines[index - 1], "");
+  assert.deepEqual(lines.slice(0, index - 1), without.split("\n").slice(0, -1));
+  assert.equal(lines[index + 1], "model-a                  attempts    2 accepted    1 rejected    1 unknown    0 assignments    1 first-attempt accepted    0 attempts to accept 2.00");
+  assert.equal(lines[index + 2], "model-b                  attempts    2 accepted    1 rejected    0 unknown    1 assignments    2 first-attempt accepted    1 attempts to accept 1.00");
+  assert.equal(lines.length, index + 4);
+  assert.ok(!withAttempts.includes("model-c"));
+  assert.equal(summarize(invocations, runOutcomes), without);
+});
+
+test("CLI collects attempt outcomes and summarizes them per Worker model", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-a", { run_id: "run-a", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-a", invocation_id: "inv-a" }),
+  ]);
+  const dir = join(root, "run-a", "selection-attempts");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "task-1.attempt-1.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 1,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: "high",
+    parent_result: "rejected",
+    parent_cause: "defects",
+  }));
+  writeFileSync(join(dir, "task-1.attempt-2.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 2,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: "high",
+    parent_result: "accepted",
+    parent_cause: null,
+  }));
+  const outFile = join(root, "usage.json");
+  const result = spawnSync(process.execPath, [script, "--out", outFile, "--summary", root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.collection.attempt_outcomes.length, 2);
+  assert.equal(doc.collection.attempt_outcomes[0].attempt, 1);
+  assert.equal(doc.collection.attempt_outcomes[1].attempt, 2);
+  assert.deepEqual(doc.collection.attempt_outcome_conflicts, []);
+  assert.match(result.stderr, /By Worker model per attempt:/);
+  assert.match(result.stderr, /^model-a\s+attempts\s+2 accepted\s+1 rejected\s+1 unknown\s+0 assignments\s+1 first-attempt accepted\s+0 attempts to accept 2\.00$/m);
+  assert.deepEqual(doc.collection.errors, []);
 });

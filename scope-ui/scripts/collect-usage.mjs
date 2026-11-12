@@ -309,6 +309,131 @@ export function collectRunOutcomes(files, errors) {
   return { run_outcomes, run_outcome_conflicts };
 }
 
+const ATTEMPT_COMPARE_FIELDS = [
+  "run_id",
+  "assignment_id",
+  "attempt",
+  "role",
+  "requested_runtime",
+  "requested_model",
+  "requested_effort",
+  "parent_result",
+  "parent_cause",
+];
+
+function attemptString(value) {
+  return typeof value === "string" ? value : null;
+}
+
+export function collectAttemptOutcomes(files, errors) {
+  const runDirs = new Set();
+  for (const file of files) {
+    runDirs.add(dirname(dirname(resolve(file))));
+  }
+  const groups = new Map();
+  for (const runDir of runDirs) {
+    const dir = join(runDir, "selection-attempts");
+    let names;
+    try {
+      names = readdirSync(dir);
+    } catch (err) {
+      if (err && err.code === "ENOENT") continue;
+      errors.push({ path: dir, reason: `unreadable file: ${err.message}` });
+      continue;
+    }
+    for (const name of [...names].sort()) {
+      if (!name.endsWith(".json")) continue;
+      const path = join(dir, name);
+      let stat;
+      try {
+        stat = lstatSync(path);
+      } catch (err) {
+        errors.push({ path, reason: `unreadable file: ${err.message}` });
+        continue;
+      }
+      if (!stat.isFile()) continue;
+      let text;
+      try {
+        text = readFileSync(path, "utf8");
+      } catch (err) {
+        errors.push({ path, reason: `unreadable file: ${err.message}` });
+        continue;
+      }
+      let data;
+      try {
+        data = JSON.parse(text);
+      } catch (err) {
+        errors.push({ path, reason: `invalid JSON: ${err.message}` });
+        continue;
+      }
+      if (data === null || typeof data !== "object" || Array.isArray(data)) {
+        errors.push({ path, reason: "attempt outcome is not a JSON object" });
+        continue;
+      }
+      if (
+        typeof data.run_id !== "string" ||
+        data.run_id === "" ||
+        typeof data.assignment_id !== "string" ||
+        data.assignment_id === "" ||
+        !Number.isSafeInteger(data.attempt) ||
+        data.attempt < 1
+      ) {
+        errors.push({ path, reason: "attempt outcome has no valid run_id, assignment_id or attempt" });
+        continue;
+      }
+      const selection =
+        data.selection !== null && typeof data.selection === "object" && !Array.isArray(data.selection)
+          ? data.selection
+          : null;
+      const outcome = {
+        run_id: data.run_id,
+        assignment_id: data.assignment_id,
+        attempt: data.attempt,
+        role: selection !== null && typeof selection.role === "string" ? selection.role : null,
+        requested_runtime: attemptString(data.requested_runtime),
+        requested_model: attemptString(data.requested_model),
+        requested_effort: attemptString(data.requested_effort),
+        parent_result: attemptString(data.parent_result),
+        parent_cause: attemptString(data.parent_cause),
+        path,
+      };
+      if (!groups.has(outcome.run_id)) groups.set(outcome.run_id, new Map());
+      const byAssignment = groups.get(outcome.run_id);
+      if (!byAssignment.has(outcome.assignment_id)) byAssignment.set(outcome.assignment_id, new Map());
+      const byAttempt = byAssignment.get(outcome.assignment_id);
+      if (!byAttempt.has(outcome.attempt)) byAttempt.set(outcome.attempt, []);
+      byAttempt.get(outcome.attempt).push(outcome);
+    }
+  }
+  const attempt_outcomes = [];
+  const attempt_outcome_conflicts = [];
+  for (const byAssignment of groups.values()) {
+    for (const byAttempt of byAssignment.values()) {
+      for (const versions of byAttempt.values()) {
+    const first = versions[0];
+    const identical = versions.every((version) =>
+      ATTEMPT_COMPARE_FIELDS.every((field) => first[field] === version[field])
+    );
+    if (identical) {
+      attempt_outcomes.push(first);
+    } else {
+      attempt_outcome_conflicts.push({
+        run_id: first.run_id,
+        assignment_id: first.assignment_id,
+        attempt: first.attempt,
+        paths: versions.map((version) => version.path),
+      });
+    }
+      }
+    }
+  }
+  const byKey = (a, b) =>
+    a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : a.assignment_id < b.assignment_id ? -1 : a.assignment_id > b.assignment_id ? 1 : a.attempt - b.attempt;
+  attempt_outcomes.sort(byKey);
+  attempt_outcome_conflicts.sort(byKey);
+  return { attempt_outcomes, attempt_outcome_conflicts };
+}
+
 function safeCounter(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -519,7 +644,63 @@ function workerModelRows(invocations, runOutcomes) {
   });
 }
 
-export function summarize(invocations, runOutcomes = []) {
+function workerAttemptRows(attemptOutcomes) {
+  const attempts = attemptOutcomes.filter((attempt) => roleCategory(attempt.role) === "Worker");
+  const groups = new Map();
+  for (const attempt of attempts) {
+    const model = attempt.requested_model;
+    const name = typeof model === "string" && model !== "" ? model : "(missing)";
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(attempt);
+  }
+  const names = [...groups.keys()].sort();
+  if (names.length === 0) return ["(none)"];
+  return names.map((name) => {
+    const group = groups.get(name);
+    const pairs = new Map();
+    for (const attempt of group) {
+      if (!pairs.has(attempt.run_id)) pairs.set(attempt.run_id, new Map());
+      const byAssignment = pairs.get(attempt.run_id);
+      if (!byAssignment.has(attempt.assignment_id)) byAssignment.set(attempt.assignment_id, new Map());
+      byAssignment.get(attempt.assignment_id).set(attempt.attempt, attempt.parent_result);
+    }
+    let accepted = 0;
+    let rejected = 0;
+    let unknown = 0;
+    for (const attempt of group) {
+      if (attempt.parent_result === "accepted") accepted += 1;
+      else if (attempt.parent_result === "rejected") rejected += 1;
+      else unknown += 1;
+    }
+    let assignments = 0;
+    let firstAccepted = 0;
+    const lowestAccepted = [];
+    for (const byAssignment of pairs.values()) {
+      for (const pair of byAssignment.values()) {
+        assignments += 1;
+        if (pair.get(1) === "accepted") firstAccepted += 1;
+        const acceptedAttempts = [...pair.entries()].filter((entry) => entry[1] === "accepted").map((entry) => entry[0]);
+        if (acceptedAttempts.length > 0) lowestAccepted.push(Math.min(...acceptedAttempts));
+      }
+    }
+    const meanText =
+      lowestAccepted.length > 0
+        ? (lowestAccepted.reduce((sum, value) => sum + value, 0) / lowestAccepted.length).toFixed(2)
+        : "-";
+    return (
+      name.padEnd(24) +
+      " attempts " + String(group.length).padStart(4) +
+      " accepted " + String(accepted).padStart(4) +
+      " rejected " + String(rejected).padStart(4) +
+      " unknown " + String(unknown).padStart(4) +
+      " assignments " + String(assignments).padStart(4) +
+      " first-attempt accepted " + String(firstAccepted).padStart(4) +
+      " attempts to accept " + meanText
+    );
+  });
+}
+
+export function summarize(invocations, runOutcomes = [], attemptOutcomes = []) {
   const total = invocations.length;
   let knownSubtotal = 0;
   let coverage = 0;
@@ -571,6 +752,11 @@ export function summarize(invocations, runOutcomes = []) {
     const model = invocation.requested_model;
     return typeof model === "string" && model !== "" ? model : "(missing)";
   }));
+  if (attemptOutcomes.length > 0) {
+    lines.push("");
+    lines.push("By Worker model per attempt:");
+    lines.push(...workerAttemptRows(attemptOutcomes));
+  }
   return lines.join("\n") + "\n";
 }
 
@@ -885,6 +1071,7 @@ export async function main(argv) {
   }
 
   const outcomes = collectRunOutcomes(files, errors);
+  const attemptOutcomes = collectAttemptOutcomes(files, errors);
 
   const externalSources = [];
   if (externalManifest !== null) {
@@ -957,13 +1144,15 @@ export async function main(argv) {
       conflicts: merged.conflicts,
       run_outcomes: outcomes.run_outcomes,
       run_outcome_conflicts: outcomes.run_outcome_conflicts,
+      attempt_outcomes: attemptOutcomes.attempt_outcomes,
+      attempt_outcome_conflicts: attemptOutcomes.attempt_outcome_conflicts,
       external_sources: externalSources,
       errors,
     },
   };
 
   if (summary) {
-    process.stderr.write(summarize(invocations, outcomes.run_outcomes));
+    process.stderr.write(summarize(invocations, outcomes.run_outcomes, attemptOutcomes.attempt_outcomes));
   }
   if (svg !== null) {
     try {
