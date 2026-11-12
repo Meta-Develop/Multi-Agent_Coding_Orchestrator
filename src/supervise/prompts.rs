@@ -1269,8 +1269,8 @@ const VIBE_AUTOMATIC_JOURNAL_CONTRACT: &str = r#"- Use plain bash for every comm
 - The wrapper derives changed_paths and checks all paths, including out-of-scope paths. Never supply invented timestamps or changed paths.
 - Journal errors: stop without repair or retry. No hand JSON, identity discovery, PATH change or alternative appender. For observed environment errors include environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Do not modify the held shim/config/helper. Invalid journal bindings fail before launch.
-- WorkerReport.commands_run may be a subset of real journal records, failed commands included. Copy each command array element and exact absolute cwd byte-for-byte. Preserve the inner argv: ["/bin/bash","-c","<complete original script>"], with a matching finished journal record. Never split scripts, drop wrappers, paraphrase commands or invent command identities.
-- Preserve actual command outcomes, including failed/repaired calls. stdout and stderr must be empty or copied exactly from the corresponding observed stream, never shortened, reworded or synthesized."#;
+- WorkerReport.commands_run may be a subset of real journal records. It should hold the final run of each validation command plus any earlier failed run of it; inspection and edit commands may be omitted. Copy each command array element and exact absolute cwd byte-for-byte from the execution journal records read with read_file, never retyped from memory. Preserve the inner argv: ["/bin/bash","-c","<complete original script>"], with a matching finished journal record. Never split scripts, drop wrappers, paraphrase commands or invent command identities.
+- Preserve actual command outcomes, including failed/repaired calls. stdout and stderr default to empty, with results summarized in validation_results messages; a nonempty stream must still be copied exactly from the corresponding observed stream, never excerpted, shortened, reworded or synthesized."#;
 
 const VIBE_DIRECT_WORKER_GUIDANCE: &str = r#"
 Vibe direct-worker guidance:
@@ -1281,7 +1281,7 @@ commands_run required keys: command, cwd, status, timeout_seconds, duration_ms, 
 validation_results required keys: name, status, command; optional keys: message
 Every findings item uses message, never summary.
 Use plain bash for all commands and edits: the configured shell journals automatically. Never manually nest journal-append or use native write/edit. Files may also be read with read_file.
-commands_run stdout and stderr are either empty or copied byte for byte from the observed output in the corresponding stream, never shortened or reworded. Copy any timestamp in the report from the journal records, readable with read_file at the Execution journal path below, never from an example.
+commands_run holds the final run of each validation command plus any earlier failed run of it; inspection and edit commands may be omitted. Commands and cwd are copied from the execution journal records read with read_file, never retyped from memory. commands_run stdout and stderr default to empty, with results summarized in validation_results messages; a nonempty stream must still be copied byte for byte from the observed output in the corresponding stream, never excerpted, shortened or reworded. Copy any timestamp in the report from the journal records, readable with read_file at the Execution journal path below, never from an example.
 Read only the files and sections the assigned change needs: this session has a fixed token cap.
 "#;
 
@@ -2293,6 +2293,12 @@ mod regression_tests {
         assert!(vibe
             .prompt
             .contains("Any commands_run entry with non-null error"));
+        assert!(vibe
+            .prompt
+            .contains("WorkerReport.commands_run may be a subset of real journal records"));
+        assert!(vibe.prompt.contains(
+            "stdout and stderr default to empty, with results summarized in validation_results messages"
+        ));
         let expected = format!(
             "{vibe_prefix}{VIBE_DIRECT_WORKER_GUIDANCE}{}",
             &codex[prefix.len()..]

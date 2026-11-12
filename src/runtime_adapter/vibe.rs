@@ -78,6 +78,11 @@ pub(crate) fn journaled_worker_arguments(arguments: &mut Vec<std::ffi::OsString>
     }
 }
 
+/// The maximum equals the existing --time-limit 3600 of the Vibe argv template;
+/// Vibe accepts a default above 300 only when both keys are set.
+pub(crate) const JOURNALED_BASH_DEFAULT_TIMEOUT_SECONDS: u32 = 1800;
+pub(crate) const JOURNALED_BASH_MAX_TIMEOUT_SECONDS: u32 = 3600;
+
 /// Encode the held per-attempt shell path as TOML data, never shell source.
 #[cfg(any(target_os = "linux", test))]
 pub(crate) fn journaled_config_document(model: &str, shell: &Path) -> Result<String> {
@@ -86,8 +91,15 @@ pub(crate) fn journaled_config_document(model: &str, shell: &Path) -> Result<Str
         .context("Vibe journal shell requires a UTF-8 path")?;
     let quoted = serde_json::to_string(shell)?;
     Ok(format!(
-        "{}\n[tools.bash]\nshell = {quoted}\n",
-        config_document(model)?
+        "{}
+[tools.bash]
+default_timeout = {}
+max_timeout_seconds = {}
+shell = {quoted}
+",
+        config_document(model)?,
+        JOURNALED_BASH_DEFAULT_TIMEOUT_SECONDS,
+        JOURNALED_BASH_MAX_TIMEOUT_SECONDS,
     ))
 }
 
