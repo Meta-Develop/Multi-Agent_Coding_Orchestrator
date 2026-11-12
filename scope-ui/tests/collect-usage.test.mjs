@@ -291,6 +291,67 @@ test("summarize prints a measured zero as 0", () => {
   assert.match(text, /Worker\s+count\s+1\s+50\.0%\s+measured\s+1\/1\s+tokens\s+0\s+0\.0%/);
 });
 
+test("summarize groups runs by Worker model with tokens across all roles", () => {
+  const invocations = [
+    invocation({ optimization_run_id: "run-1", role: "worker", requested_model: "model-w", input_tokens: 100, output_tokens: 50 }),
+    invocation({ optimization_run_id: "run-1", role: "manager", requested_model: "model-m", input_tokens: 200, output_tokens: 100 }),
+    invocation({ optimization_run_id: "run-1", role: "auditor", requested_model: "model-r", input_tokens: 30, output_tokens: 20 }),
+    invocation({ optimization_run_id: "run-2", role: "worker", requested_model: "model-w", input_tokens: 400, output_tokens: 100 }),
+    invocation({ optimization_run_id: "run-2", role: "manager", requested_model: "model-m", input_tokens: 500, output_tokens: 300 }),
+    invocation({ optimization_run_id: "run-2", role: "auditor", requested_model: "model-r", input_tokens: 60, output_tokens: 40 }),
+  ];
+  const text = summarize(invocations, [
+    { run_id: "run-1", accepted: true },
+    { run_id: "run-2", accepted: false },
+  ]);
+  const lines = text.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.notEqual(heading, -1);
+  assert.equal(lines[heading + 1], "model-w                  runs    2 accepted    1 not accepted    1 tokens       1900 per accepted run       1900 incomplete 0");
+});
+
+test("summarize marks a run with an unknown counter as incomplete", () => {
+  const text = summarize(
+    [
+      invocation({ optimization_run_id: "run-1", role: "worker", requested_model: "model-w", input_tokens: 100, output_tokens: null }),
+    ],
+    [{ run_id: "run-1", accepted: true }]
+  );
+  const lines = text.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.equal(lines[heading + 1], "model-w                  runs    1 accepted    1 not accepted    0 tokens          - per accepted run          - incomplete 1");
+});
+
+test("summarize keys a run without Worker invocations as (no Worker)", () => {
+  const text = summarize(
+    [
+      invocation({ optimization_run_id: "run-1", role: "manager", requested_model: "model-m", input_tokens: 100, output_tokens: 100 }),
+    ],
+    [{ run_id: "run-1", accepted: true }]
+  );
+  const lines = text.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.equal(lines[heading + 1], "(no Worker)              runs    1 accepted    1 not accepted    0 tokens        200 per accepted run        200 incomplete 0");
+});
+
+test("summarize ignores invocations whose run has no outcome", () => {
+  const invocations = [
+    invocation({ optimization_run_id: "run-1", role: "worker", requested_model: "model-w", input_tokens: 100, output_tokens: 50 }),
+    invocation({ optimization_run_id: "run-9", role: "worker", requested_model: "model-x", input_tokens: 900, output_tokens: 900 }),
+  ];
+  const text = summarize(invocations, [{ run_id: "run-1", accepted: true }]);
+  const lines = text.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.equal(lines[heading + 1], "model-w                  runs    1 accepted    1 not accepted    0 tokens        150 per accepted run        150 incomplete 0");
+  assert.ok(!lines.slice(heading + 1).some((line) => line.startsWith("model-x")));
+});
+
+test("summarize prints (none) for the Worker model section without outcomes", () => {
+  const text = summarize([invocation({ role: "worker", requested_model: "model-w" })], []);
+  const lines = text.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.equal(lines[heading + 1], "(none)");
+});
 test("CLI end to end with --out, --summary, and an external manifest", (t) => {
   const root = tempDir(t);
   writeArtifact(root, "run/switch-cost/live-evidence.json", {
