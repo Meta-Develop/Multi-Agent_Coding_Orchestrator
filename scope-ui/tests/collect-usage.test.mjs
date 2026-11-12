@@ -238,6 +238,25 @@ test("parseExternalTranscript emits turns, copies counters, nulls unsafe counter
   assert.equal(second.output_tokens, 30);
 });
 
+test("parseExternalTranscript uses a manifest optimization_run_id and falls back to external label", () => {
+  const text = JSON.stringify({
+    type: "turn.completed",
+    usage: { input_tokens: 100, cached_input_tokens: 10, output_tokens: 20 },
+  });
+  const withRun = parseExternalTranscript(
+    { path: "transcript.jsonl", label: "manager-outer", role: "manager", optimization_run_id: "run-7" },
+    text
+  );
+  assert.equal(withRun.invocations.length, 1);
+  assert.equal(withRun.invocations[0].optimization_run_id, "run-7");
+  assert.equal(withRun.invocations[0].invocation_id, "manager-outer:turn-1");
+
+  const withoutRun = parseExternalTranscript({ path: "transcript.jsonl", label: "manager-outer" }, text);
+  assert.equal(withoutRun.invocations.length, 1);
+  assert.equal(withoutRun.invocations[0].optimization_run_id, "external:manager-outer");
+  assert.equal(withoutRun.invocations[0].invocation_id, "manager-outer:turn-1");
+});
+
 test("roleCategory maps case-insensitively and defaults to Other", () => {
   assert.equal(roleCategory("Manager"), "Manager");
   assert.equal(roleCategory("SUPERVISOR"), "Manager");
@@ -696,6 +715,77 @@ test("CLI links run outcomes, keeps invocations unchanged, and summarizes by out
   assert.deepEqual(doc.invocations[0], invocation({ optimization_run_id: "run-a", invocation_id: "inv-a" }));
   assert.deepEqual(doc.invocations[1], invocation({ optimization_run_id: "run-b", invocation_id: "inv-b", input_tokens: 200, output_tokens: 100 }));
   assert.deepEqual(doc.invocations[2], invocation({ optimization_run_id: "run-c", invocation_id: "inv-c", input_tokens: 10, output_tokens: 5 }));
+});
+
+test("CLI attributes an external manager transcript to its MACO run", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-1", { run_id: "run-1", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-1", invocation_id: "inv-1", input_tokens: 100, output_tokens: 50 }),
+  ]);
+  const transcript = join(root, "manager-outer.jsonl");
+  writeFileSync(
+    transcript,
+    JSON.stringify({ type: "turn.completed", usage: { input_tokens: 300, cached_input_tokens: 0, output_tokens: 100 } }) + "\n"
+  );
+  const manifest = join(root, "manifest.json");
+  writeFileSync(manifest, JSON.stringify([
+    {
+      path: transcript,
+      label: "manager-outer",
+      role: "manager",
+      requested_model: "gpt-5",
+      requested_effort: "medium",
+      optimization_run_id: "run-1",
+    },
+  ]));
+  const outFile = join(root, "usage.json");
+
+  const result = spawnSync(
+    process.execPath,
+    [script, "--external-manifest", manifest, "--out", outFile, "--summary", root],
+    { encoding: "utf8" }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const lines = result.stderr.split("\n");
+  const heading = lines.indexOf("By Worker model per run:");
+  assert.notEqual(heading, -1);
+  assert.equal(lines[heading + 1], "model-a                  runs    1 accepted    1 not accepted    0 tokens        550 per accepted run        550 incomplete 0");
+
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.invocations.length, 2);
+  const manager = doc.invocations.find((invocation) => invocation.role === "manager");
+  assert.equal(manager.optimization_run_id, "run-1");
+  assert.equal(manager.invocation_id, "manager-outer:turn-1");
+});
+
+test("CLI skips a manifest entry with an invalid optimization_run_id and records the error", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-1", { run_id: "run-1", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-1", invocation_id: "inv-1" }),
+  ]);
+  const transcript = join(root, "outer.jsonl");
+  writeFileSync(
+    transcript,
+    JSON.stringify({ type: "turn.completed", usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5 } }) + "\n"
+  );
+  const manifest = join(root, "manifest.json");
+  writeFileSync(manifest, JSON.stringify([
+    { path: transcript, label: "outer", role: "manager", optimization_run_id: 5 },
+  ]));
+  const outFile = join(root, "usage.json");
+
+  const result = spawnSync(
+    process.execPath,
+    [script, "--external-manifest", manifest, "--out", outFile, root],
+    { encoding: "utf8" }
+  );
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.invocations.length, 1);
+  assert.deepEqual(doc.collection.external_sources, []);
+  assert.deepEqual(doc.collection.errors, [
+    { path: manifest, reason: "manifest entry outer has an invalid optimization_run_id" },
+  ]);
 });
 
 test("CLI reports conflicting outcomes as conflicts and treats the run as unknown", (t) => {
