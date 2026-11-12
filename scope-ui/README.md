@@ -109,7 +109,12 @@ The collector also reads each scanned run's `selection-attempts` records into
 `collection.attempt_outcomes` (and `attempt_outcome_conflicts` for disagreeing
 duplicates). When there are any, `--summary` adds a `By Worker model per
 attempt:` section with each Worker model's parent review results and the
-attempts it needed to accept.
+attempts it needed to accept. `--summary` then adds a `Worker tokens to
+acceptance` section that joins each attempt to its recorded Worker invocation
+and reports, per Worker model, joined attempts, their tokens and the mean
+Worker tokens per accepted assignment over assignments whose attempts up to
+the first acceptance are all joined. Review and Manager tokens are not
+included there.
 
 All recorded roles are in scope, including control/review roles, retries and
 failed attempts, each invocation counted once. The charts describe the supplied

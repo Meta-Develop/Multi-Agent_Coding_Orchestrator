@@ -1151,7 +1151,11 @@ test("summarize adds a By Worker model per attempt section", () => {
   assert.deepEqual(lines.slice(0, index - 1), without.split("\n").slice(0, -1));
   assert.equal(lines[index + 1], "model-a                  attempts    2 accepted    1 rejected    1 unknown    0 assignments    1 first-attempt accepted    0 attempts to accept 2.00");
   assert.equal(lines[index + 2], "model-b                  attempts    2 accepted    1 rejected    0 unknown    1 assignments    2 first-attempt accepted    1 attempts to accept 1.00");
-  assert.equal(lines.length, index + 4);
+  assert.equal(lines[index + 3], "");
+  assert.equal(lines[index + 4], "Worker tokens to acceptance (attempts joined to Worker invocations):");
+  assert.equal(lines[index + 5], "model-a                  joined       0/2 tokens            0 accepted assignments    1 complete    0 tokens per accepted assignment -");
+  assert.equal(lines[index + 6], "model-b                  joined       0/2 tokens            0 accepted assignments    1 complete    0 tokens per accepted assignment -");
+  assert.equal(lines.length, index + 8);
   assert.ok(!withAttempts.includes("model-c"));
   assert.equal(summarize(invocations, runOutcomes), without);
 });
@@ -1197,5 +1201,105 @@ test("CLI collects attempt outcomes and summarizes them per Worker model", (t) =
   assert.deepEqual(doc.collection.attempt_outcome_conflicts, []);
   assert.match(result.stderr, /By Worker model per attempt:/);
   assert.match(result.stderr, /^model-a\s+attempts\s+2 accepted\s+1 rejected\s+1 unknown\s+0 assignments\s+1 first-attempt accepted\s+0 attempts to accept 2\.00$/m);
+  assert.deepEqual(doc.collection.errors, []);
+});
+
+test("summarize joins Worker attempts to their Worker invocations for tokens to acceptance", () => {
+  const invocations = [
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-a:1:worker", role: "worker", requested_model: "model-a", input_tokens: 100, output_tokens: 10 }),
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-a:2:worker", role: "worker", requested_model: "model-a", input_tokens: 200, output_tokens: 20 }),
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-b:1:worker", role: "worker", requested_model: "model-b", input_tokens: 50, output_tokens: 5 }),
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-c:1:worker", role: "worker", requested_model: "model-b", input_tokens: 70, output_tokens: null }),
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-d:1:auditor", role: "auditor", requested_model: "model-c", input_tokens: 900, output_tokens: 90 }),
+  ];
+  const runOutcomes = [
+    { run_id: "run-1", success: true, accepted: true, publishable: true, status: "succeeded", path: "p" },
+  ];
+  const attemptOutcomes = [
+    { run_id: "run-1", assignment_id: "task-a", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-a", requested_effort: "high", parent_result: "rejected", parent_cause: "defects", path: "p1" },
+    { run_id: "run-1", assignment_id: "task-a", attempt: 2, role: "worker", requested_runtime: "vibe", requested_model: "model-a", requested_effort: "high", parent_result: "accepted", parent_cause: null, path: "p2" },
+    { run_id: "run-1", assignment_id: "task-b", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-b", requested_effort: null, parent_result: "accepted", parent_cause: null, path: "p3" },
+    { run_id: "run-1", assignment_id: "task-c", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-b", requested_effort: null, parent_result: "accepted", parent_cause: null, path: "p4" },
+    { run_id: "run-1", assignment_id: "task-d", attempt: 1, role: "auditor", requested_runtime: "vibe", requested_model: "model-c", requested_effort: null, parent_result: "accepted", parent_cause: null, path: "p5" },
+  ];
+  const withAttempts = summarize(invocations, runOutcomes, attemptOutcomes);
+  const without = summarize(invocations, runOutcomes);
+  const perAttemptHeading = "By Worker model per attempt:";
+  const heading = "Worker tokens to acceptance (attempts joined to Worker invocations):";
+  const lines = withAttempts.split("\n");
+  const perAttemptIndex = lines.indexOf(perAttemptHeading);
+  const index = lines.indexOf(heading);
+  assert.notEqual(perAttemptIndex, -1);
+  assert.notEqual(index, -1);
+  assert.equal(index, perAttemptIndex + 4);
+  assert.equal(lines[index - 1], "");
+  assert.deepEqual(lines.slice(0, perAttemptIndex - 1), without.split("\n").slice(0, -1));
+  assert.equal(lines[perAttemptIndex + 1], "model-a                  attempts    2 accepted    1 rejected    1 unknown    0 assignments    1 first-attempt accepted    0 attempts to accept 2.00");
+  assert.equal(lines[perAttemptIndex + 2], "model-b                  attempts    2 accepted    2 rejected    0 unknown    0 assignments    2 first-attempt accepted    2 attempts to accept 1.00");
+  assert.equal(lines[index + 1], "model-a                  joined       2/2 tokens          330 accepted assignments    1 complete    1 tokens per accepted assignment 330");
+  assert.equal(lines[index + 2], "model-b                  joined       1/2 tokens           55 accepted assignments    2 complete    1 tokens per accepted assignment 55");
+  assert.equal(lines.length, index + 4);
+  assert.ok(!lines.slice(index + 1).some((line) => line.startsWith("model-c")));
+  assert.equal(summarize(invocations, runOutcomes), without);
+});
+
+test("summarize counts an assignment complete only within its Worker model group", () => {
+  const invocations = [
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-a:1:worker", role: "worker", requested_model: "model-a", input_tokens: 100, output_tokens: 10 }),
+    invocation({ optimization_run_id: "run-1", invocation_id: "run-1:task-a:2:worker", role: "worker", requested_model: "model-b", input_tokens: 200, output_tokens: 20 }),
+  ];
+  const runOutcomes = [
+    { run_id: "run-1", success: true, accepted: true, publishable: true, status: "succeeded", path: "p" },
+  ];
+  const attemptOutcomes = [
+    { run_id: "run-1", assignment_id: "task-a", attempt: 1, role: "worker", requested_runtime: "vibe", requested_model: "model-a", requested_effort: "high", parent_result: "rejected", parent_cause: "defects", path: "p1" },
+    { run_id: "run-1", assignment_id: "task-a", attempt: 2, role: "worker", requested_runtime: "vibe", requested_model: "model-b", requested_effort: "high", parent_result: "accepted", parent_cause: null, path: "p2" },
+  ];
+  const lines = summarize(invocations, runOutcomes, attemptOutcomes).split("\n");
+  const index = lines.indexOf("Worker tokens to acceptance (attempts joined to Worker invocations):");
+  assert.notEqual(index, -1);
+  assert.equal(lines[index + 1], "model-a                  joined       1/1 tokens          110 accepted assignments    0 complete    0 tokens per accepted assignment -");
+  assert.equal(lines[index + 2], "model-b                  joined       1/1 tokens          220 accepted assignments    1 complete    0 tokens per accepted assignment -");
+  assert.equal(lines.length, index + 4);
+});
+
+test("CLI joins recorded Worker invocations to attempts for tokens to acceptance", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-a", { run_id: "run-a", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-a", invocation_id: "run-a:task-1:1:worker", role: "worker", requested_model: "model-a", input_tokens: 100, output_tokens: 10 }),
+    invocation({ optimization_run_id: "run-a", invocation_id: "run-a:task-1:2:worker", role: "worker", requested_model: "model-a", input_tokens: 200, output_tokens: 20 }),
+  ]);
+  const dir = join(root, "run-a", "selection-attempts");
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, "task-1.attempt-1.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 1,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: "high",
+    parent_result: "rejected",
+    parent_cause: "defects",
+  }));
+  writeFileSync(join(dir, "task-1.attempt-2.json"), JSON.stringify({
+    run_id: "run-a",
+    assignment_id: "task-1",
+    attempt: 2,
+    selection: { role: "worker" },
+    requested_runtime: "vibe",
+    requested_model: "model-a",
+    requested_effort: "high",
+    parent_result: "accepted",
+    parent_cause: null,
+  }));
+  const outFile = join(root, "usage.json");
+  const result = spawnSync(process.execPath, [script, "--out", outFile, "--summary", root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /Worker tokens to acceptance \(attempts joined to Worker invocations\):/);
+  assert.match(result.stderr, /^model-a\s+joined\s+2\/2 tokens\s+330 accepted assignments\s+1 complete\s+1 tokens per accepted assignment 330$/m);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
   assert.deepEqual(doc.collection.errors, []);
 });

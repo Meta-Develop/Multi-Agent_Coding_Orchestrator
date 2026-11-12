@@ -700,6 +700,109 @@ function workerAttemptRows(attemptOutcomes) {
   });
 }
 
+function workerAttemptInvocationIndex(invocations) {
+  const index = new Map();
+  for (const invocation of invocations) {
+    if (!bothCountersKnown(invocation)) continue;
+    if (!index.has(invocation.optimization_run_id)) index.set(invocation.optimization_run_id, new Map());
+    const byInvocationId = index.get(invocation.optimization_run_id);
+    if (!byInvocationId.has(invocation.invocation_id)) {
+      byInvocationId.set(invocation.invocation_id, invocation);
+    }
+  }
+  return index;
+}
+
+function workerAttemptInvocationId(attempt) {
+  return (
+    attempt.run_id + ":" + attempt.assignment_id + ":" + String(attempt.attempt) + ":" + attempt.role
+  );
+}
+
+function workerAttemptTokenRows(attemptOutcomes, invocations) {
+  const attempts = attemptOutcomes.filter((attempt) => roleCategory(attempt.role) === "Worker");
+  const index = workerAttemptInvocationIndex(invocations);
+  const modelName = (attempt) => {
+    const model = attempt.requested_model;
+    return typeof model === "string" && model !== "" ? model : "(missing)";
+  };
+  const groups = new Map();
+  for (const attempt of attempts) {
+    const name = modelName(attempt);
+    if (!groups.has(name)) groups.set(name, []);
+    groups.get(name).push(attempt);
+  }
+  const names = [...groups.keys()].sort();
+  if (names.length === 0) return ["(none)"];
+  const stats = new Map();
+  for (const name of names) {
+    stats.set(name, { attempts: 0, joined: 0, tokens: 0, acceptedPairs: 0, completePairs: 0, completeTokens: 0 });
+  }
+  const pairsByModel = new Map();
+  for (const attempt of attempts) {
+    const name = modelName(attempt);
+    const entry = stats.get(name);
+    entry.attempts += 1;
+    const byInvocationId = index.get(attempt.run_id);
+    const invocation =
+      byInvocationId === undefined ? undefined : byInvocationId.get(workerAttemptInvocationId(attempt));
+    const attemptTokens =
+      invocation === undefined ? null : invocation.input_tokens + invocation.output_tokens;
+    if (attemptTokens !== null) {
+      entry.joined += 1;
+      entry.tokens += attemptTokens;
+    }
+    if (!pairsByModel.has(name)) pairsByModel.set(name, new Map());
+    const pairs = pairsByModel.get(name);
+    if (!pairs.has(attempt.run_id)) pairs.set(attempt.run_id, new Map());
+    const byAssignment = pairs.get(attempt.run_id);
+    if (!byAssignment.has(attempt.assignment_id)) byAssignment.set(attempt.assignment_id, new Map());
+    byAssignment.get(attempt.assignment_id).set(attempt.attempt, {
+      parent_result: attempt.parent_result,
+      tokens: attemptTokens,
+    });
+  }
+  for (const [name, pairs] of pairsByModel) {
+    const entry = stats.get(name);
+    for (const byAssignment of pairs.values()) {
+      for (const byAttempt of byAssignment.values()) {
+        const acceptedAttempts = [...byAttempt.entries()]
+          .filter((candidate) => candidate[1].parent_result === "accepted")
+          .map((candidate) => candidate[0]);
+        if (acceptedAttempts.length === 0) continue;
+        const lowest = Math.min(...acceptedAttempts);
+        entry.acceptedPairs += 1;
+        let complete = true;
+        let pairTokens = 0;
+        for (let n = 1; n <= lowest; n += 1) {
+          const attemptEntry = byAttempt.get(n);
+          if (attemptEntry === undefined || attemptEntry.tokens === null) {
+            complete = false;
+            break;
+          }
+          pairTokens += attemptEntry.tokens;
+        }
+        if (complete) {
+          entry.completePairs += 1;
+          entry.completeTokens += pairTokens;
+        }
+      }
+    }
+  }
+  return names.map((name) => {
+    const entry = stats.get(name);
+    const meanText =
+      entry.completePairs > 0 ? String(Math.round(entry.completeTokens / entry.completePairs)) : "-";
+    return (
+      name.padEnd(24) +
+      " joined " + (String(entry.joined) + "/" + String(entry.attempts)).padStart(9) +
+      " tokens " + String(entry.tokens).padStart(12) +
+      " accepted assignments " + String(entry.acceptedPairs).padStart(4) +
+      " complete " + String(entry.completePairs).padStart(4) +
+      " tokens per accepted assignment " + meanText
+    );
+  });
+}
 export function summarize(invocations, runOutcomes = [], attemptOutcomes = []) {
   const total = invocations.length;
   let knownSubtotal = 0;
@@ -756,6 +859,9 @@ export function summarize(invocations, runOutcomes = [], attemptOutcomes = []) {
     lines.push("");
     lines.push("By Worker model per attempt:");
     lines.push(...workerAttemptRows(attemptOutcomes));
+    lines.push("");
+    lines.push("Worker tokens to acceptance (attempts joined to Worker invocations):");
+    lines.push(...workerAttemptTokenRows(attemptOutcomes, invocations));
   }
   return lines.join("\n") + "\n";
 }
