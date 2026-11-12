@@ -7014,23 +7014,42 @@ fn initialize_supervisor_selection_with_catalog_discovery(
                 // than carrying an earlier advertisement as live access proof.
                 plan_metadata.normal_intake_selection = Some(revalidated);
             }
-            let resolution = super::selection_bridge::initialize_supervisor_selection_with_shapes(
-                plan,
-                runtime,
-                catalog,
-                admission_policy_input,
-                &advertised,
-                plan_metadata.resolved_objective_profile.as_ref(),
-                quota,
-                frozen_history.as_ref(),
-                &account_observations,
-                if plan_metadata.evidence_only_reaudit.is_some() {
-                    None
-                } else {
-                    plan_metadata.task_routing_assessment.as_ref()
-                },
-                assignment_shapes,
-            )?;
+            // The rewritten re-audit task never matches the source
+            // declaration, so an evidence-only re-audit uses its copied
+            // source assessment only after authenticating it against the
+            // finalized source run.
+            let resolution = match plan_metadata.evidence_only_reaudit.as_ref() {
+                Some(operation) => {
+                    super::selection_bridge::initialize_supervisor_selection_with_authenticated_reaudit(
+                        plan,
+                        runtime,
+                        catalog,
+                        admission_policy_input,
+                        &advertised,
+                        plan_metadata.resolved_objective_profile.as_ref(),
+                        quota,
+                        frozen_history.as_ref(),
+                        &account_observations,
+                        repo,
+                        operation,
+                        plan_metadata.task_routing_assessment.as_ref(),
+                        assignment_shapes,
+                    )?
+                }
+                None => super::selection_bridge::initialize_supervisor_selection_with_shapes(
+                    plan,
+                    runtime,
+                    catalog,
+                    admission_policy_input,
+                    &advertised,
+                    plan_metadata.resolved_objective_profile.as_ref(),
+                    quota,
+                    frozen_history.as_ref(),
+                    &account_observations,
+                    plan_metadata.task_routing_assessment.as_ref(),
+                    assignment_shapes,
+                )?,
+            };
             #[cfg(all(test, target_os = "linux"))]
             let resolution = {
                 let mut resolution = resolution;
