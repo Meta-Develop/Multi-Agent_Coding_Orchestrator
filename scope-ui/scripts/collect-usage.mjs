@@ -315,6 +315,10 @@ function safeCounter(value) {
 
 export function parseExternalTranscript(manifestEntry, text) {
   const invocations = [];
+  const optimizationRunId =
+    typeof manifestEntry.optimization_run_id === "string" && manifestEntry.optimization_run_id !== ""
+      ? manifestEntry.optimization_run_id
+      : "external:" + manifestEntry.label;
   let turns = 0;
   let malformedLines = 0;
   for (const raw of text.split("\n")) {
@@ -338,7 +342,7 @@ export function parseExternalTranscript(manifestEntry, text) {
     }
     turns += 1;
     invocations.push({
-      optimization_run_id: "external:" + manifestEntry.label,
+      optimization_run_id: optimizationRunId,
       invocation_id: manifestEntry.label + ":turn-" + turns,
       started_at: null,
       role: manifestEntry.role,
@@ -831,6 +835,17 @@ export async function main(argv) {
           typeof entry.label !== "string"
         ) {
           errors.push({ path: externalManifest, reason: "manifest entry missing path or label" });
+          continue;
+        }
+        if (
+          entry.optimization_run_id !== undefined &&
+          entry.optimization_run_id !== null &&
+          (typeof entry.optimization_run_id !== "string" || entry.optimization_run_id === "")
+        ) {
+          errors.push({
+            path: externalManifest,
+            reason: "manifest entry " + entry.label + " has an invalid optimization_run_id",
+          });
           continue;
         }
         let text;

@@ -82,6 +82,12 @@ run outcomes that `--summary` describes, with token shares by role category,
 requested model, run outcome and role category by requested model; it can be
 combined with `--out` and `--summary`.
 
+A manifest entry may set `optimization_run_id` to attribute an outer CLI
+session to the MACO run it supervised, so its tokens join that run in the
+outcome grouping, the `By Worker model per run:` summary and the SVG export.
+Without that field its invocations use `external:` + label and stay outside
+run totals.
+
 The collector also reads each scanned run's native final result from
 `<run>/reports/supervisor-final.json` and emits `collection.run_outcomes`
 and `run_outcome_conflicts`, joining invocations to outcomes by
