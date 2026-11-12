@@ -75,13 +75,14 @@ export function liveHref(row) {
 
 export const EVIDENCE_SCHEMA_VERSION = 1;
 export const UNKNOWN_MODEL = "Unknown";
-export const MODEL_GROUPINGS = ["resolved", "requested", "role", "role_requested"];
+export const MODEL_GROUPINGS = ["resolved", "requested", "role", "role_requested", "outcome"];
 
 const MODEL_GROUPING_LABELS = {
   resolved: "Resolved / observed model",
   requested: "Requested model",
   role: "Role category",
   role_requested: "Role category x requested model",
+  outcome: "Run outcome (MACO native result)",
 };
 
 export function modelGroupingLabel(grouping) {
@@ -297,6 +298,35 @@ export function mergeEvidenceArtifacts(artifacts) {
   };
 }
 
+// Index run outcomes recorded by the usage collector in
+// collection.run_outcomes. Only plain-object entries with a non-empty string
+// run_id and a boolean accepted are used; a run_id whose entries disagree on
+// accepted is omitted entirely.
+export function runOutcomeIndex(collections) {
+  const index = new Map();
+  const conflicted = new Set();
+  for (const collection of Array.isArray(collections) ? collections : []) {
+    const entries = isPlainObject(collection) && Array.isArray(collection.run_outcomes)
+      ? collection.run_outcomes
+      : [];
+    for (const entry of entries) {
+      if (!isPlainObject(entry)) continue;
+      const runId = textOrNull(entry.run_id);
+      if (!runId || typeof entry.accepted !== "boolean") continue;
+      if (conflicted.has(runId)) continue;
+      const label = entry.accepted ? "Accepted run" : "Not accepted run";
+      const existing = index.get(runId);
+      if (existing === undefined) {
+        index.set(runId, label);
+      } else if (existing !== label) {
+        index.delete(runId);
+        conflicted.add(runId);
+      }
+    }
+  }
+  return index;
+}
+
 function groupLabel(record, grouping) {
   const field = grouping === "requested" ? "requested_model" : "resolved_model";
   return textOrNull(record[field]) || UNKNOWN_MODEL;
@@ -320,15 +350,20 @@ function percentOf(part, whole) {
 // Aggregate records into chart rows for one model grouping. Token totals are
 // accumulated exactly; a group with no measured usage keeps null token values
 // instead of a fabricated zero.
-export function evidenceGroups(records, grouping) {
+export function evidenceGroups(records, grouping, outcomes) {
   const mode = MODEL_GROUPINGS.includes(grouping) ? grouping : "resolved";
+  const outcomeIndex = outcomes instanceof Map ? outcomes : null;
   const list = Array.isArray(records) ? records : [];
   const buckets = new Map();
   let measuredRecords = 0;
   const masses = [];
   for (const record of list) {
     const category = mode === "role" || mode === "role_requested" ? roleCategory(record.role) : null;
-    const label = groupLabel(record, mode === "role_requested" ? "requested" : mode);
+    const label =
+      mode === "outcome"
+        ? (outcomeIndex ? outcomeIndex.get(textOrNull(record.optimization_run_id)) : undefined) ||
+          "Unknown outcome"
+        : groupLabel(record, mode === "role_requested" ? "requested" : mode);
     const key = category ? JSON.stringify([category, mode === "role_requested" ? label : null]) : label;
     let bucket = buckets.get(key);
     if (!bucket) {

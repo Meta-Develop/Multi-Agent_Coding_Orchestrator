@@ -10,6 +10,7 @@ import {
   measuredTokenMass,
   parseEvidenceArtifact,
   mergeEvidenceArtifacts,
+  runOutcomeIndex,
   evidenceGroups,
   evidenceSummary,
   exactTotal,
@@ -809,4 +810,126 @@ test("collected artifacts show one collection notice and accept exec JSONL recor
   for (const absent of ["artifacts_parsed", "identical_duplicates", "invalid_artifacts", "conflicts:"]) {
     assert.equal(sparse.includes(absent), false);
   }
+});
+
+test("runOutcomeIndex maps outcomes and omits disagreeing or malformed entries", () => {
+  const collections = [
+    {
+      run_outcomes: [
+        { run_id: "run-a", success: true, accepted: true, publishable: true, status: "succeeded", path: "a" },
+        { run_id: "run-b", accepted: false },
+        { run_id: "", accepted: true },
+        { run_id: "run-c", accepted: "yes" },
+        { run_id: "run-d" },
+        { accepted: true },
+        "not-an-object",
+        null,
+      ],
+    },
+    { run_outcomes: [{ run_id: "run-a", accepted: true }, { run_id: "run-e", accepted: false }] },
+    { run_outcomes: [{ run_id: "run-b", accepted: true }, { run_id: "run-b", accepted: true }] },
+    {},
+    { run_outcomes: "not-an-array" },
+  ];
+  const index = runOutcomeIndex(collections);
+  assert.equal(index.get("run-a"), "Accepted run");
+  assert.equal(index.get("run-e"), "Not accepted run");
+  assert.equal(index.has("run-b"), false);
+  assert.equal(index.has("run-c"), false);
+  assert.equal(index.has("run-d"), false);
+  assert.equal(index.size, 2);
+  assert.equal(runOutcomeIndex([]).size, 0);
+  assert.equal(runOutcomeIndex(null).size, 0);
+});
+
+test("evidenceGroups outcome mode labels runs and keeps token handling unchanged", () => {
+  const outcomes = new Map([
+    ["run-a", "Accepted run"],
+    ["run-b", "Not accepted run"],
+  ]);
+  const records = [
+    invocation({ invocation_id: "i1", optimization_run_id: "run-a", input_tokens: 60, output_tokens: 40 }),
+    invocation({ invocation_id: "i2", optimization_run_id: "run-b", input_tokens: 30, output_tokens: 10 }),
+    invocation({ invocation_id: "i3", optimization_run_id: "run-b", input_tokens: 10, output_tokens: 0 }),
+    invocation({ invocation_id: "i4", optimization_run_id: "run-z", input_tokens: null, output_tokens: null }),
+  ];
+  const groups = evidenceGroups(records, "outcome", outcomes);
+  assert.equal(groups.grouping, "outcome");
+  assert.equal(groups.groupingLabel, "Run outcome (MACO native result)");
+  assert.deepEqual(
+    groups.rows.map((row) => row.label).sort(),
+    ["Accepted run", "Not accepted run", "Unknown outcome"],
+  );
+  assert.equal(groups.totalInvocations, 4);
+  assert.equal(groups.measuredInvocations, 3);
+  assert.equal(groups.measuredTokens, 150);
+  const accepted = groups.rows.find((row) => row.label === "Accepted run");
+  assert.equal(accepted.invocations, 1);
+  assert.equal(accepted.invocationShare, 25);
+  assert.equal(accepted.tokens, 100);
+  assert.equal(accepted.tokenShare, (100 / 150) * 100);
+  const notAccepted = groups.rows.find((row) => row.label === "Not accepted run");
+  assert.equal(notAccepted.invocations, 2);
+  assert.equal(notAccepted.measuredInvocations, 2);
+  assert.equal(notAccepted.tokens, 50);
+  assert.equal(notAccepted.tokenShare, (50 / 150) * 100);
+  const unknown = groups.rows.find((row) => row.label === "Unknown outcome");
+  assert.equal(unknown.invocations, 1);
+  assert.equal(unknown.measuredInvocations, 0);
+  assert.equal(unknown.tokens, null);
+  assert.equal(unknown.tokenShare, null);
+  assert.equal(formatPercent(unknown.tokenShare), "—");
+
+  // A non-Map third argument is treated as empty: everything is unknown.
+  const noIndex = evidenceGroups(records, "outcome", "not a map");
+  assert.deepEqual(noIndex.rows.map((row) => row.label), ["Unknown outcome"]);
+  assert.equal(noIndex.rows[0].invocations, 4);
+  const omitted = evidenceGroups(records, "outcome");
+  assert.deepEqual(omitted.rows.map((row) => row.label), ["Unknown outcome"]);
+
+  // Other modes are unchanged by the third argument.
+  const resolved = evidenceGroups(records, "resolved", outcomes);
+  assert.deepEqual(resolved.rows.map((row) => row.label), ["model-x"]);
+});
+
+test("headless view switches the grouping to outcome with collected run_outcomes", async () => {
+  const document = resetDocument(VIEW_IDS);
+  const view = await loadView(document);
+  const text = JSON.stringify({
+    schema_version: 1,
+    collection: {
+      files_scanned: 4,
+      run_outcomes: [
+        { run_id: "run-a", success: true, accepted: true, publishable: true, status: "succeeded", path: "a" },
+        { run_id: "run-b", success: false, accepted: false, publishable: false, status: "failed", path: "b" },
+      ],
+    },
+    invocations: [
+      invocation({ invocation_id: "i1", optimization_run_id: "run-a", input_tokens: 60, output_tokens: 40 }),
+      invocation({ invocation_id: "i2", optimization_run_id: "run-b", input_tokens: 30, output_tokens: 10 }),
+      invocation({ invocation_id: "i3", optimization_run_id: "run-c", input_tokens: 10, output_tokens: 0 }),
+    ],
+  });
+  await view.importFiles([{ name: "outcomes.json", text: async () => text }]);
+  const control = document.nodes.get("evidenceGrouping");
+  control.value = "outcome";
+  control.dispatchEvent({ type: "change" });
+  assert.equal(view.evidenceState.grouping, "outcome");
+  assert.equal(
+    document.nodes.get("evidenceGroupHeading").textContent,
+    "Run outcome (MACO native result)",
+  );
+  assert.match(document.nodes.get("invocationChartTitle").textContent, /run outcome \(maco native result\)/);
+  const rows = document.nodes.get("invocationChart").children;
+  assert.equal(rows.length, 3);
+  for (const label of ["Accepted run", "Not accepted run", "Unknown outcome"]) {
+    assert.ok(rows.some((row) => row.children[0].textContent === label), label);
+  }
+  const tokenRows = document.nodes.get("tokenChart").children;
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("Accepted run"))), /100 · 66\.7%/);
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("Not accepted run"))), /40 · 26\.7%/);
+  assert.match(textOf(tokenRows.find((row) => textOf(row).includes("Unknown outcome"))), /10 · 6\.7%/);
+  const tableRows = document.nodes.get("evidenceBody").children;
+  assert.ok(tableRows.some((row) => textOf(row).includes("Accepted run")));
+  assert.ok(tableRows.some((row) => textOf(row).includes("Unknown outcome")));
 });

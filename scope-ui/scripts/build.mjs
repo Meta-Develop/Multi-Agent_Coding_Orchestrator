@@ -55,6 +55,7 @@ const MODULES = [
       "exactToNumber",
       "parseEvidenceArtifact",
       "mergeEvidenceArtifacts",
+      "runOutcomeIndex",
       "evidenceGroups",
       "evidenceSummary",
       "formatPercent",
