@@ -385,6 +385,50 @@ function bothCountersKnown(invocation) {
   );
 }
 
+function cachedCountersKnown(invocation) {
+  const input = safeCounter(invocation.input_tokens);
+  const cached = safeCounter(invocation.cached_input_tokens);
+  return input !== null && cached !== null && cached <= input;
+}
+
+function cachedGroupRows(invocations, keyOf) {
+  const groups = new Map();
+  for (const invocation of invocations) {
+    const key = keyOf(invocation);
+    if (!groups.has(key)) groups.set(key, { count: 0, known: 0, input: 0, cached: 0 });
+    const group = groups.get(key);
+    group.count += 1;
+    if (cachedCountersKnown(invocation)) {
+      group.known += 1;
+      group.input += invocation.input_tokens;
+      group.cached += invocation.cached_input_tokens;
+    }
+  }
+  const names = [...groups.keys()].sort();
+  if (names.length === 0) return ["(none)"];
+  return names.map((name) => {
+    const group = groups.get(name);
+    const measured = group.known > 0;
+    const inputText = measured ? String(group.input).padStart(10) : "-".padStart(10);
+    const cachedText = measured ? String(group.cached).padStart(10) : "-".padStart(10);
+    const shareText =
+      measured && group.input > 0 ? pct(group.cached, group.input).padStart(7) : "-".padStart(7);
+    return (
+      name.padEnd(24) +
+      " known " +
+      group.known +
+      "/" +
+      group.count +
+      "  input " +
+      inputText +
+      "  cached " +
+      cachedText +
+      " " +
+      shareText
+    );
+  });
+}
+
 function groupRows(invocations, keyOf, totalInvocations, knownSubtotal) {
   const groups = new Map();
   for (const invocation of invocations) {
@@ -518,6 +562,15 @@ export function summarize(invocations, runOutcomes = []) {
   lines.push("");
   lines.push("By Worker model per run:");
   lines.push(...workerModelRows(invocations, runOutcomes));
+  lines.push("");
+  lines.push("Cached input (where input and cached counters are known):");
+  lines.push("By role category:");
+  lines.push(...cachedGroupRows(invocations, (invocation) => roleCategory(invocation.role)));
+  lines.push("By requested model:");
+  lines.push(...cachedGroupRows(invocations, (invocation) => {
+    const model = invocation.requested_model;
+    return typeof model === "string" && model !== "" ? model : "(missing)";
+  }));
   return lines.join("\n") + "\n";
 }
 
@@ -540,14 +593,15 @@ const SVG_SECTION_GAP = 18;
 const SVG_TEXT_X = 20;
 const SVG_BAR_X = 240;
 const SVG_STATS_X = SVG_BAR_X + SVG_BAR_WIDTH + 12;
-const SVG_WIDTH = SVG_STATS_X + 420;
+const SVG_WIDTH = SVG_STATS_X + 760;
 
 function escapeXml(value) {
   return String(value)
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
-    .replace(/"/g, "&quot;");
+    .replace(/"/g, "&quot;")
+    .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F\uFFFE\uFFFF]|[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/g, "\uFFFD");
 }
 
 function svgText(x, y, text, extra = "") {
@@ -562,12 +616,17 @@ function svgGroupStats(invocations, keyOf) {
   const groups = new Map();
   for (const invocation of invocations) {
     const key = keyOf(invocation);
-    if (!groups.has(key)) groups.set(key, { count: 0, measured: 0, tokens: 0 });
+    if (!groups.has(key)) groups.set(key, { count: 0, measured: 0, tokens: 0, known: 0, input: 0, cached: 0 });
     const group = groups.get(key);
     group.count += 1;
     if (bothCountersKnown(invocation)) {
       group.measured += 1;
       group.tokens += invocation.input_tokens + invocation.output_tokens;
+    }
+    if (cachedCountersKnown(invocation)) {
+      group.known += 1;
+      group.input += invocation.input_tokens;
+      group.cached += invocation.cached_input_tokens;
     }
   }
   const rows = [...groups.entries()].map(([name, group]) => ({ name, ...group }));
@@ -578,9 +637,24 @@ function svgGroupStats(invocations, keyOf) {
   return rows;
 }
 
+function svgCachedText(row) {
+  if (row.known > 0 && row.input > 0) {
+    return " | cached " + pct(row.cached, row.input) + " of input (" + row.known + "/" + row.count + " known)";
+  }
+  return " | cached unknown";
+}
+
 function svgRowText(row, knownSubtotal) {
-  if (row.measured === 0) return "unavailable | " + row.count + " invocations";
-  return pct(row.tokens, knownSubtotal) + " | " + row.tokens + " tokens | " + row.count + " invocations";
+  if (row.measured === 0) return "unavailable | " + row.count + " invocations" + svgCachedText(row);
+  return (
+    pct(row.tokens, knownSubtotal) +
+    " | " +
+    row.tokens +
+    " tokens | " +
+    row.count +
+    " invocations" +
+    svgCachedText(row)
+  );
 }
 
 function svgBarWidth(tokens, knownSubtotal) {
@@ -733,7 +807,7 @@ export function renderSvg(invocations, runOutcomes = []) {
     svgText(
       SVG_TEXT_X,
       y,
-      "Requested model labels only; served model identity, effort and cost are not recorded. Unknown counters are excluded, not counted as zero.",
+      "Requested model labels only; served model identity, effort and cost are not recorded. Unknown counters are excluded, not counted as zero. The cached share covers only invocations whose cached counter is known.",
       ' font-size="12"'
     )
   );
