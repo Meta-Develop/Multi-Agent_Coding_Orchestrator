@@ -74,6 +74,15 @@ object adds one notice listing numeric `files_scanned`, `artifacts_parsed` and
 `node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--summary] ROOT...`
 writes one importable artifact. Clear also invalidates pending file reads.
 
+The collector also reads each scanned run's native final result from
+`<run>/reports/supervisor-final.json` and emits `collection.run_outcomes`
+and `run_outcome_conflicts`, joining invocations to outcomes by
+`optimization_run_id`. The `--summary` output adds a `By run outcome:`
+section and a `Known tokens per accepted run:` line that divides all known
+measured tokens — accepted, not accepted and unknown invocations together —
+by the number of accepted runs. Accepted here means MACO's own native final
+result, not any later human or root acceptance.
+
 All recorded roles are in scope, including control/review roles, retries and
 failed attempts, each invocation counted once. The charts describe the supplied
 artifacts only — not the whole account, unrecorded outer Managers, planned

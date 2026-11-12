@@ -1,5 +1,5 @@
 import { lstatSync, readdirSync, readFileSync, writeFileSync, realpathSync } from "node:fs";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const USAGE =
@@ -226,6 +226,89 @@ export function sortInvocations(invocations) {
   });
 }
 
+const OUTCOME_FIELDS = ["success", "accepted", "publishable", "status"];
+
+export function collectRunOutcomes(files, errors) {
+  const groups = new Map();
+  for (const file of files) {
+    const path = join(dirname(dirname(resolve(file))), "reports", "supervisor-final.json");
+    let stat;
+    try {
+      stat = lstatSync(path);
+    } catch (err) {
+      if (err && err.code === "ENOENT") continue;
+      errors.push({ path, reason: `unreadable file: ${err.message}` });
+      continue;
+    }
+    if (!stat.isFile()) continue;
+    let text;
+    try {
+      text = readFileSync(path, "utf8");
+    } catch (err) {
+      errors.push({ path, reason: `unreadable file: ${err.message}` });
+      continue;
+    }
+    let data;
+    try {
+      data = JSON.parse(text);
+    } catch (err) {
+      errors.push({ path, reason: `invalid JSON: ${err.message}` });
+      continue;
+    }
+    if (data === null || typeof data !== "object" || Array.isArray(data)) {
+      errors.push({ path, reason: "supervisor final is not a JSON object" });
+      continue;
+    }
+    if (typeof data.run_id !== "string" || data.run_id === "") {
+      errors.push({ path, reason: "supervisor final has no non-empty string run_id" });
+      continue;
+    }
+    const outcome = {
+      run_id: data.run_id,
+      success: typeof data.success === "boolean" ? data.success : null,
+      accepted: typeof data.accepted === "boolean" ? data.accepted : null,
+      publishable: typeof data.publishable === "boolean" ? data.publishable : null,
+      status: typeof data.status === "string" ? data.status : null,
+      path,
+    };
+    if (!groups.has(outcome.run_id)) groups.set(outcome.run_id, []);
+    groups.get(outcome.run_id).push(outcome);
+  }
+  const run_outcomes = [];
+  const run_outcome_conflicts = [];
+  for (const [runId, versions] of groups) {
+    const first = versions[0];
+    const differing = new Set();
+    for (let i = 1; i < versions.length; i++) {
+      for (const field of OUTCOME_FIELDS) {
+        if (!same(norm(first[field]), norm(versions[i][field]))) {
+          differing.add(field);
+        }
+      }
+    }
+    if (differing.size === 0) {
+      run_outcomes.push({
+        run_id: runId,
+        success: first.success,
+        accepted: first.accepted,
+        publishable: first.publishable,
+        status: first.status,
+        path: first.path,
+      });
+    } else {
+      run_outcome_conflicts.push({
+        run_id: runId,
+        fields: [...differing].sort(),
+        paths: versions.map((version) => version.path),
+      });
+    }
+  }
+  const byId = (a, b) => (a.run_id < b.run_id ? -1 : a.run_id > b.run_id ? 1 : 0);
+  run_outcomes.sort(byId);
+  run_outcome_conflicts.sort(byId);
+  return { run_outcomes, run_outcome_conflicts };
+}
+
 function safeCounter(value) {
   return Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
@@ -336,7 +419,7 @@ function groupRows(invocations, keyOf, totalInvocations, knownSubtotal) {
   });
 }
 
-export function summarize(invocations) {
+export function summarize(invocations, runOutcomes = []) {
   const total = invocations.length;
   let knownSubtotal = 0;
   let coverage = 0;
@@ -359,6 +442,23 @@ export function summarize(invocations) {
   lines.push("");
   lines.push("By role category:");
   lines.push(...groupRows(invocations, (invocation) => roleCategory(invocation.role), total, knownSubtotal));
+  const outcomeByRun = new Map(runOutcomes.map((outcome) => [outcome.run_id, outcome]));
+  lines.push("");
+  lines.push("By run outcome:");
+  lines.push(...groupRows(invocations, (invocation) => {
+    const outcome = outcomeByRun.get(invocation.optimization_run_id);
+    if (outcome === undefined) return "unknown";
+    if (outcome.accepted === true) return "accepted";
+    if (outcome.accepted === false) return "not accepted";
+    return "unknown";
+  }, total, knownSubtotal));
+  const acceptedRuns = runOutcomes.filter((outcome) => outcome.accepted === true).length;
+  const notAcceptedRuns = runOutcomes.filter((outcome) => outcome.accepted === false).length;
+  lines.push("Runs with outcome: " + acceptedRuns + " accepted, " + notAcceptedRuns + " not accepted");
+  lines.push(
+    "Known tokens per accepted run: " +
+      (acceptedRuns > 0 ? Math.round(knownSubtotal / acceptedRuns) : "-")
+  );
   return lines.join("\n") + "\n";
 }
 
@@ -429,6 +529,8 @@ export async function main(argv) {
     }
   }
 
+  const outcomes = collectRunOutcomes(files, errors);
+
   const externalSources = [];
   if (externalManifest !== null) {
     let manifestLoaded = false;
@@ -487,13 +589,15 @@ export async function main(argv) {
       invalid_artifacts: invalidArtifacts,
       identical_duplicates: merged.identicalDuplicates,
       conflicts: merged.conflicts,
+      run_outcomes: outcomes.run_outcomes,
+      run_outcome_conflicts: outcomes.run_outcome_conflicts,
       external_sources: externalSources,
       errors,
     },
   };
 
   if (summary) {
-    process.stderr.write(summarize(invocations));
+    process.stderr.write(summarize(invocations, outcomes.run_outcomes));
   }
   const json = JSON.stringify(doc, null, 2) + "\n";
   if (out !== null) {
