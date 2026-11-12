@@ -1037,9 +1037,84 @@ pub(super) fn initialize_supervisor_selection_with_shapes(
     assessment: Option<&TaskRoutingAssessment>,
     assignment_shapes: &AssignmentSelectionShapes,
 ) -> Result<SupervisorSelectionResolution> {
+    initialize_supervisor_selection_with_task_binding(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        history,
+        account_observations,
+        assessment,
+        AssessmentTaskBinding::CurrentPlanTask,
+        assignment_shapes,
+    )
+}
+
+/// Selection entry for an evidence-only re-audit. The copied source assessment
+/// is authenticated against the finalized source run before candidate
+/// evaluation; only that authenticated evidence-only case may supply the
+/// assessed routing dimensions for the rewritten re-audit task.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn initialize_supervisor_selection_with_authenticated_reaudit(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
+    account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+    repo: &Path,
+    operation: &EvidenceOnlyReauditPlan,
+    assessment: Option<&TaskRoutingAssessment>,
+    assignment_shapes: &AssignmentSelectionShapes,
+) -> Result<SupervisorSelectionResolution> {
+    let frozen_policy = crate::selection::routing_policy::current_routing_policy();
+    let assessment = authenticated_reaudit_assessment(
+        repo,
+        plan,
+        operation,
+        assessment,
+        frozen_policy.as_ref(),
+    )?;
+    initialize_supervisor_selection_with_task_binding(
+        plan,
+        runtime,
+        catalog,
+        admission,
+        advertised,
+        resolved_objective_profile,
+        quota,
+        history,
+        account_observations,
+        assessment,
+        AssessmentTaskBinding::AuthenticatedReauditSource,
+        assignment_shapes,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn initialize_supervisor_selection_with_task_binding(
+    plan: &mut SupervisorPlan,
+    runtime: SupervisorRuntime,
+    catalog: &RuntimeModelCatalog,
+    admission: &SupervisorAdmissionPolicyInput,
+    advertised: &AdvertisedCatalogSet,
+    resolved_objective_profile: Option<&ResolvedObjectiveProfile>,
+    quota: SupervisorQuotaSelectionInput<'_>,
+    history: Option<&FrozenOutcomeHistory>,
+    account_observations: &[(SupervisorRuntime, AccountObserveResult)],
+    assessment: Option<&TaskRoutingAssessment>,
+    task_binding: AssessmentTaskBinding,
+    assignment_shapes: &AssignmentSelectionShapes,
+) -> Result<SupervisorSelectionResolution> {
     let frozen_policy = crate::selection::routing_policy::current_routing_policy();
     let routing_features =
-        routing_features_with_assessment(plan, assessment, frozen_policy.as_ref())?;
+        routing_features_with_task_binding(plan, assessment, frozen_policy.as_ref(), task_binding)?;
     if runtime == SupervisorRuntime::Fake {
         return Ok(SupervisorSelectionResolution {
             mode: SupervisorSelectionMode::LegacyFake,
@@ -2394,10 +2469,43 @@ pub(super) fn routing_features_with_assessment(
     assessment: Option<&TaskRoutingAssessment>,
     frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
 ) -> Result<crate::selection::routing_policy::TaskRoutingFeatures> {
+    routing_features_with_task_binding(
+        plan,
+        assessment,
+        frozen,
+        AssessmentTaskBinding::CurrentPlanTask,
+    )
+}
+
+/// How an assessment's declared task must relate to the current plan before
+/// its assessed dimensions may be used for selection.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum AssessmentTaskBinding {
+    /// The declaration's declared_task must equal the current plan task.
+    CurrentPlanTask,
+    /// Authenticated evidence-only re-audit: the plan task is a rewritten
+    /// label of the audited source assignment, so only the frozen-policy
+    /// validation applies after the source-run authentication.
+    AuthenticatedReauditSource,
+}
+
+pub(super) fn routing_features_with_task_binding(
+    plan: &SupervisorPlan,
+    assessment: Option<&TaskRoutingAssessment>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+    task_binding: AssessmentTaskBinding,
+) -> Result<crate::selection::routing_policy::TaskRoutingFeatures> {
     let mut features = routing_features_from_plan(plan);
     if let Some(assessment) = assessment {
         let frozen = frozen.context("task assessment requires its frozen routing policy")?;
-        assessment.validate_for_task(frozen, &plan.task)?;
+        match task_binding {
+            AssessmentTaskBinding::CurrentPlanTask => {
+                assessment.validate_for_task(frozen, &plan.task)?;
+            }
+            AssessmentTaskBinding::AuthenticatedReauditSource => {
+                assessment.validate(frozen)?;
+            }
+        }
         features.complexity = assessment.features.complexity;
         features.risk = assessment.features.risk;
         features.horizon = assessment.features.horizon;
@@ -2408,6 +2516,39 @@ pub(super) fn routing_features_with_assessment(
         );
     }
     Ok(features)
+}
+
+/// Authenticate the copied source assessment of an evidence-only re-audit
+/// against its finalized source run before selection may use it. A source
+/// plan without an assessment stays unassessed: the selector keeps refusing
+/// unknown risk instead of inferring one. An assessment that fails the
+/// frozen policy or differs from the authenticated source run's assessment
+/// is refused before candidate evaluation.
+pub(super) fn authenticated_reaudit_assessment<'a>(
+    repo: &Path,
+    plan: &SupervisorPlan,
+    operation: &EvidenceOnlyReauditPlan,
+    assessment: Option<&'a TaskRoutingAssessment>,
+    frozen: Option<&crate::selection::routing_policy::FrozenRoutingPolicy>,
+) -> Result<Option<&'a TaskRoutingAssessment>> {
+    let assessment = match assessment {
+        Some(assessment) => assessment,
+        None => return Ok(None),
+    };
+    let frozen = frozen.context("task assessment requires its frozen routing policy")?;
+    assessment.validate(frozen)?;
+    let assignment = plan
+        .assignments
+        .iter()
+        .find(|assignment| assignment.id == operation.assignment_id)
+        .context("evidence-only re-audit plan lost its audited assignment")?;
+    super::plan_api::verify_evidence_only_reaudit_source(
+        repo,
+        operation,
+        assignment,
+        Some(assessment),
+    )?;
+    Ok(Some(assessment))
 }
 
 pub(super) fn task_profile_with_assessment(

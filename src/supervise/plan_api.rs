@@ -1920,6 +1920,229 @@ mod task_routing_lowering_tests {
         }
     }
 
+    fn authenticated_reaudit_source_fixture(
+        assessed: bool,
+    ) -> (
+        tempfile::TempDir,
+        LoadedSupervisorPlan,
+        LoadedSupervisorPlan,
+    ) {
+        use crate::artifacts::{ArtifactFileDisposition, ArtifactRunWriter, RunArtifactFamily};
+        let repo = tempfile::tempdir().unwrap();
+        git2::Repository::init(repo.path()).unwrap();
+        let loaded = if assessed {
+            loaded(repo.path(), proposal())
+        } else {
+            loaded_with_intake_decision(repo.path())
+        };
+        let assignment = &loaded.plan.assignments[0];
+        let run_id = RunId::new("reaudit-routing-source").unwrap();
+        let binding = CandidateValidationBinding {
+            version: 1,
+            agent_id: assignment.id.clone(),
+            primary_head: Some("1".repeat(40)),
+            agent_head: Some("2".repeat(40)),
+            merge_base: Some("1".repeat(40)),
+            diff_oid: "3".repeat(40),
+        };
+        let denial = GateDenial::new(
+            run_id.as_str(),
+            GateDenialReason::AuditorRepair {
+                rejection: AuditorRejectionKind::EvidenceQuality,
+            },
+            VerifiedGateContext::new(
+                &assignment.id,
+                GateCheckSource::Auditor,
+                std::iter::empty::<&Path>(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let report: SupervisorFinalReport = serde_json::from_value(json!({
+            "version":1, "run_id":run_id, "role":"supervisor", "repo":".",
+            "plan_file":"plan.json", "run_dir":".", "publishable":false,
+            "success":false, "accepted":false, "rejected":true, "status":"rejected",
+            "run_lifecycle":"finalized", "remaining_risk":"fixture", "next_safe_action":"re-audit",
+            "orchestrator_reports":[{"id":assignment.id, "role":assignment.role,
+                "accepted":false, "rejected":true, "status":"rejected", "gate_denials":[denial]}],
+            "assignment_traceability":[{"assignment_id":assignment.id, "depth":2,
+                "flattened_index":0, "produced_diff_binding":binding}]
+        }))
+        .unwrap();
+        let mut writer = ArtifactRunWriter::reserve(
+            repo.path(),
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "reaudit-routing-fixture",
+        )
+        .unwrap();
+        writer
+            .write_bytes(
+                "assignments/supervisor-plan.json",
+                &serde_json::to_vec(&intake_document(&loaded)).unwrap(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        writer
+            .write_bytes(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                &serde_json::to_vec(&report).unwrap(),
+                ArtifactFileDisposition::PrivateEvidence,
+            )
+            .unwrap();
+        writer
+            .finalize(
+                RunArtifactFamily::Supervise.final_report_relative_path(),
+                false,
+            )
+            .unwrap();
+        let reaudit =
+            evidence_only_reaudit_plan_from_source(repo.path(), &run_id, &assignment.id).unwrap();
+        (repo, loaded, reaudit)
+    }
+
+    #[test]
+    fn authenticated_reaudit_source_assessment_supplies_selection_routing_features() {
+        let (repo, loaded, reaudit) = authenticated_reaudit_source_fixture(true);
+        let operation = reaudit
+            .plan_metadata
+            .evidence_only_reaudit
+            .as_ref()
+            .unwrap();
+        let assessment = reaudit
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        let frozen = reaudit
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap();
+        assert_eq!(
+            assessment,
+            loaded
+                .plan_metadata
+                .task_routing_assessment
+                .as_ref()
+                .unwrap()
+        );
+        // The rewritten re-audit task never validates through the ordinary
+        // declared-task comparison.
+        assert!(assessment
+            .validate_for_task(frozen, &reaudit.plan.task)
+            .is_err());
+        // The production re-audit handling authenticates the copied source
+        // assessment against the finalized source run before it may supply
+        // the assessed routing dimensions.
+        let authenticated = super::super::selection_bridge::authenticated_reaudit_assessment(
+            repo.path(),
+            &reaudit.plan,
+            operation,
+            Some(assessment),
+            Some(frozen),
+        )
+        .unwrap()
+        .unwrap();
+        let features = super::super::selection_bridge::routing_features_with_task_binding(
+            &reaudit.plan,
+            Some(authenticated),
+            Some(frozen),
+            super::super::selection_bridge::AssessmentTaskBinding::AuthenticatedReauditSource,
+        )
+        .unwrap();
+        assert_eq!(features.complexity, assessment.features.complexity);
+        assert_eq!(features.risk, assessment.features.risk);
+        assert_eq!(features.horizon, assessment.features.horizon);
+        assert_eq!(features.context_tokens, assessment.features.context_tokens);
+        assert!(!features.evidence.is_empty());
+    }
+
+    #[test]
+    fn reaudit_selection_refuses_assessment_that_differs_from_source_run() {
+        let (repo, _loaded, reaudit) = authenticated_reaudit_source_fixture(true);
+        let operation = reaudit
+            .plan_metadata
+            .evidence_only_reaudit
+            .as_ref()
+            .unwrap();
+        let frozen = reaudit
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap();
+        // A valid assessment of another task is still refused before any
+        // candidate evaluation.
+        let foreign = super::super::task_routing::assess_task_routing(
+            "Foreign independently sealed declaration",
+            &proposal(),
+            frozen,
+        )
+        .unwrap();
+        foreign.validate(frozen).unwrap();
+        let error = super::super::selection_bridge::authenticated_reaudit_assessment(
+            repo.path(),
+            &reaudit.plan,
+            operation,
+            Some(&foreign),
+            Some(frozen),
+        )
+        .expect_err("a differing assessment must be refused");
+        assert!(error.to_string().contains("task assessment differs"));
+        // The ordinary declared-task comparison keeps refusing the rewritten
+        // re-audit task even for the authentic copied assessment.
+        let assessment = reaudit
+            .plan_metadata
+            .task_routing_assessment
+            .as_ref()
+            .unwrap();
+        assert!(
+            super::super::selection_bridge::routing_features_with_assessment(
+                &reaudit.plan,
+                Some(assessment),
+                Some(frozen),
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn reaudit_selection_keeps_unknown_risk_without_source_assessment() {
+        let (repo, _loaded, reaudit) = authenticated_reaudit_source_fixture(false);
+        let operation = reaudit
+            .plan_metadata
+            .evidence_only_reaudit
+            .as_ref()
+            .unwrap();
+        let frozen = reaudit
+            .plan_metadata
+            .resolved_routing_policy
+            .as_ref()
+            .unwrap();
+        assert!(reaudit.plan_metadata.task_routing_assessment.is_none());
+        // No assessment is inferred: the selector keeps refusing unknown risk.
+        let authenticated = super::super::selection_bridge::authenticated_reaudit_assessment(
+            repo.path(),
+            &reaudit.plan,
+            operation,
+            reaudit.plan_metadata.task_routing_assessment.as_ref(),
+            Some(frozen),
+        )
+        .unwrap();
+        assert!(authenticated.is_none());
+        let features = super::super::selection_bridge::routing_features_with_task_binding(
+            &reaudit.plan,
+            authenticated,
+            Some(frozen),
+            super::super::selection_bridge::AssessmentTaskBinding::AuthenticatedReauditSource,
+        )
+        .unwrap();
+        assert_eq!(features.risk, 0);
+        assert_eq!(features.complexity, 0);
+        assert_eq!(features.horizon, 0);
+        assert_eq!(features.context_tokens, 0);
+    }
+
     #[test]
     fn coordinated_route_authors_distinct_execution_parent_and_exact_nested_workers() {
         let repo = tempfile::tempdir().unwrap();
