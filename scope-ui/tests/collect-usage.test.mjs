@@ -10,6 +10,7 @@ import {
   mergeInvocations,
   parseArtifact,
   parseExternalTranscript,
+  renderSvg,
   roleCategory,
   scanRoot,
   sortInvocations,
@@ -791,4 +792,59 @@ test("CLI records an error when supervisor-final.json cannot be inspected", (t) 
   assert.equal(doc.collection.errors.length, 1);
   assert.equal(doc.collection.errors[0].path, join(root, "run-f/reports/supervisor-final.json"));
   assert.match(doc.collection.errors[0].reason, /unreadable file: /);
+});
+
+test("renderSvg draws the four sections with role category shares", () => {
+  const invocations = [
+    invocation({ invocation_id: "inv-m", role: "manager", requested_model: "model-a", input_tokens: 100, output_tokens: 100 }),
+    invocation({ invocation_id: "inv-w", role: "worker", requested_model: "model-b", input_tokens: 100, output_tokens: 100 }),
+    invocation({ invocation_id: "inv-a", role: "auditor", requested_model: "model-a", input_tokens: 50, output_tokens: 50 }),
+  ];
+  const svg = renderSvg(invocations, []);
+  assert.ok(svg.startsWith("<svg"));
+  assert.ok(svg.trimEnd().endsWith("</svg>"));
+  assert.match(svg, /<svg xmlns="http:\/\/www\.w3\.org\/2000\/svg"/);
+  assert.match(svg, /MACO token usage shares/);
+  assert.match(svg, /By role category/);
+  assert.match(svg, /By requested model/);
+  assert.match(svg, /By run outcome/);
+  assert.match(svg, /Role category x requested model/);
+  assert.match(svg, /40\.0% \| 200 tokens \| 1 invocations/);
+  assert.match(svg, /20\.0% \| 100 tokens \| 1 invocations/);
+  assert.match(svg, /Invocations: 3 \| Known measured input\+output tokens: 500 \| Coverage \(both counters known\): 3\/3/);
+  assert.equal(renderSvg(invocations, []), svg);
+});
+
+test("renderSvg escapes XML metacharacters in requested model names", () => {
+  const svg = renderSvg([invocation({ requested_model: "<&>" })], []);
+  assert.match(svg, /&lt;&amp;&gt;/);
+  assert.ok(!svg.includes("<&>"));
+});
+
+test("renderSvg shows unavailable for a group without counters", () => {
+  const svg = renderSvg(
+    [invocation({ role: "reviewer", input_tokens: null, output_tokens: null })],
+    []
+  );
+  assert.match(svg, /unavailable \| 1 invocations/);
+  assert.match(svg, /Known measured input\+output tokens: 0/);
+});
+
+test("CLI writes both --svg and --out files", (t) => {
+  const root = tempDir(t);
+  writeArtifact(root, "run/switch-cost/live-evidence.json", {
+    schema_version: 1,
+    invocations: [invocation()],
+  });
+  const svgFile = join(root, "usage.svg");
+  const outFile = join(root, "usage.json");
+  const result = spawnSync(process.execPath, [script, "--svg", svgFile, "--out", outFile, root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const svg = readFileSync(svgFile, "utf8");
+  assert.ok(svg.startsWith("<svg"));
+  assert.ok(svg.trimEnd().endsWith("</svg>"));
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.invocations.length, 1);
 });
