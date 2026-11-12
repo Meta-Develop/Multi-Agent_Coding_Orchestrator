@@ -3,7 +3,7 @@ import { basename, dirname, join, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
 const USAGE =
-  "usage: node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--summary] ROOT...";
+  "usage: node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--svg FILE] [--summary] ROOT...";
 
 const SKIP_DIRS = new Set([".git", "node_modules"]);
 
@@ -517,6 +517,226 @@ export function summarize(invocations, runOutcomes = []) {
   return lines.join("\n") + "\n";
 }
 
+const SVG_PALETTE = [
+  "#1f77b4",
+  "#ff7f0e",
+  "#2ca02c",
+  "#d62728",
+  "#9467bd",
+  "#8c564b",
+  "#e377c2",
+  "#7f7f7f",
+  "#bcbd22",
+  "#17becf",
+];
+
+const SVG_BAR_WIDTH = 600;
+const SVG_ROW_HEIGHT = 22;
+const SVG_SECTION_GAP = 18;
+const SVG_TEXT_X = 20;
+const SVG_BAR_X = 240;
+const SVG_STATS_X = SVG_BAR_X + SVG_BAR_WIDTH + 12;
+const SVG_WIDTH = SVG_STATS_X + 420;
+
+function escapeXml(value) {
+  return String(value)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;")
+    .replace(/"/g, "&quot;");
+}
+
+function svgText(x, y, text, extra = "") {
+  return (
+    '<text x="' + x + '" y="' + y + '" font-family="sans-serif"' + extra + ">" +
+    escapeXml(text) +
+    "</text>"
+  );
+}
+
+function svgGroupStats(invocations, keyOf) {
+  const groups = new Map();
+  for (const invocation of invocations) {
+    const key = keyOf(invocation);
+    if (!groups.has(key)) groups.set(key, { count: 0, measured: 0, tokens: 0 });
+    const group = groups.get(key);
+    group.count += 1;
+    if (bothCountersKnown(invocation)) {
+      group.measured += 1;
+      group.tokens += invocation.input_tokens + invocation.output_tokens;
+    }
+  }
+  const rows = [...groups.entries()].map(([name, group]) => ({ name, ...group }));
+  rows.sort((a, b) => {
+    if (b.tokens !== a.tokens) return b.tokens - a.tokens;
+    return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+  });
+  return rows;
+}
+
+function svgRowText(row, knownSubtotal) {
+  if (row.measured === 0) return "unavailable | " + row.count + " invocations";
+  return pct(row.tokens, knownSubtotal) + " | " + row.tokens + " tokens | " + row.count + " invocations";
+}
+
+function svgBarWidth(tokens, knownSubtotal) {
+  if (knownSubtotal <= 0 || tokens <= 0) return 0;
+  return (SVG_BAR_WIDTH * tokens) / knownSubtotal;
+}
+
+function svgModelKey(invocation) {
+  const model = invocation.requested_model;
+  return typeof model === "string" && model !== "" ? model : "(missing)";
+}
+
+export function renderSvg(invocations, runOutcomes = []) {
+  const total = invocations.length;
+  let knownSubtotal = 0;
+  let coverage = 0;
+  for (const invocation of invocations) {
+    if (bothCountersKnown(invocation)) {
+      knownSubtotal += invocation.input_tokens + invocation.output_tokens;
+      coverage += 1;
+    }
+  }
+
+  const outcomeByRun = new Map(runOutcomes.map((outcome) => [outcome.run_id, outcome]));
+  const roleRows = svgGroupStats(invocations, (invocation) => roleCategory(invocation.role));
+  const modelRows = svgGroupStats(invocations, svgModelKey);
+  const outcomeRows = svgGroupStats(invocations, (invocation) => {
+    const outcome = outcomeByRun.get(invocation.optimization_run_id);
+    if (outcome === undefined) return "unknown";
+    if (outcome.accepted === true) return "accepted";
+    if (outcome.accepted === false) return "not accepted";
+    return "unknown";
+  });
+
+  const modelColour = new Map();
+  modelRows.forEach((row, index) => {
+    modelColour.set(row.name, SVG_PALETTE[index % SVG_PALETTE.length]);
+  });
+
+  const pairTokens = new Map();
+  for (const invocation of invocations) {
+    if (!bothCountersKnown(invocation)) continue;
+    const key = roleCategory(invocation.role) + "\u0000" + svgModelKey(invocation);
+    pairTokens.set(key, (pairTokens.get(key) || 0) + invocation.input_tokens + invocation.output_tokens);
+  }
+
+  const parts = [];
+  let y = 0;
+  const sectionRows = (rows) => (rows.length === 0 ? 1 : rows.length);
+  const height =
+    28 +
+    20 +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT + sectionRows(roleRows) * SVG_ROW_HEIGHT +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT + sectionRows(modelRows) * SVG_ROW_HEIGHT +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT + sectionRows(outcomeRows) * SVG_ROW_HEIGHT +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT + sectionRows(roleRows) * SVG_ROW_HEIGHT +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT + sectionRows(modelRows) * SVG_ROW_HEIGHT +
+    SVG_SECTION_GAP + SVG_ROW_HEIGHT +
+    20;
+
+  parts.push(
+    '<svg xmlns="http://www.w3.org/2000/svg" width="' + SVG_WIDTH + '" height="' + height + '" viewBox="0 0 ' + SVG_WIDTH + " " + height + '">'
+  );
+  parts.push('<rect x="0" y="0" width="' + SVG_WIDTH + '" height="' + height + '" fill="#ffffff"/>');
+  y += 28;
+  parts.push(svgText(SVG_TEXT_X, y, "MACO token usage shares", ' font-size="18" font-weight="bold"'));
+  y += 20;
+  parts.push(
+    svgText(
+      SVG_TEXT_X,
+      y,
+      "Invocations: " +
+        total +
+        " | Known measured input+output tokens: " +
+        knownSubtotal +
+        " | Coverage (both counters known): " +
+        coverage +
+        "/" +
+        total,
+      ' font-size="12"'
+    )
+  );
+
+  const drawSection = (heading, rows, colourOf) => {
+    y += SVG_SECTION_GAP + SVG_ROW_HEIGHT;
+    parts.push(svgText(SVG_TEXT_X, y, heading, ' font-size="14" font-weight="bold"'));
+    if (rows.length === 0) {
+      y += SVG_ROW_HEIGHT;
+      parts.push(svgText(SVG_TEXT_X, y, "(none)", ' font-size="12"'));
+      return;
+    }
+    for (const row of rows) {
+      y += SVG_ROW_HEIGHT;
+      const width = svgBarWidth(row.tokens, knownSubtotal);
+      parts.push(svgText(SVG_TEXT_X, y, row.name, ' font-size="12"'));
+      parts.push(
+        '<rect x="' + SVG_BAR_X + '" y="' + (y - 11) + '" width="' + width.toFixed(2) + '" height="14" fill="' +
+          colourOf(row) +
+          '"/>'
+      );
+      parts.push(svgText(SVG_STATS_X, y, svgRowText(row, knownSubtotal), ' font-size="12"'));
+    }
+  };
+
+  drawSection("By role category", roleRows, () => SVG_PALETTE[0]);
+  drawSection("By requested model", modelRows, (row) => modelColour.get(row.name));
+  drawSection("By run outcome", outcomeRows, () => SVG_PALETTE[0]);
+
+  y += SVG_SECTION_GAP + SVG_ROW_HEIGHT;
+  parts.push(svgText(SVG_TEXT_X, y, "Role category x requested model", ' font-size="14" font-weight="bold"'));
+  if (roleRows.length === 0) {
+    y += SVG_ROW_HEIGHT;
+    parts.push(svgText(SVG_TEXT_X, y, "(none)", ' font-size="12"'));
+  }
+  for (const roleRow of roleRows) {
+    y += SVG_ROW_HEIGHT;
+    parts.push(svgText(SVG_TEXT_X, y, roleRow.name, ' font-size="12"'));
+    let x = SVG_BAR_X;
+    for (const modelRow of modelRows) {
+      const tokens = pairTokens.get(roleRow.name + "\u0000" + modelRow.name) || 0;
+      const width = svgBarWidth(tokens, knownSubtotal);
+      if (width <= 0) continue;
+      parts.push(
+        '<rect x="' + x.toFixed(2) + '" y="' + (y - 11) + '" width="' + width.toFixed(2) + '" height="14" fill="' +
+          modelColour.get(modelRow.name) +
+          '"/>'
+      );
+      x += width;
+    }
+  }
+
+  y += SVG_SECTION_GAP + SVG_ROW_HEIGHT;
+  parts.push(svgText(SVG_TEXT_X, y, "Legend: requested model", ' font-size="14" font-weight="bold"'));
+  if (modelRows.length === 0) {
+    y += SVG_ROW_HEIGHT;
+    parts.push(svgText(SVG_TEXT_X, y, "(none)", ' font-size="12"'));
+  }
+  for (const modelRow of modelRows) {
+    y += SVG_ROW_HEIGHT;
+    parts.push(
+      '<rect x="' + SVG_TEXT_X + '" y="' + (y - 11) + '" width="12" height="12" fill="' +
+        modelColour.get(modelRow.name) +
+        '"/>'
+    );
+    parts.push(svgText(SVG_TEXT_X + 20, y, modelRow.name, ' font-size="12"'));
+  }
+
+  y += SVG_SECTION_GAP + SVG_ROW_HEIGHT;
+  parts.push(
+    svgText(
+      SVG_TEXT_X,
+      y,
+      "Requested model labels only; served model identity, effort and cost are not recorded. Unknown counters are excluded, not counted as zero.",
+      ' font-size="12"'
+    )
+  );
+  parts.push("</svg>");
+  return parts.join("\n") + "\n";
+}
+
 function writeStdout(text) {
   return new Promise((resolve, reject) => {
     process.stdout.write(text, (err) => {
@@ -529,17 +749,19 @@ function writeStdout(text) {
 export async function main(argv) {
   let externalManifest = null;
   let out = null;
+  let svg = null;
   let summary = false;
   const roots = [];
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
-    if (arg === "--external-manifest" || arg === "--out") {
+    if (arg === "--external-manifest" || arg === "--out" || arg === "--svg") {
       const operand = argv[i + 1];
       if (operand === undefined || operand.startsWith("-")) {
         process.stderr.write(USAGE + "\n");
         return 2;
       }
       if (arg === "--external-manifest") externalManifest = operand;
+      else if (arg === "--svg") svg = operand;
       else out = operand;
       i += 1;
     } else if (arg === "--summary") {
@@ -653,6 +875,14 @@ export async function main(argv) {
 
   if (summary) {
     process.stderr.write(summarize(invocations, outcomes.run_outcomes));
+  }
+  if (svg !== null) {
+    try {
+      writeFileSync(svg, renderSvg(invocations, outcomes.run_outcomes));
+    } catch (err) {
+      process.stderr.write("error: cannot write " + svg + ": " + err.message + "\n");
+      return 1;
+    }
   }
   const json = JSON.stringify(doc, null, 2) + "\n";
   if (out !== null) {

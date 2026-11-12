@@ -75,8 +75,12 @@ with `record_source: "codex_exec_jsonl"`. An optional top-level `collection`
 object adds one notice listing numeric `files_scanned`, `artifacts_parsed` and
 `identical_duplicates`, plus the lengths of `invalid_artifacts`, `conflicts` and
 `external_sources` arrays; missing values are omitted. The collector command
-`node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--summary] ROOT...`
+`node scope-ui/scripts/collect-usage.mjs [--external-manifest FILE] [--out FILE] [--svg FILE] [--summary] ROOT...`
 writes one importable artifact. Clear also invalidates pending file reads.
+`--svg FILE` writes a standalone SVG chart of the same merged invocations and
+run outcomes that `--summary` describes, with token shares by role category,
+requested model, run outcome and role category by requested model; it can be
+combined with `--out` and `--summary`.
 
 The collector also reads each scanned run's native final result from
 `<run>/reports/supervisor-final.json` and emits `collection.run_outcomes`
