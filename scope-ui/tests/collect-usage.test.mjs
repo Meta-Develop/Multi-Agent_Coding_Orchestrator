@@ -574,3 +574,160 @@ test("CLI records an error for an empty ROOT argument", (t) => {
   assert.deepEqual(doc.collection.roots, [""]);
   assert.deepEqual(doc.collection.errors, [{ path: "", reason: "empty root" }]);
 });
+
+function writeRunTree(root, name, finalDoc, invocations) {
+  writeArtifact(root, name + "/switch-cost/live-evidence.json", {
+    schema_version: 1,
+    invocations,
+  });
+  if (finalDoc !== null) {
+    writeArtifact(root, name + "/reports/supervisor-final.json", finalDoc);
+  }
+}
+
+test("CLI links run outcomes, keeps invocations unchanged, and summarizes by outcome", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-a", { run_id: "run-a", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-a", invocation_id: "inv-a", input_tokens: 100, output_tokens: 50 }),
+  ]);
+  writeRunTree(root, "run-b", { run_id: "run-b", success: false, accepted: false, publishable: false, status: "rejected" }, [
+    invocation({ optimization_run_id: "run-b", invocation_id: "inv-b", input_tokens: 200, output_tokens: 100 }),
+  ]);
+  writeRunTree(root, "run-c", null, [
+    invocation({ optimization_run_id: "run-c", invocation_id: "inv-c", input_tokens: 10, output_tokens: 5 }),
+  ]);
+  const outFile = join(root, "usage.json");
+
+  const result = spawnSync(process.execPath, [script, "--out", outFile, "--summary", root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  assert.match(result.stderr, /By run outcome:/);
+  assert.match(result.stderr, /^accepted\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+150\s+32\.3%/m);
+  assert.match(result.stderr, /^not accepted\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+300\s+64\.5%/m);
+  assert.match(result.stderr, /^unknown\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+15\s+3\.2%/m);
+  assert.match(result.stderr, /Runs with outcome: 1 accepted, 1 not accepted/);
+  assert.match(result.stderr, /Known tokens per accepted run: 465/);
+
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.deepEqual(doc.collection.run_outcomes, [
+    {
+      run_id: "run-a",
+      success: true,
+      accepted: true,
+      publishable: true,
+      status: "succeeded",
+      path: join(root, "run-a/reports/supervisor-final.json"),
+    },
+    {
+      run_id: "run-b",
+      success: false,
+      accepted: false,
+      publishable: false,
+      status: "rejected",
+      path: join(root, "run-b/reports/supervisor-final.json"),
+    },
+  ]);
+  assert.deepEqual(doc.collection.run_outcome_conflicts, []);
+  assert.deepEqual(doc.collection.errors, []);
+  assert.equal(doc.invocations.length, 3);
+  assert.deepEqual(doc.invocations[0], invocation({ optimization_run_id: "run-a", invocation_id: "inv-a" }));
+  assert.deepEqual(doc.invocations[1], invocation({ optimization_run_id: "run-b", invocation_id: "inv-b", input_tokens: 200, output_tokens: 100 }));
+  assert.deepEqual(doc.invocations[2], invocation({ optimization_run_id: "run-c", invocation_id: "inv-c", input_tokens: 10, output_tokens: 5 }));
+});
+
+test("CLI reports conflicting outcomes as conflicts and treats the run as unknown", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-x1", { run_id: "run-x", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-x", invocation_id: "inv-x1", input_tokens: 100, output_tokens: 50 }),
+  ]);
+  writeRunTree(root, "run-x2", { run_id: "run-x", success: true, accepted: false, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-x", invocation_id: "inv-x2", input_tokens: 20, output_tokens: 10 }),
+  ]);
+  const outFile = join(root, "usage.json");
+
+  const result = spawnSync(process.execPath, [script, "--out", outFile, "--summary", root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.deepEqual(doc.collection.run_outcomes, []);
+  assert.deepEqual(doc.collection.run_outcome_conflicts, [
+    {
+      run_id: "run-x",
+      fields: ["accepted"],
+      paths: [
+        join(root, "run-x1/reports/supervisor-final.json"),
+        join(root, "run-x2/reports/supervisor-final.json"),
+      ],
+    },
+  ]);
+  assert.deepEqual(doc.collection.errors, []);
+  assert.equal(doc.invocations.length, 2);
+  assert.match(result.stderr, /^unknown\s+count\s+2\s+100\.0%\s+measured\s+2\/2\s+tokens\s+180\s+100\.0%/m);
+  assert.match(result.stderr, /Runs with outcome: 0 accepted, 0 not accepted/);
+  assert.match(result.stderr, /Known tokens per accepted run: -/);
+  assert.doesNotMatch(result.stderr, /^accepted\s/m);
+  assert.doesNotMatch(result.stderr, /^not accepted\s/m);
+});
+
+test("CLI records an error for an invalid supervisor-final.json without failing", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-d", { run_id: "run-d", accepted: true }, [
+    invocation({ optimization_run_id: "run-d", invocation_id: "inv-d" }),
+  ]);
+  writeFileSync(join(root, "run-d/reports/supervisor-final.json"), "not json");
+  const outFile = join(root, "usage.json");
+
+  const result = spawnSync(process.execPath, [script, "--out", outFile, root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.deepEqual(doc.collection.run_outcomes, []);
+  assert.equal(doc.invocations.length, 1);
+  assert.equal(doc.collection.errors.length, 1);
+  assert.equal(doc.collection.errors[0].path, join(root, "run-d/reports/supervisor-final.json"));
+  assert.match(doc.collection.errors[0].reason, /invalid JSON/);
+});
+
+test("CLI links run outcomes when ROOT is '.' from inside a switch-cost directory", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-e", { run_id: "run-e", success: true, accepted: true, publishable: true, status: "succeeded" }, [
+    invocation({ optimization_run_id: "run-e", invocation_id: "inv-e", input_tokens: 100, output_tokens: 50 }),
+  ]);
+  const outFile = join(root, "usage.json");
+  const result = spawnSync(process.execPath, [script, "--out", outFile, "."], {
+    encoding: "utf8",
+    cwd: join(root, "run-e", "switch-cost"),
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.invocations.length, 1);
+  assert.equal(doc.invocations[0].optimization_run_id, "run-e");
+  assert.equal(doc.collection.run_outcomes.length, 1);
+  assert.equal(doc.collection.run_outcomes[0].run_id, "run-e");
+  assert.equal(doc.collection.run_outcomes[0].accepted, true);
+  assert.equal(doc.collection.run_outcomes[0].path, join(root, "run-e/reports/supervisor-final.json"));
+  assert.deepEqual(doc.collection.run_outcome_conflicts, []);
+  assert.deepEqual(doc.collection.errors, []);
+});
+
+test("CLI records an error when supervisor-final.json cannot be inspected", (t) => {
+  const root = tempDir(t);
+  writeRunTree(root, "run-f", null, [
+    invocation({ optimization_run_id: "run-f", invocation_id: "inv-f" }),
+  ]);
+  writeFileSync(join(root, "run-f", "reports"), "not a directory");
+  const outFile = join(root, "usage.json");
+  const result = spawnSync(process.execPath, [script, "--out", outFile, root], {
+    encoding: "utf8",
+  });
+  assert.equal(result.status, 0, result.stderr);
+  const doc = JSON.parse(readFileSync(outFile, "utf8"));
+  assert.equal(doc.invocations.length, 1);
+  assert.deepEqual(doc.collection.run_outcomes, []);
+  assert.equal(doc.collection.errors.length, 1);
+  assert.equal(doc.collection.errors[0].path, join(root, "run-f/reports/supervisor-final.json"));
+  assert.match(doc.collection.errors[0].reason, /unreadable file: /);
+});
