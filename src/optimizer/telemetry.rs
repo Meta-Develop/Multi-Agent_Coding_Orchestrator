@@ -220,9 +220,9 @@ pub struct InvocationRecord {
     #[serde(default)]
     pub cost_micros: Option<i64>,
     #[serde(default)]
-    pub produced_useful_evidence: bool,
+    pub produced_useful_evidence: Option<bool>,
     #[serde(default)]
-    pub produced_valid_patch: bool,
+    pub produced_valid_patch: Option<bool>,
     #[serde(default)]
     pub human_intervention: bool,
     #[serde(default)]
@@ -278,8 +278,8 @@ impl InvocationRecord {
             certified: None,
             cost_class: None,
             cost_micros: None,
-            produced_useful_evidence: false,
-            produced_valid_patch: false,
+            produced_useful_evidence: None,
+            produced_valid_patch: None,
             human_intervention: false,
             task_features: None,
             repo_features: None,
@@ -565,10 +565,12 @@ impl PolicyExecutionTotals {
             ..Self::default()
         };
         if let Some(start) = start {
-            totals.time_to_first_useful_evidence_ms =
-                first_elapsed(records, start, |record| record.produced_useful_evidence);
-            totals.time_to_first_valid_patch_ms =
-                first_elapsed(records, start, |record| record.produced_valid_patch);
+            totals.time_to_first_useful_evidence_ms = first_elapsed(records, start, |record| {
+                record.produced_useful_evidence == Some(true)
+            });
+            totals.time_to_first_valid_patch_ms = first_elapsed(records, start, |record| {
+                record.produced_valid_patch == Some(true)
+            });
             totals.time_to_certification_ms =
                 first_elapsed(records, start, |record| record.certified == Some(true));
         }
@@ -735,7 +737,7 @@ mod tests {
         worker.role = Some(AgentRole::Worker);
         worker.cost_class = Some(CostClass::DirectWorker);
         worker.cost_micros = Some(100);
-        worker.produced_useful_evidence = true;
+        worker.produced_useful_evidence = Some(true);
         worker.quota_window = Some(QuotaWindow::measured(
             Some(3_100),
             Some(3_158),
@@ -748,7 +750,7 @@ mod tests {
         repair.parent_invocation_id = worker.invocation_id.clone();
         repair.cost_class = Some(CostClass::InducedDownstreamRepair);
         repair.cost_micros = Some(40);
-        repair.produced_valid_patch = true;
+        repair.produced_valid_patch = Some(true);
         repair.quota_window = Some(QuotaWindow::inferred(
             Some(3_158),
             Some(3_200),
@@ -915,5 +917,28 @@ mod tests {
         );
         let error = sink.record(&record).expect_err("incomplete");
         assert!(error.to_string().contains("optimization_run_id"));
+    }
+
+    #[test]
+    fn unknown_outcome_flags_serialize_as_null_and_legacy_bools_still_load() {
+        let record = InvocationRecord::new(
+            PolicyId::new("p").expect("p"),
+            CandidateId::new("c").expect("c"),
+            TimestampMillis::from_millis(1),
+            snapshot_at(1),
+        );
+        let json = serde_json::to_value(&record).expect("serialize");
+        assert!(json["produced_useful_evidence"].is_null());
+        assert!(json["produced_valid_patch"].is_null());
+        let round_tripped: InvocationRecord = serde_json::from_value(json).expect("deserialize");
+        assert_eq!(round_tripped.produced_useful_evidence, None);
+        assert_eq!(round_tripped.produced_valid_patch, None);
+
+        let mut legacy = serde_json::to_value(&record).expect("serialize");
+        legacy["produced_valid_patch"] = serde_json::json!(false);
+        legacy["produced_useful_evidence"] = serde_json::json!(true);
+        let loaded: InvocationRecord = serde_json::from_value(legacy).expect("legacy");
+        assert_eq!(loaded.produced_valid_patch, Some(false));
+        assert_eq!(loaded.produced_useful_evidence, Some(true));
     }
 }
