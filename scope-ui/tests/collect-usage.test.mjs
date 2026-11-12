@@ -254,7 +254,8 @@ test("summarize prints percentages and '-' for zero denominators", () => {
   ]);
   assert.match(noTokens, /Known measured input\+output tokens: 0/);
   assert.match(noTokens, /Coverage \(both counters known\): 0\/1 0\.0%/);
-  assert.match(noTokens, /tokens\s+0\s+-/);
+  assert.match(noTokens, /measured 0\/1/);
+  assert.match(noTokens, /tokens\s+-\s+-/);
 
   const text = summarize([
     invocation({ requested_model: "model-a", role: "worker", input_tokens: 100, output_tokens: 100 }),
@@ -263,11 +264,31 @@ test("summarize prints percentages and '-' for zero denominators", () => {
   ]);
   assert.match(text, /Known measured input\+output tokens: 600/);
   assert.match(text, /Coverage \(both counters known\): 2\/3 66\.7%/);
-  assert.match(text, /model-a\s+count\s+1\s+33\.3%\s+tokens\s+200\s+33\.3%/);
-  assert.match(text, /model-b\s+count\s+2\s+66\.7%\s+tokens\s+400\s+66\.7%/);
-  assert.match(text, /Manager\s+count\s+1\s+33\.3%\s+tokens\s+400\s+66\.7%/);
-  assert.match(text, /Worker\s+count\s+1\s+33\.3%\s+tokens\s+200\s+33\.3%/);
-  assert.match(text, /Review\s+count\s+1\s+33\.3%\s+tokens\s+0\s+0\.0%/);
+  assert.match(text, /model-a\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+200\s+33\.3%/);
+  assert.match(text, /model-b\s+count\s+2\s+66\.7%\s+measured\s+1\/2\s+tokens\s+400\s+66\.7%/);
+  assert.match(text, /Manager\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+400\s+66\.7%/);
+  assert.match(text, /Worker\s+count\s+1\s+33\.3%\s+measured\s+1\/1\s+tokens\s+200\s+33\.3%/);
+  assert.match(text, /Review\s+count\s+1\s+33\.3%\s+measured\s+0\/1\s+tokens\s+-\s+-/);
+});
+
+test("summarize shows unavailable tokens for a Review group with no measured invocation", () => {
+  const text = summarize([
+    invocation({ requested_model: "model-a", role: "worker", input_tokens: 100, output_tokens: 50 }),
+    invocation({ requested_model: "model-a", role: "auditor", input_tokens: null, output_tokens: null }),
+  ]);
+  assert.match(text, /Known measured input\+output tokens: 150/);
+  assert.match(text, /Coverage \(both counters known\): 1\/2 50\.0%/);
+  assert.match(text, /Worker\s+count\s+1\s+50\.0%\s+measured\s+1\/1\s+tokens\s+150\s+100\.0%/);
+  assert.match(text, /Review\s+count\s+1\s+50\.0%\s+measured\s+0\/1\s+tokens\s+-\s+-/);
+});
+
+test("summarize prints a measured zero as 0", () => {
+  const text = summarize([
+    invocation({ requested_model: "model-a", role: "worker", input_tokens: 0, output_tokens: 0 }),
+    invocation({ requested_model: "model-a", role: "manager", input_tokens: 100, output_tokens: 100 }),
+  ]);
+  assert.match(text, /Known measured input\+output tokens: 200/);
+  assert.match(text, /Worker\s+count\s+1\s+50\.0%\s+measured\s+1\/1\s+tokens\s+0\s+0\.0%/);
 });
 
 test("CLI end to end with --out, --summary, and an external manifest", (t) => {
@@ -521,7 +542,8 @@ test("parseArtifact keeps negative counters and summarize treats them as unknown
   const text = summarize(parsed.invocations);
   assert.match(text, /Known measured input\+output tokens: 0/);
   assert.match(text, /Coverage \(both counters known\): 0\/1 0\.0%/);
-  assert.match(text, /tokens\s+0\s+-/);
+  assert.match(text, /measured 0\/1/);
+  assert.match(text, /tokens\s+-\s+-/);
 });
 
 test("CLI collects an artifact directly under ROOT '.' from inside switch-cost", (t) => {

@@ -302,10 +302,11 @@ function groupRows(invocations, keyOf, totalInvocations, knownSubtotal) {
   const groups = new Map();
   for (const invocation of invocations) {
     const key = keyOf(invocation);
-    if (!groups.has(key)) groups.set(key, { count: 0, tokens: 0 });
+    if (!groups.has(key)) groups.set(key, { count: 0, measured: 0, tokens: 0 });
     const group = groups.get(key);
     group.count += 1;
     if (bothCountersKnown(invocation)) {
+      group.measured += 1;
       group.tokens += invocation.input_tokens + invocation.output_tokens;
     }
   }
@@ -313,16 +314,24 @@ function groupRows(invocations, keyOf, totalInvocations, knownSubtotal) {
   if (names.length === 0) return ["(none)"];
   return names.map((name) => {
     const group = groups.get(name);
+    const tokensText =
+      group.measured > 0 ? String(group.tokens).padStart(10) : "-".padStart(10);
+    const shareText =
+      group.measured > 0 ? pct(group.tokens, knownSubtotal).padStart(7) : "-".padStart(7);
     return (
       name.padEnd(24) +
       " count " +
       String(group.count).padStart(6) +
       " " +
       pct(group.count, totalInvocations).padStart(7) +
+      "  measured " +
+      group.measured +
+      "/" +
+      group.count +
       "  tokens " +
-      String(group.tokens).padStart(10) +
+      tokensText +
       " " +
-      pct(group.tokens, knownSubtotal).padStart(7)
+      shareText
     );
   });
 }
