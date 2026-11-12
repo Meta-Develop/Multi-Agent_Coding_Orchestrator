@@ -151,10 +151,33 @@ fn vibe_journaled_config_encodes_the_per_attempt_shell_as_data() {
     let shell = Path::new("/private/attempt 'quoted' \\\"/journal-shell");
     let config = super::journaled_config_document(MODEL_A, shell).unwrap();
     let base = config_document(MODEL_A).unwrap();
+    let table_prefix = format!(
+        "\n[tools.bash]\ndefault_timeout = {}\nmax_timeout_seconds = {}\nshell = ",
+        super::JOURNALED_BASH_DEFAULT_TIMEOUT_SECONDS,
+        super::JOURNALED_BASH_MAX_TIMEOUT_SECONDS
+    );
+    assert_eq!(
+        config
+            .matches(&format!(
+                "default_timeout = {}",
+                super::JOURNALED_BASH_DEFAULT_TIMEOUT_SECONDS
+            ))
+            .count(),
+        1
+    );
+    assert_eq!(
+        config
+            .matches(&format!(
+                "max_timeout_seconds = {}",
+                super::JOURNALED_BASH_MAX_TIMEOUT_SECONDS
+            ))
+            .count(),
+        1
+    );
     let encoded = config
         .strip_prefix(&base)
         .unwrap()
-        .strip_prefix("\n[tools.bash]\nshell = ")
+        .strip_prefix(&table_prefix)
         .unwrap()
         .trim_end();
     // The generated TOML basic string uses the JSON string escape subset.

@@ -107,10 +107,15 @@ mod automatic_journal {
         let shell = staged.journal_shell.as_ref().unwrap();
         let config = fs::read_to_string(staged.config.path())?;
         let base = crate::runtime_adapter::vibe::config_document(&staged.evidence.model)?;
+        let table_prefix = format!(
+            "\n[tools.bash]\ndefault_timeout = {}\nmax_timeout_seconds = {}\nshell = ",
+            crate::runtime_adapter::vibe::JOURNALED_BASH_DEFAULT_TIMEOUT_SECONDS,
+            crate::runtime_adapter::vibe::JOURNALED_BASH_MAX_TIMEOUT_SECONDS
+        );
         let encoded = config
             .strip_prefix(&base)
             .unwrap()
-            .strip_prefix("\n[tools.bash]\nshell = ")
+            .strip_prefix(&table_prefix)
             .unwrap()
             .trim_end();
         assert_eq!(
