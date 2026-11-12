@@ -169,7 +169,11 @@
 
   function renderEvidence() {
     var merged = evidence.merged;
-    var groups = catalog.evidenceGroups(merged ? merged.records : [], evidence.grouping);
+    var groups = catalog.evidenceGroups(
+      merged ? merged.records : [],
+      evidence.grouping,
+      catalog.runOutcomeIndex(merged ? merged.collections : []),
+    );
     var summary = catalog.evidenceSummary(merged ? merged.records : []);
     var groupingLabel = catalog.modelGroupingLabel(evidence.grouping);
     var groupHeading = document.getElementById("evidenceGroupHeading");

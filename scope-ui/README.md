@@ -30,15 +30,19 @@ Two horizontal bar charts are rendered:
 - measured `input_tokens + output_tokens` and shares per model group.
 
 A **Group by** control switches both charts between the resolved/observed model
-(`resolved_model`), requested model (`requested_model`), Role category, and
-Role category x requested model. Role matching ignores case: Manager includes
+(`resolved_model`), requested model (`requested_model`), Role category,
+Role category x requested model, and Run outcome. Role matching ignores case: Manager includes
 manager, childorchestrator, orchestrator and supervisor; Review includes auditor,
 reviewer and review; Worker includes worker; Other includes missing or any other
 role. Category labels list their raw roles, for example `Review (Auditor)`.
 A missing model
 is shown as `Unknown`; a missing `resolved_model` is never replaced by
 `requested_model`. `cached_input_tokens` is already part of `input_tokens` and
-is never added again.
+is never added again. The Run outcome grouping uses `collection.run_outcomes`
+from collected artifacts, joined by `optimization_run_id`; invocations without
+a recorded outcome, including every directly imported live-evidence artifact,
+show as `Unknown outcome`. `Accepted run` means MACO's native final result, not
+later human or root acceptance.
 
 Token mass counts only records where both `input_tokens` and `output_tokens`
 are nonnegative safe integers and their sum is safe. Null, missing, partial,
