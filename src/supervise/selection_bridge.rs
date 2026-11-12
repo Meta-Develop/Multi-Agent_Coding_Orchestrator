@@ -3429,9 +3429,10 @@ fn append_deepseek_research_catalog(
     Ok(())
 }
 
-/// Vibe is an explicit terminal Worker lane, never an automatic alternative.
-/// Like DeepSeek, its operator-declared menu requires a frozen executable and
-/// task-provided priors; a role_models effort remains part of the selector key.
+/// Vibe is a non-delegating terminal Worker lane. Its operator-declared menu
+/// requires a frozen bound executable and operator prior rows. With both, its
+/// models are automatic Worker candidates ranked by the ordinary selector; an
+/// explicit Worker override for another runtime keeps Vibe out.
 fn append_vibe_worker_catalog(
     catalogs: &mut Vec<RuntimeCatalog>,
     role: AgentRole,
@@ -3440,7 +3441,7 @@ fn append_vibe_worker_catalog(
     priors: &selection::PriorDataset,
 ) -> Result<()> {
     if role != AgentRole::Worker
-        || debug_override.is_none_or(|request| request.candidate.runtime != "vibe")
+        || debug_override.is_some_and(|request| request.candidate.runtime != "vibe")
         || task.authority_role != AuthorityRole::TerminalLeaf
         || catalogs.iter().any(|catalog| catalog.runtime == "vibe")
     {
@@ -5231,6 +5232,8 @@ pub(super) mod tests {
     include!("qualification_selection_tests.rs");
     #[cfg(target_os = "linux")]
     include!("deepseek_selection_tests.rs");
+    #[cfg(target_os = "linux")]
+    include!("vibe_selection_tests.rs");
     // These tests need the private selection, account and assignment-shape fixtures.
     #[cfg(target_os = "linux")]
     mod vibe_selection {
@@ -5525,7 +5528,7 @@ pub(super) mod tests {
         }
 
         #[test]
-        fn vibe_selection_requires_explicit_override_and_reasoning_effort() -> Result<()> {
+        fn vibe_selection_automatic_candidates_and_mandatory_override_effort() -> Result<()> {
             let _policy = bind_fixture_routing_policy()?;
             let (_temporary, repo) = super::super::super::tests::injected_repository();
             let _binding = bind_program(&repo, true)?;
@@ -5535,11 +5538,13 @@ pub(super) mod tests {
             automatic.role_models.clear();
             let selected = resolve(&mut automatic, &[], false)?;
             assert!(selected.selection_preflight_failure.is_none());
-            assert!(selected.decisions.iter().all(|event| event
+            // With a bound executable and operator prior rows, the Vibe lane
+            // is now an automatic Worker candidate, not override-only.
+            assert!(selected.decisions.iter().any(|event| event
                 .provenance
                 .candidate_set
                 .iter()
-                .all(|candidate| candidate.candidate.runtime != "vibe")));
+                .any(|candidate| candidate.candidate.runtime == "vibe")));
             let mut missing_effort = plan_for(AgentRole::Worker)?;
             missing_effort
                 .role_models
