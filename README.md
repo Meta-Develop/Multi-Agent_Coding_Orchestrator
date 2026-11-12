@@ -1334,6 +1334,16 @@ and review gates still apply. See
 [`src/runtime_adapter/vibe.rs`](src/runtime_adapter/vibe.rs) and
 [`src/external_agent/vibe.rs`](src/external_agent/vibe.rs).
 
+Vibe models enter selection only from operator prior data (`--prior-data`)
+for a run whose Vibe executable is bound (`--additional-runtime-bin vibe=PATH`).
+With both present, each Vibe prior row whose class fit covers the task is an
+automatic Worker candidate: the selector ranks it against the other runtimes'
+candidates under the same quality gate, task-shape ceiling, authority
+prohibitions and cost objective, with no Vibe-specific preference. An explicit
+Worker `role_models` entry still decides the Worker model, other roles never
+receive a Vibe candidate, and a run without a bound Vibe executable or without
+Vibe prior rows selects as before.
+
 
 ## Development
 
