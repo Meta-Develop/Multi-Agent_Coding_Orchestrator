@@ -60,18 +60,23 @@ struct CappedBuffer {
     bytes: Vec<u8>,
     max: usize,
     deadline: Option<std::time::Instant>,
+    next_check: usize,
+    checks: usize,
 }
 
 impl Write for CappedBuffer {
     fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
-        if self
-            .deadline
-            .is_some_and(|d| std::time::Instant::now() >= d)
-        {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "serialization deadline expired",
-            ));
+        if let Some(deadline) = self.deadline {
+            if self.bytes.len() >= self.next_check {
+                self.checks += 1;
+                if std::time::Instant::now() >= deadline {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "serialization deadline expired",
+                    ));
+                }
+                self.next_check = self.bytes.len() + WORK_CHUNK_BYTES;
+            }
         }
         if bytes.len() > self.max - self.bytes.len() {
             return Err(std::io::Error::other("lifecycle frame exceeds byte limit"));
@@ -107,6 +112,8 @@ fn serialize_bounded(
         bytes: Vec::new(),
         max: usize::try_from(max.min(MAX_FRAME))?,
         deadline,
+        next_check: 0,
+        checks: 0,
     };
     serde_json::to_writer(&mut writer, value)?;
     check_deadline(deadline)?;
@@ -183,6 +190,40 @@ mod tests {
         assert!(read_frame::<serde_json::Value>(&mut bytes.as_slice(), 1024).is_err());
         bytes[0] = b'!';
         assert!(read_frame::<serde_json::Value>(&mut bytes.as_slice(), 1024).is_err());
+    }
+
+    #[test]
+    fn serialize_bounded_matches_serde_json_bytes_within_deadline() {
+        let value = serde_json::json!(vec![0u8; 64 * 1024]);
+        let deadline = Some(std::time::Instant::now() + std::time::Duration::from_secs(60));
+        let bounded = serialize_bounded(&value, MAX_FRAME, deadline).unwrap();
+        assert_eq!(bounded, serde_json::to_vec(&value).unwrap());
+    }
+
+    #[test]
+    fn deadline_checks_are_bounded_per_chunk() {
+        let value = serde_json::json!(vec![0u8; 64 * 1024]);
+        let mut writer = CappedBuffer {
+            bytes: Vec::new(),
+            max: usize::try_from(MAX_FRAME).unwrap(),
+            deadline: Some(std::time::Instant::now() + std::time::Duration::from_secs(60)),
+            next_check: 0,
+            checks: 0,
+        };
+        serde_json::to_writer(&mut writer, &value).unwrap();
+        let output_len = writer.bytes.len();
+        assert!(output_len > WORK_CHUNK_BYTES);
+        assert!(writer.checks <= output_len / WORK_CHUNK_BYTES + 2);
+    }
+
+    #[test]
+    fn past_deadline_refuses_serialization() {
+        let value = serde_json::json!({"prompt": "x"});
+        let deadline = Some(std::time::Instant::now() - std::time::Duration::from_secs(1));
+        let error = serialize_bounded(&value, MAX_FRAME, deadline)
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("deadline expired"));
     }
 
     #[test]
