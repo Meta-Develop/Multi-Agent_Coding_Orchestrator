@@ -1020,11 +1020,17 @@ function exactToNumber(total) {
   return Number(total);
 }
 
+function startedAtOrNull(value) {
+  if (typeof value === "number") return Number.isFinite(value) ? value : null;
+  if (typeof value === "string") return value.trim() ? value : null;
+  return null;
+}
+
 function identityKey(record) {
   const run = textOrNull(record.optimization_run_id);
   const invocation = textOrNull(record.invocation_id);
   if (!run || !invocation) return null;
-  return JSON.stringify([run, invocation, textOrNull(record.started_at)]);
+  return JSON.stringify([run, invocation, startedAtOrNull(record.started_at)]);
 }
 
 // Every field that can distinguish two rows for the same invocation. Raw
@@ -1069,7 +1075,7 @@ function describeConflict(existing, incoming) {
     "/" +
     invocation +
     " @ " +
-    (textOrNull(incoming.started_at) || "null") +
+    (startedAtOrNull(incoming.started_at) ?? "null") +
     " (" +
     (fields.length ? fields.join("; ") : "differing measurement fields") +
     ")"

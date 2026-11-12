@@ -669,6 +669,30 @@ test("identity distinguishes trial starts and collapses missing and null starts"
   }
 });
 
+test("numeric started_at distinguishes trials and identical rows collapse", () => {
+  const first = invocation({ started_at: 1761955200000 });
+  const later = invocation({ started_at: 1762041600000 });
+  const merged = mergeEvidenceArtifacts([
+    { text: artifact([first, later, first]) },
+  ]);
+  assert.equal(merged.ok, true);
+  assert.equal(merged.records.length, 2);
+  assert.equal(merged.duplicates, 1);
+  assert.equal(evidenceGroups(merged.records).totalInvocations, 2);
+});
+
+test("same numeric started_at with differing measurement conflicts and is excluded", () => {
+  const first = invocation({ started_at: 1761955200000 });
+  const conflicting = { ...first, input_tokens: 200 };
+  const merged = mergeEvidenceArtifacts([
+    { text: artifact([first, conflicting]) },
+  ]);
+  assert.equal(merged.ok, false);
+  assert.equal(merged.conflicts, 1);
+  assert.deepEqual(merged.records, []);
+  assert.match(merged.errors.join(" "), /Conflicting duplicate invocation .*1761955200000.*input_tokens/);
+});
+
 test("role categories match all aliases without losing raw role labels", () => {
   const roles = ["Manager", "CHILDORCHESTRATOR", "orchestrator", "Supervisor",
     "Auditor", "REVIEWER", "review", "Worker", "custom", null];
