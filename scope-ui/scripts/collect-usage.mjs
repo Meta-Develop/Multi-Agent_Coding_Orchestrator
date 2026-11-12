@@ -419,6 +419,58 @@ function groupRows(invocations, keyOf, totalInvocations, knownSubtotal) {
   });
 }
 
+function workerModelRows(invocations, runOutcomes) {
+  const runs = runOutcomes.filter((outcome) => outcome.accepted === true || outcome.accepted === false);
+  const groups = new Map();
+  for (const outcome of runs) {
+    const runInvocations = invocations.filter((invocation) => invocation.optimization_run_id === outcome.run_id);
+    const workerModels = new Set();
+    for (const invocation of runInvocations) {
+      if (roleCategory(invocation.role) !== "Worker") continue;
+      const model = invocation.requested_model;
+      workerModels.add(typeof model === "string" && model !== "" ? model : "(missing)");
+    }
+    const key = workerModels.size === 0 ? "(no Worker)" : [...workerModels].sort().join("+");
+    if (!groups.has(key)) groups.set(key, { runs: 0, accepted: 0, notAccepted: 0, tokens: 0, measured: 0, incomplete: 0 });
+    const group = groups.get(key);
+    group.runs += 1;
+    if (outcome.accepted === true) group.accepted += 1;
+    else group.notAccepted += 1;
+    if (runInvocations.length === 0 || runInvocations.some((invocation) => !bothCountersKnown(invocation))) {
+      group.incomplete += 1;
+    }
+    for (const invocation of runInvocations) {
+      if (bothCountersKnown(invocation)) {
+        group.measured += 1;
+        group.tokens += invocation.input_tokens + invocation.output_tokens;
+      }
+    }
+  }
+  const keys = [...groups.keys()].sort();
+  if (keys.length === 0) return ["(none)"];
+  return keys.map((key) => {
+    const group = groups.get(key);
+    const tokensText = group.measured > 0 ? String(group.tokens) : "-";
+    const perText =
+      group.accepted > 0 && tokensText !== "-" ? String(Math.round(group.tokens / group.accepted)) : "-";
+    return (
+      key.padEnd(24) +
+      " runs " +
+      String(group.runs).padStart(4) +
+      " accepted " +
+      String(group.accepted).padStart(4) +
+      " not accepted " +
+      String(group.notAccepted).padStart(4) +
+      " tokens " +
+      tokensText.padStart(10) +
+      " per accepted run " +
+      perText.padStart(10) +
+      " incomplete " +
+      group.incomplete
+    );
+  });
+}
+
 export function summarize(invocations, runOutcomes = []) {
   const total = invocations.length;
   let knownSubtotal = 0;
@@ -459,6 +511,9 @@ export function summarize(invocations, runOutcomes = []) {
     "Known tokens per accepted run: " +
       (acceptedRuns > 0 ? Math.round(knownSubtotal / acceptedRuns) : "-")
   );
+  lines.push("");
+  lines.push("By Worker model per run:");
+  lines.push(...workerModelRows(invocations, runOutcomes));
   return lines.join("\n") + "\n";
 }
 

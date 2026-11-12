@@ -86,6 +86,11 @@ section and a `Known tokens per accepted run:` line that divides all known
 measured tokens — accepted, not accepted and unknown invocations together —
 by the number of accepted runs. Accepted here means MACO's own native final
 result, not any later human or root acceptance.
+A `By Worker model per run:` section follows it, grouping only runs with
+a native outcome by the sorted, de-duplicated `requested_model` values of
+their Worker invocations (`(no Worker)` when a run has none). Each row
+counts every role of each run: accepted and not accepted runs, total known
+tokens, tokens per accepted run, and how many runs are incomplete.
 
 All recorded roles are in scope, including control/review roles, retries and
 failed attempts, each invocation counted once. The charts describe the supplied
