@@ -363,7 +363,8 @@ test("summarize ignores invocations whose run has no outcome", () => {
   const lines = text.split("\n");
   const heading = lines.indexOf("By Worker model per run:");
   assert.equal(lines[heading + 1], "model-w                  runs    1 accepted    1 not accepted    0 tokens        150 per accepted run        150 incomplete 0");
-  assert.ok(!lines.slice(heading + 1).some((line) => line.startsWith("model-x")));
+  const cachedHeading = lines.indexOf("Cached input (where input and cached counters are known):");
+  assert.ok(!lines.slice(heading + 1, cachedHeading).some((line) => line.startsWith("model-x")));
 });
 
 test("summarize prints (none) for the Worker model section without outcomes", () => {
@@ -371,6 +372,85 @@ test("summarize prints (none) for the Worker model section without outcomes", ()
   const lines = text.split("\n");
   const heading = lines.indexOf("By Worker model per run:");
   assert.equal(lines[heading + 1], "(none)");
+});
+
+test("summarize appends a cached input section without changing existing lines", () => {
+  const invocations = [
+    invocation({
+      invocation_id: "inv-m",
+      role: "manager",
+      requested_model: "model-m",
+      input_tokens: 1000,
+      cached_input_tokens: 900,
+      output_tokens: 10,
+    }),
+    invocation({
+      invocation_id: "inv-w",
+      role: "worker",
+      requested_model: "model-w",
+      input_tokens: 1000,
+      cached_input_tokens: null,
+      output_tokens: 10,
+    }),
+  ];
+  const text = summarize(invocations, []);
+  const lines = text.split("\n");
+  const heading = lines.indexOf("Cached input (where input and cached counters are known):");
+  assert.notEqual(heading, -1);
+  assert.equal(lines[heading - 1], "");
+  assert.equal(lines[heading + 1], "By role category:");
+  assert.equal(lines[heading + 2], "Manager                  known 1/1  input       1000  cached        900   90.0%");
+  assert.equal(lines[heading + 3], "Worker                   known 0/1  input          -  cached          -       -");
+  assert.equal(lines[heading + 4], "By requested model:");
+  assert.equal(lines[heading + 5], "model-m                  known 1/1  input       1000  cached        900   90.0%");
+  assert.equal(lines[heading + 6], "model-w                  known 0/1  input          -  cached          -       -");
+
+  const existing = lines.slice(0, heading - 1).join("\n");
+  const withoutCached = summarize(
+    invocations.map((item) => ({ ...item, cached_input_tokens: null })),
+    []
+  );
+  const withoutLines = withoutCached.split("\n");
+  const withoutHeading = withoutLines.indexOf("Cached input (where input and cached counters are known):");
+  assert.equal(withoutLines.slice(0, withoutHeading - 1).join("\n"), existing);
+});
+
+test("summarize treats cached greater than input as not known", () => {
+  const text = summarize(
+    [
+      invocation({
+        role: "manager",
+        requested_model: "model-m",
+        input_tokens: 100,
+        cached_input_tokens: 500,
+        output_tokens: 10,
+      }),
+    ],
+    []
+  );
+  const lines = text.split("\n");
+  const heading = lines.indexOf("Cached input (where input and cached counters are known):");
+  assert.equal(lines[heading + 2], "Manager                  known 0/1  input          -  cached          -       -");
+  assert.equal(lines[heading + 3], "By requested model:");
+  assert.equal(lines[heading + 4], "model-m                  known 0/1  input          -  cached          -       -");
+});
+test("summarize prints known zero counters instead of hiding them", () => {
+  const text = summarize(
+    [
+      invocation({
+        role: "manager",
+        requested_model: "model-m",
+        input_tokens: 0,
+        cached_input_tokens: 0,
+        output_tokens: 0,
+      }),
+    ],
+    []
+  );
+  const lines = text.split("\n");
+  const heading = lines.indexOf("Cached input (where input and cached counters are known):");
+  assert.equal(lines[heading + 2], "Manager                  known 1/1  input          0  cached          0       -");
+  assert.equal(lines[heading + 4], "model-m                  known 1/1  input          0  cached          0       -");
 });
 test("CLI end to end with --out, --summary, and an external manifest", (t) => {
   const root = tempDir(t);
@@ -909,6 +989,46 @@ test("renderSvg escapes XML metacharacters in requested model names", () => {
   const svg = renderSvg([invocation({ requested_model: "<&>" })], []);
   assert.match(svg, /&lt;&amp;&gt;/);
   assert.ok(!svg.includes("<&>"));
+});
+
+test("renderSvg shows the cached share of input where it is known", () => {
+  const invocations = [
+    invocation({
+      invocation_id: "inv-m",
+      role: "manager",
+      requested_model: "model-m",
+      input_tokens: 1000,
+      cached_input_tokens: 900,
+      output_tokens: 10,
+    }),
+    invocation({
+      invocation_id: "inv-w",
+      role: "worker",
+      requested_model: "model-w",
+      input_tokens: 1000,
+      cached_input_tokens: null,
+      output_tokens: 10,
+    }),
+  ];
+  const svg = renderSvg(invocations, []);
+  assert.match(svg, /cached 90\.0% of input \(1\/1 known\)/);
+  assert.match(svg, /cached unknown/);
+  assert.match(svg, /The cached share covers only invocations whose cached counter is known\./);
+
+  const width = Number(/<svg[^>]* width="(\d+)"/.exec(svg)[1]);
+  const statsTexts = [...svg.matchAll(/<text x="(\d+)" y="\d+" font-family="sans-serif" font-size="12">([^<]*)<\/text>/g)]
+    .filter((match) => Number(match[1]) > 240)
+    .map((match) => match[2]);
+  assert.ok(statsTexts.length > 0);
+  const longest = Math.max(...statsTexts.map((text) => text.length));
+  assert.ok(width >= 852 + longest * 6.5, "canvas width " + width + " must cover " + longest + " characters");
+});
+
+test("renderSvg replaces characters that XML 1.0 forbids", () => {
+  const svg = renderSvg([invocation({ requested_model: "model\u0000a\u001Bb" })], []);
+  assert.ok(!svg.includes("\u0000"));
+  assert.ok(!svg.includes("\u001B"));
+  assert.match(svg, /\uFFFD/);
 });
 
 test("renderSvg shows unavailable for a group without counters", () => {

@@ -81,6 +81,10 @@ writes one importable artifact. Clear also invalidates pending file reads.
 run outcomes that `--summary` describes, with token shares by role category,
 requested model, run outcome and role category by requested model; it can be
 combined with `--out` and `--summary`.
+Both `--summary` and `--svg` also show the cached fraction of input per role
+category and per requested model wherever the input and cached counters are
+known, and show it as unknown everywhere else. MACO native rows usually have
+no cached counter, so their cached share is unknown.
 
 A manifest entry may set `optimization_run_id` to attribute an outer CLI
 session to the MACO run it supervised, so its tokens join that run in the
