@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 
 use super::{
     config_document, export_directory, final_assistant_text, immutable_argument_template,
-    parse_usage, validate_model, VibeUsage,
+    parse_outcome, parse_usage, stop_message, validate_model, VibeUsage,
 };
 
 const MODEL_A: &str = "deepseek-v4-1-flash-1017";
@@ -503,4 +503,95 @@ fn vibe_final_assistant_text_byte_boundary() {
     let stream = vibe_stream(&[over_line.as_str()]);
     assert!(stream.len() <= 8 * 1024 * 1024);
     assert!(final_assistant_text(&stream).is_err());
+}
+
+fn vibe_export_with_outcome(usage: &str, outcome: &str) -> Vec<u8> {
+    format!(r#"{{"usage":{usage},"outcome":{outcome}}}"#).into_bytes()
+}
+
+#[test]
+fn vibe_parse_outcome_reads_the_top_level_outcome_string() {
+    let bytes = vibe_export_with_outcome(
+        r#"{"input_tokens":10,"output_tokens":5,"cached_input_tokens":0,"total_tokens":15}"#,
+        "\"token_limit\"",
+    );
+    assert_eq!(parse_outcome(&bytes).as_deref(), Some("token_limit"));
+}
+
+#[test]
+fn vibe_parse_outcome_rejects_missing_nonstring_invalid_and_oversized_values() {
+    let usage =
+        r#"{"input_tokens":10,"output_tokens":5,"cached_input_tokens":0,"total_tokens":15}"#;
+    // Missing outcome.
+    assert_eq!(
+        parse_outcome(vibe_export(usage).as_slice()),
+        None,
+        "missing outcome"
+    );
+    // Non-string outcome.
+    assert_eq!(
+        parse_outcome(vibe_export_with_outcome(usage, "3").as_slice()),
+        None,
+        "non-string outcome"
+    );
+    // Uppercase letters.
+    assert_eq!(
+        parse_outcome(vibe_export_with_outcome(usage, "\"Token_Limit\"").as_slice()),
+        None,
+        "uppercase outcome"
+    );
+    // Spaces.
+    assert_eq!(
+        parse_outcome(vibe_export_with_outcome(usage, "\"token limit\"").as_slice()),
+        None,
+        "outcome with a space"
+    );
+    // Oversized document.
+    let mut oversized = vibe_export_with_outcome(usage, "\"token_limit\"");
+    oversized.resize(4 * 1024 * 1024 + 1, b' ');
+    assert_eq!(parse_outcome(&oversized), None, "oversized document");
+}
+
+#[test]
+fn vibe_stop_message_names_each_limit_outcome_with_the_template_numbers() {
+    let template = immutable_argument_template();
+    let value = |flag: &str| {
+        template
+            .iter()
+            .position(|argument| argument == flag)
+            .map(|index| template[index + 1].clone())
+            .unwrap()
+    };
+    let expected = |outcome: &str| {
+        format!(
+            "Vibe stopped without finishing: run outcome {outcome}; MACO launches Vibe with --max-turns {}, --max-tokens {} and --time-limit {}",
+            value("--max-turns"),
+            value("--max-tokens"),
+            value("--time-limit")
+        )
+    };
+    for outcome in [
+        "turn_limit",
+        "token_limit",
+        "price_limit",
+        "deadline",
+        "terminated",
+        "length",
+        "refusal",
+    ] {
+        assert_eq!(
+            stop_message(outcome).as_deref(),
+            Some(expected(outcome).as_str())
+        );
+    }
+    // The template numbers are the documented launch limits.
+    assert_eq!(value("--max-turns"), "200");
+    assert_eq!(value("--max-tokens"), "10000000");
+    assert_eq!(value("--time-limit"), "3600");
+}
+
+#[test]
+fn vibe_stop_message_returns_none_for_other_outcomes() {
+    assert_eq!(stop_message("finished"), None);
+    assert_eq!(stop_message("aborted"), None);
 }

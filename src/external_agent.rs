@@ -12551,10 +12551,20 @@ fn record_completed_target(
         // unavailable or incomplete, never a silent success.
         let export = vibe_export
             .context("private Vibe export directory became unavailable before usage capture");
-        match export.and_then(vibe::capture_usage) {
-            Ok(usage) => {
+        match export.and_then(vibe::capture_usage_with_outcome) {
+            Ok((usage, outcome)) => {
                 report.stdout.run_metadata.vibe_usage = Some(usage);
                 report.stdout.run_metadata.vibe_usage_complete = true;
+                // A limit stop exits with status 3 and still writes its export;
+                // name the stop in the attempt's error without failing capture.
+                if output.status.and_then(|status| status.code()) == Some(3) {
+                    if let Some(message) = outcome
+                        .as_deref()
+                        .and_then(crate::runtime_adapter::vibe::stop_message)
+                    {
+                        report.error = append_external_error(report.error.take(), Some(message));
+                    }
+                }
             }
             Err(error) => {
                 report.stdout.run_metadata.vibe_usage_complete = false;

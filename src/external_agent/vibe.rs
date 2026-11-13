@@ -667,7 +667,9 @@ pub(super) fn seal_private_runtime_home(
 ///
 /// The leaf is captured once and its identity verified while reading: a missing,
 /// replaced, oversized, or malformed export means usage is unavailable.
-pub(super) fn capture_usage(export: &SecureOutputRoot) -> Result<VibeUsageCapture> {
+pub(super) fn capture_usage_with_outcome(
+    export: &SecureOutputRoot,
+) -> Result<(VibeUsageCapture, Option<String>)> {
     export.verify_path_identity()?;
     let leaf = export
         .open_existing_leaf(OsStr::new(EXPORT_LEAF_NAME))
@@ -676,7 +678,14 @@ pub(super) fn capture_usage(export: &SecureOutputRoot) -> Result<VibeUsageCaptur
         .read_bounded(VIBE_EXPORT_LIMIT_BYTES)
         .context("Vibe export.json could not be read from the held leaf")?;
     let usage = crate::runtime_adapter::vibe::parse_usage(&bytes)?;
-    Ok(VibeUsageCapture::from_parsed(usage))
+    let outcome = crate::runtime_adapter::vibe::parse_outcome(&bytes);
+    Ok((VibeUsageCapture::from_parsed(usage), outcome))
+}
+
+/// Captures usage alone; see [`capture_usage_with_outcome`].
+#[cfg(test)]
+pub(super) fn capture_usage(export: &SecureOutputRoot) -> Result<VibeUsageCapture> {
+    capture_usage_with_outcome(export).map(|(usage, _)| usage)
 }
 
 /// Extracts the final assistant text from the captured NDJSON stdout stream.

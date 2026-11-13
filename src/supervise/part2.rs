@@ -418,11 +418,23 @@ impl DispatchBudgetReservation<'_> {
             }
             _ => external_process_completed(run, launch_runtime),
         };
+        // Reliability of the captured counters is deliberately separate from
+        // completion and publication. Vibe's own limit stops exit with status 3
+        // and still write a complete export, so their exact counts are reliable
+        // once containment is verified; every other runtime keeps requiring the
+        // full safety verification of a clean exit.
+        let usage_reliability_verified = if launch_runtime == SupervisorRuntime::Vibe {
+            external_containment_verified(run, SupervisorRuntime::Vibe)
+                && !run.timed_out
+                && matches!(run.exit_code, Some(0) | Some(3))
+        } else {
+            external_safety_verified(run, launch_runtime)
+        };
         let settlement = if external_dispatch_may_have_started(run, launch_runtime) {
             let (measurement, reliability) = match usage {
                 Some(usage)
                     if token_process_completed
-                        && external_safety_verified(run, launch_runtime)
+                        && usage_reliability_verified
                         && !run.stdout.raw_capture_truncated()
                         && (run.codex_command_execution_evidence().is_none()
                             || run.authenticated_app_server_evidence().is_some_and(|evidence| {
@@ -1486,5 +1498,162 @@ mod grok_native_settlement_tests {
         assert_eq!(report.consumed.tokens, 10);
         assert_eq!(report.reserved.tokens, 0);
         assert!(!report.usage_complete);
+    }
+
+    fn vibe_command(root: &Path) -> ExternalAgentCommand {
+        let mut command = ExternalAgentCommand::codex(
+            "vibe",
+            root,
+            root.join("prompt"),
+            root.join("log"),
+            root.join("report"),
+            Duration::from_secs(1),
+        )
+        .with_runtime_adapter(
+            SupervisorRuntime::Vibe,
+            RuntimeAdapterConfig::defaults(SupervisorRuntime::Vibe),
+        );
+        command.model = Some("zai-glm-5-3".into());
+        command
+    }
+
+    fn vibe_export() -> Vec<u8> {
+        br#"{"usage":{"input_tokens":9990000,"output_tokens":19950,"cached_input_tokens":0,"total_tokens":10009950},"outcome":"token_limit"}"#
+            .to_vec()
+    }
+
+    fn vibe_run(command: &ExternalAgentCommand, exit_code: i32) -> ExternalAgentRun {
+        let mut run = deterministic_fake_run(command, Vec::new());
+        run.exit_code = Some(exit_code);
+        run.process_tree = Some(ProcessTreeEvidence::VerifiedEmpty(
+            ContainmentBackend::SystemdUserService,
+        ));
+        run.side_effects = Some(SideEffectConfinementEvidence::Verified(
+            SideEffectConfinementProfileKind::ExternalCodex,
+        ));
+        run.retain_vibe_fixture_for_test(command, Some(&vibe_export()), b"")
+            .unwrap();
+        run
+    }
+
+    fn vibe_ledger() -> RunBudgetLedger {
+        RunBudgetLedger::new(crate::supervise_budget::RunBudgetLimits {
+            hard_tokens: Some(20_000_000),
+            ..Default::default()
+        })
+        .unwrap()
+    }
+
+    fn vibe_reserve(ledger: &RunBudgetLedger) -> DispatchBudgetReservation<'_> {
+        let reservation = ledger
+            .reserve(BudgetReservationRequest {
+                role: AgentRole::Worker,
+                tokens: 400_000,
+                cost_usd: None,
+            })
+            .unwrap()
+            .reservation()
+            .expect("admitted")
+            .clone();
+        DispatchBudgetReservation {
+            ledger,
+            reservation,
+            pricing: None,
+            pricing_model: None,
+            state: DispatchBudgetReservationState::Reserved(SupervisorRuntime::Vibe),
+        }
+    }
+
+    #[test]
+    fn vibe_stop_settlement_exit3_charges_exact_export_tokens_as_reliable() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = vibe_command(temp.path());
+        let run = vibe_run(&command, 3);
+        let ledger = vibe_ledger();
+        let mut reservation = vibe_reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Vibe)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Reliable);
+        assert_eq!(settled.observed_usage.unwrap().total_tokens, 10_009_950);
+        let report = ledger.report().unwrap();
+        assert_eq!(report.consumed.tokens, 10_009_950);
+        assert!(report.usage_complete);
+        assert!(!report
+            .reasons
+            .contains(&BudgetReason::EstimatedProviderUsage));
+        assert!(report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn vibe_stop_settlement_exit3_timed_out_stays_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = vibe_command(temp.path());
+        let mut run = vibe_run(&command, 3);
+        run.timed_out = true;
+        let ledger = vibe_ledger();
+        let mut reservation = vibe_reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Vibe)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        let report = ledger.report().unwrap();
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn vibe_stop_settlement_exit2_stays_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = vibe_command(temp.path());
+        let run = vibe_run(&command, 2);
+        let ledger = vibe_ledger();
+        let mut reservation = vibe_reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Vibe)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        let report = ledger.report().unwrap();
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn vibe_stop_settlement_exit3_unverified_process_tree_stays_estimated() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = vibe_command(temp.path());
+        let mut run = vibe_run(&command, 3);
+        run.process_tree = None;
+        let ledger = vibe_ledger();
+        let mut reservation = vibe_reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Vibe)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Estimated);
+        let report = ledger.report().unwrap();
+        assert!(!report.usage_complete);
+        assert!(!report.new_dispatch_allowed);
+    }
+
+    #[test]
+    fn vibe_stop_settlement_exit0_stays_reliable() {
+        let temp = tempfile::tempdir().unwrap();
+        let command = vibe_command(temp.path());
+        let run = vibe_run(&command, 0);
+        let ledger = vibe_ledger();
+        let mut reservation = vibe_reserve(&ledger);
+        reservation
+            .mark_invoked_for_runtime(SupervisorRuntime::Vibe)
+            .unwrap();
+        let settled = reservation.settle_bound_runtime(&run, &command).unwrap();
+        assert_eq!(settled.reliability, DispatchUsageReliability::Reliable);
+        assert_eq!(settled.observed_usage.unwrap().total_tokens, 10_009_950);
+        let report = ledger.report().unwrap();
+        assert!(report.usage_complete);
+        assert!(report.new_dispatch_allowed);
     }
 }

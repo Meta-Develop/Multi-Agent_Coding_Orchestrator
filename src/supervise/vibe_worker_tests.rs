@@ -510,7 +510,7 @@ fn vibe_worker_settlement_keeps_export_tokens_and_unknown_cost_and_identity() ->
         assert_eq!(settlement.model, None);
         assert_eq!(
             settlement.reliability,
-            if expected_tokens.is_some() && exit_code == 0 {
+            if expected_tokens.is_some() && (exit_code == 0 || exit_code == 3) {
                 DispatchUsageReliability::Reliable
             } else if expected_tokens.is_some() {
                 DispatchUsageReliability::Estimated
