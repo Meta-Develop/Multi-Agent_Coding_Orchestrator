@@ -98,6 +98,12 @@ The current implementation covers a local-first command-line slice:
   categories and Git status while excluding runtime-only `.maco` output and
   local `.agents/temp`, `.agents/storage`, and `.agents/live` coordination data.
 - `maco repo map --semantic` builds a parser-backed Rust semantic map for modules, symbols, impls, imports, public re-exports, module declarations, import dependencies, and parse errors.
+- `maco repo map --allow-incomplete` (not with `--semantic`) still prints the
+  map when an ordinary repository directory cannot be opened or listed because
+  of a permission error: the directory itself is listed, its contents are
+  omitted, and the result reports `complete: false` with one
+  `permission_denied` warning per unreadable directory. The default map and
+  every cleanliness, containment and admission check stay strict.
 - `maco repo query symbol <name>` and `maco repo query path <path>` search the semantic Rust map.
 - `maco repo query risk --path <path> --json` reports touched symbols, dependency impacts, and impacted files for changed Rust paths.
 - `maco coord preview/claim/status/release/release-agent` provides standalone
