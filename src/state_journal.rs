@@ -44,8 +44,8 @@ const RECORD_DOMAIN: AuthenticationDomain =
 const HEAD_DOMAIN: AuthenticationDomain =
     AuthenticationDomain::new(b"MACO\0orchestration-checkpoint-head\0v3\0");
 const MAX_JOURNAL_RECORDS: usize = 4096;
-const MAX_RECORD_BYTES: u64 = 4 * 1024 * 1024;
-const MAX_JOURNAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Record bound of journals that do not embed a supervisor final report.
+pub(crate) const STANDARD_JOURNAL_RECORD_BYTES: u64 = 4 * 1024 * 1024;
 const MAX_PHASE_BYTES: usize = 64;
 const MAX_SUBJECT_BYTES: usize = 256;
 const MAX_RUN_ID_BYTES: usize = 128;
@@ -82,8 +82,11 @@ impl JournalSpec for CheckpointJournalSpec {
     const RECORD_DOMAIN: AuthenticationDomain = RECORD_DOMAIN;
     const HEAD_DOMAIN: AuthenticationDomain = HEAD_DOMAIN;
     const MAX_RECORDS: usize = MAX_JOURNAL_RECORDS;
-    const MAX_RECORD_BYTES: u64 = MAX_RECORD_BYTES;
-    const MAX_TOTAL_BYTES: u64 = MAX_JOURNAL_BYTES;
+    // A final_report_planned record embeds a pretty-printed supervisor final
+    // report of up to 8 MiB as an escaped JSON string (at most twice its size)
+    // plus a small envelope.
+    const MAX_RECORD_BYTES: u64 = 24 * 1024 * 1024;
+    const MAX_TOTAL_BYTES: u64 = 128 * 1024 * 1024;
     const MAX_PHASE_BYTES: usize = MAX_PHASE_BYTES;
     const MAX_SUBJECT_BYTES: usize = MAX_SUBJECT_BYTES;
     const MAX_INSTANCE_ID_BYTES: usize = MAX_RUN_ID_BYTES;

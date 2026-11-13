@@ -42,7 +42,7 @@ impl JournalSpec for RepairAttemptJournalSpec {
     // Reuse the authenticated checkpoint envelope's established size bounds;
     // replay additionally validates every fixed reservation field.
     const MAX_RECORDS: usize = MAX_REVIEW_LOOP_ATTEMPTS;
-    const MAX_RECORD_BYTES: u64 = <CheckpointJournalSpec as JournalSpec>::MAX_RECORD_BYTES;
+    const MAX_RECORD_BYTES: u64 = crate::state_journal::STANDARD_JOURNAL_RECORD_BYTES;
     const MAX_TOTAL_BYTES: u64 = Self::MAX_RECORD_BYTES * Self::MAX_RECORDS as u64;
     const MAX_PHASE_BYTES: usize = <CheckpointJournalSpec as JournalSpec>::MAX_PHASE_BYTES;
     const MAX_SUBJECT_BYTES: usize = <CheckpointJournalSpec as JournalSpec>::MAX_SUBJECT_BYTES;
