@@ -382,6 +382,20 @@ fn checked_weighted_score(
     Ok(score)
 }
 
+fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
+    if needle.is_empty() {
+        return false;
+    }
+    let bytes = haystack.as_bytes();
+    let is_word_byte = |byte: u8| byte.is_ascii_alphanumeric() || byte == b'_';
+    haystack.match_indices(needle).any(|(start, _)| {
+        let end = start + needle.len();
+        let before = start == 0 || !is_word_byte(bytes[start - 1]);
+        let after = end == bytes.len() || !is_word_byte(bytes[end]);
+        before && after
+    })
+}
+
 fn estimate_declaration(
     declaration: &TaskEstimationDeclaration,
     frozen: &FrozenRoutingPolicy,
@@ -401,6 +415,9 @@ fn estimate_declaration(
         let matches = match rule.match_kind {
             TaskEstimateMatch::DeclaredTaskContainsAsciiInsensitive => {
                 lowered_task.contains(&rule.pattern.to_ascii_lowercase())
+            }
+            TaskEstimateMatch::DeclaredTaskContainsWordAsciiInsensitive => {
+                contains_ascii_word(&lowered_task, &rule.pattern.to_ascii_lowercase())
             }
             TaskEstimateMatch::ScopePathPrefix => declaration
                 .assignments
@@ -1077,5 +1094,61 @@ mod tests {
         let mut missing = proposal();
         missing.assignments.pop();
         assert!(features_from_proposal(&missing, &assessment()).is_err());
+    }
+
+    #[test]
+    fn default_deletion_rule_ignores_inflected_words() -> Result<()> {
+        let frozen = estimation_policy()?;
+        let reported =
+            assess_task_routing("Report 6 added and 0 deleted lines.", &proposal(), &frozen)?;
+        let deletion = assess_task_routing("Delete the obsolete module.", &proposal(), &frozen)?;
+        let evidence = "policy_heuristic_rule:declared-deletion".to_string();
+        assert!(!reported.features.evidence.contains(&evidence));
+        assert!(deletion.features.evidence.contains(&evidence));
+        assert!(reported.features.risk < deletion.features.risk);
+        Ok(())
+    }
+
+    #[test]
+    fn ascii_word_match_respects_boundaries() {
+        for task in [
+            "delete",
+            "please delete it",
+            "delete: a",
+            "(delete)",
+            "x deleted then delete",
+        ] {
+            assert!(contains_ascii_word(task, "delete"), "{task}");
+        }
+        for task in [
+            "deleted",
+            "deletes",
+            "deletion",
+            "undelete",
+            "delete_me",
+            "delete2",
+        ] {
+            assert!(!contains_ascii_word(task, "delete"), "{task}");
+        }
+        assert!(!contains_ascii_word("anything", ""));
+    }
+
+    #[test]
+    fn substring_match_kind_keeps_substring_semantics() -> Result<()> {
+        let mut policy = estimation_policy()?.policy.clone();
+        let estimator = policy.task_estimation.as_mut().unwrap();
+        let rule = estimator
+            .rules
+            .iter_mut()
+            .find(|rule| rule.id == "declared-deletion")
+            .unwrap();
+        rule.match_kind = TaskEstimateMatch::DeclaredTaskContainsAsciiInsensitive;
+        let changed = frozen_estimation_policy(policy)?;
+        let assessment = assess_task_routing("Report 0 deleted lines.", &proposal(), &changed)?;
+        assert!(assessment
+            .features
+            .evidence
+            .contains(&"policy_heuristic_rule:declared-deletion".to_string()));
+        Ok(())
     }
 }

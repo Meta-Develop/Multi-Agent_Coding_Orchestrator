@@ -184,7 +184,7 @@
             "complexity_basis_points": 0,
             "horizon_basis_points": 0,
             "id": "declared-deletion",
-            "match_kind": "declared_task_contains_ascii_insensitive",
+            "match_kind": "declared_task_contains_word_ascii_insensitive",
             "pattern": "delete",
             "risk_basis_points": 6000
           },
@@ -243,7 +243,7 @@
       },
       "unknown_access_policy": "unknown_access_for_productive_attempt"
     },
-    "sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
+    "sha256": "b36e669327e729d9cee22480ff20f0b60415f4144ac26f70e4a6e116e4c10c08",
     "source": "bundled-routing-policy"
   },
   "task_routing_assessment": {
@@ -291,7 +291,7 @@
       "scope_modules": 0,
       "scope_paths": 1
     },
-    "policy_sha256": "2e0608b9d3bce4ca0c9dcb75786d08d6f5f5b7105d6941b1eeb127e06894ed3e",
+    "policy_sha256": "b36e669327e729d9cee22480ff20f0b60415f4144ac26f70e4a6e116e4c10c08",
     "provenance": "policy_heuristic"
   }
 }
