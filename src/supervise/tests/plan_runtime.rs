@@ -3791,7 +3791,10 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
                 &injected_auditor_report(&assignment, &child_report),
             );
             write_injected_usage(command, 8, 3);
-            return injected_verified_run(command);
+            let mut run = injected_verified_run(command);
+            #[cfg(unix)]
+            retained_review_turn_fixture(command, &mut run, Vec::new(), 8, 3);
+            return run;
         }
         if command.codex_managed_worker_requests_enabled() {
             observed_turns.push("initial-parent");
@@ -3853,6 +3856,8 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
             write_injected_usage(command, 8, 3);
             let mut run = injected_verified_run(command);
             run.stdout.target_launch_attempted = true;
+            #[cfg(unix)]
+            retained_review_turn_fixture(command, &mut run, Vec::new(), 8, 3);
             run.output_last_message =
                 Some(serde_json::to_vec(&yield_turn).expect("encode parent yield"));
             child_commands.push(command.clone());
@@ -3882,6 +3887,8 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
             write_injected_usage(command, 8, 3);
             let mut run = injected_verified_run(command);
             run.stdout.target_launch_attempted = true;
+            #[cfg(unix)]
+            retained_review_turn_fixture(command, &mut run, Vec::new(), 8, 3);
             return run;
         }
         observed_turns.push("final-parent");
@@ -3907,6 +3914,8 @@ fn verified_supervise_dispatch_consumes_and_persists_the_selector_triple() {
         write_injected_usage(command, 8, 3);
         let mut run = injected_verified_run(command);
         run.stdout.target_launch_attempted = true;
+        #[cfg(unix)]
+        retained_review_turn_fixture(command, &mut run, Vec::new(), 8, 3);
         run.output_last_message =
             Some(serde_json::to_vec(&final_turn).expect("encode final parent"));
         run

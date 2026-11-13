@@ -35,6 +35,7 @@ fn run_loaded_reaudit_source_with_selected_fixture(
     mut loaded: LoadedSupervisorPlan,
     options: SupervisorRunOptions,
     owner: &tempfile::TempDir,
+    verified_parent: bool,
     runner: &mut (dyn FnMut(&ExternalAgentCommand, bool) -> ExternalAgentRun + Send),
 ) -> Result<SupervisorFinalReport> {
     #[cfg(target_os = "linux")]
@@ -145,12 +146,27 @@ fn run_loaded_reaudit_source_with_selected_fixture(
                 loaded.plan_metadata.clone(),
                 &parent_acceptance,
             )?;
-            run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+            if verified_parent {
+                let serialized_runner = Mutex::new(runner);
+                super::super::scheduler::run_supervisor_plan_with_runner_and_creation(
+                    loaded,
+                    options,
+                    1,
+                    SupervisorExecutionRuntime::Verified,
+                    SupervisorWorktreeCreation::VerifiedTestOnly,
+                    Ok(catalog),
+                    &|command, _cancellation, review| {
+                        serialized_runner.lock().unwrap()(command, review.is_some())
+                    },
+                )
+            } else {
+                run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+            }
         }
     }
     #[cfg(not(target_os = "linux"))]
     {
-        let _ = (&mut loaded, owner);
+        let _ = (&mut loaded, owner, verified_parent);
         run_loaded_supervisor_plan_with_runner(loaded, options, runner)
     }
 }
@@ -202,7 +218,21 @@ fn run_loaded_evidence_only_reaudit_with_selected_fixture(
                 .context("evidence-only fixture current parsed assessment")?,
             &parent_acceptance,
         )?;
-        run_loaded_supervisor_plan_with_runner(loaded, options, runner)
+        {
+            // Preserve both original roles through the production re-audit contract.
+            let serialized_runner = Mutex::new(runner);
+            super::super::scheduler::run_supervisor_plan_with_runner_and_creation(
+                loaded,
+                options,
+                1,
+                SupervisorExecutionRuntime::Verified,
+                SupervisorWorktreeCreation::ExistingOnly,
+                Ok(catalog),
+                &|command, _cancellation, review| {
+                    serialized_runner.lock().unwrap()(command, review.is_some())
+                },
+            )
+        }
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -223,12 +253,31 @@ fn run_evidence_rejected_source_with_assignment(
     let budget = injected_run_budget(None, None, None, None, 100, 100);
     let options = injected_options(repo, temp.path(), run_id);
     let mut preserved_worktree = None;
+    let verified_parent = cfg!(target_os = "linux")
+        && assignment.role == AgentRole::ChildOrchestrator
+        && rejection_kind == AuditorRejectionKind::EvidenceQuality;
+    #[cfg(target_os = "linux")]
+    let mut captured_source_child = None;
+    #[cfg(target_os = "linux")]
+    let mut source_calls = Vec::new();
     let mut runner = |command: &ExternalAgentCommand, _pre_action_review: bool| {
         let name = command
             .output_last_message
             .file_name()
             .and_then(OsStr::to_str)
             .unwrap_or_default();
+        #[cfg(target_os = "linux")]
+        if verified_parent {
+            return verified_reaudit_source_turn(
+                command,
+                &assignment,
+                run_id,
+                rejection_kind,
+                &mut preserved_worktree,
+                &mut captured_source_child,
+                &mut source_calls,
+            );
+        }
         if name.contains("review-auditor") {
             let mut child = reaudit_source_child_report(&assignment);
             child.files_changed = vec![PathBuf::from("README.md")];
@@ -298,14 +347,167 @@ fn run_evidence_rejected_source_with_assignment(
             ..SupervisorPlanMetadata::default()
         },
     };
-    let report =
-        run_loaded_reaudit_source_with_selected_fixture(loaded, options, temp, &mut runner)
-            .expect("run typed parent-auditor rejection source");
+    let report = run_loaded_reaudit_source_with_selected_fixture(
+        loaded,
+        options,
+        temp,
+        verified_parent,
+        &mut runner,
+    )
+    .expect("run typed parent-auditor rejection source");
+    #[cfg(target_os = "linux")]
+    if verified_parent {
+        assert_eq!(source_calls, ["initial", "worker", "final", "auditor"]);
+    }
     (
         report,
         assignment,
         preserved_worktree.expect("source child worktree"),
     )
+}
+
+/// Owning source-run fixture: the production managed controller dispatches the
+/// Worker and imports its driver-retained capture before the source is finalized.
+#[cfg(target_os = "linux")]
+fn verified_reaudit_source_turn(
+    command: &ExternalAgentCommand,
+    assignment: &OrchestratorAssignment,
+    run_id: &str,
+    rejection_kind: AuditorRejectionKind,
+    preserved_worktree: &mut Option<PathBuf>,
+    captured_child: &mut Option<OrchestratorReviewReport>,
+    calls: &mut Vec<&'static str>,
+) -> ExternalAgentRun {
+    let identity = command.agent_lifecycle.as_ref().unwrap();
+    let (input, output, items) = if identity.role == "auditor" {
+        calls.push("auditor");
+        let child = captured_child
+            .as_ref()
+            .expect("source Worker was collected");
+        let mut auditor = injected_auditor_report(assignment, child);
+        auditor.accepted = false;
+        auditor.rejected = true;
+        auditor.status = ReviewStatus::Rejected;
+        auditor.rejection_kind = Some(rejection_kind);
+        auditor.findings.push(Finding {
+            severity: FindingSeverity::Error,
+            message: "implementation is sound but validation evidence is insufficient".into(),
+            paths: assignment.assigned_paths.clone(),
+        });
+        write_injected_json(&command.output_last_message, &auditor);
+        (11, 9, Vec::new())
+    } else if identity.role == "worker" {
+        calls.push("worker");
+        assert_eq!(identity.parent.as_deref(), Some(assignment.id.as_str()));
+        let mut child = injected_child_report(assignment);
+        let claims = SyncStore::open(&identity.registry_repo)
+            .unwrap()
+            .snapshot()
+            .unwrap();
+        child.claim_token = Some(
+            claims
+                .iter()
+                .find(|claim| claim.agent_id == assignment.id)
+                .unwrap()
+                .token
+                .get(),
+        );
+        child.files_changed = assignment.assigned_paths.clone();
+        let worker = &mut child.worker_reports[0];
+        worker.claim_token = child.claim_token;
+        worker.files_changed = assignment.assigned_paths.clone();
+        worker.commands_run = vec![serde_json::from_value(json!({
+            "command":["cat README.md"], "cwd":command.cwd,
+            "exit_code":0, "status":"succeeded", "timeout_seconds":1,
+            "duration_ms":1, "timed_out":false
+        }))
+        .unwrap()];
+        write_injected_json(&command.output_last_message, worker);
+        *captured_child = Some(child);
+        (
+            5,
+            3,
+            review_command_items(
+                command,
+                "owning-source-worker",
+                "/bin/bash -lc 'cat README.md'",
+                0,
+                Some("source Worker read its candidate\n"),
+            ),
+        )
+    } else if command.codex_managed_worker_requests_enabled() {
+        calls.push("initial");
+        *preserved_worktree = Some(command.cwd.clone());
+        use crate::messaging::transport::{ENV_MESSAGE_ENDPOINT, ENV_MESSAGE_TOKEN};
+        use std::io::{BufRead, BufReader, Write};
+        use std::net::TcpStream;
+        let environment: BTreeMap<_, _> = command
+            .assignment_messaging_launch()
+            .unwrap()
+            .environment_for(run_id, &assignment.id)
+            .unwrap()
+            .into_iter()
+            .collect();
+        let mut stream = TcpStream::connect(&environment[ENV_MESSAGE_ENDPOINT]).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        writeln!(
+            stream,
+            "{}",
+            json!({"bearer":environment[ENV_MESSAGE_TOKEN], "request":{
+                "operation":"submit_worker_request", "request_id":"reaudit-source-worker",
+                "worker_id":assignment.worker_assignments[0].id
+            }})
+        )
+        .unwrap();
+        stream.flush().unwrap();
+        let mut response = String::new();
+        BufReader::new(stream).read_line(&mut response).unwrap();
+        assert_eq!(
+            serde_json::from_str::<Value>(&response).unwrap()["ok"],
+            true
+        );
+        write_injected_json(
+            &command.output_last_message,
+            &json!({
+                "version":1, "outcome":"yield_workers", "run_id":run_id,
+                "parent_id":assignment.id, "parent_attempt":1,
+                "requests":[{"request_id":"reaudit-source-worker",
+                    "worker_id":assignment.worker_assignments[0].id}]
+            }),
+        );
+        (1, 1, Vec::new())
+    } else {
+        calls.push("final");
+        assert!(command.codex_managed_readonly_continuation_enabled());
+        write_injected_json(
+            &command.output_last_message,
+            &json!({
+                "version":2, "run_id":run_id, "parent_id":assignment.id,
+                "source_parent_attempt":1, "parent_attempt":2,
+                "completed_worker_ids":[assignment.worker_assignments[0].id],
+                "turn":assignment_execution::parent_continuation_response::final_turn_for_test(
+                    command, captured_child.as_ref().unwrap(),
+                )
+            }),
+        );
+        (7, 3, Vec::new())
+    };
+    write_injected_usage(command, input, output);
+    let mut run = injected_verified_run(command);
+    if identity.role == "worker" {
+        // Preserve the native uncommitted edit, as in the managed handoff fixture.
+        fs::write(command.cwd.join("README.md"), "preserved implementation\n").unwrap();
+    }
+    retained_review_turn_fixture(
+        command,
+        &mut run,
+        items,
+        u64::try_from(input).expect("fixture input tokens fit u64"),
+        u64::try_from(output).expect("fixture output tokens fit u64"),
+    );
+    run
 }
 
 #[test]
@@ -460,7 +662,88 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
             write_injected_json(&command.output_last_message, &evidence);
             write_injected_usage(command, 4, 3);
         }
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        #[cfg(target_os = "linux")]
+        {
+            assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+            assert!(command.worker_journal_artifacts.is_empty());
+            let items = if name.contains("review-auditor") {
+                let request: crate::review::ReviewLensRequest = serde_json::from_str(
+                    fs::read_to_string(&command.prompt)
+                        .unwrap()
+                        .split_once("REVIEW_LENS_REQUEST_JSON:\n")
+                        .unwrap()
+                        .1
+                        .trim(),
+                )
+                .unwrap();
+                let bindings = match request.information {
+                    crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+                        bindings,
+                        ..
+                    } => bindings,
+                    _ => panic!("expected full review"),
+                };
+                let native = &bindings.validation_bindings["native_execution_evidence"];
+                assert_eq!(native["required_for_acceptance"], true);
+                assert_eq!(native["review_complete"], true);
+                assert_eq!(
+                    native["candidate_binding"]["diff_oid"],
+                    source_binding.diff_oid
+                );
+                let current = &native["targets"][0];
+                assert_eq!(current["binding"]["role"], assignment.role.as_str());
+                assert_eq!(current["binding"]["run_id"], destination_run_id);
+                assert_eq!(current["execution_epoch"], "current_assignment_execution");
+                assert_eq!(current["commands"]["observation_count"], 1);
+                if !generated_direct {
+                    let targets = native["targets"].as_array().unwrap();
+                    assert_eq!(targets.len(), 1 + assignment.worker_assignments.len());
+                    let historical = &targets[1];
+                    assert_eq!(historical["binding"]["run_id"], source_id.as_str());
+                    assert_eq!(historical["binding"]["parent"], assignment.id);
+                    assert_eq!(historical["binding"]["task_id"], "worker-a");
+                    assert_eq!(historical["binding"]["attempt"], 1);
+                    assert_eq!(historical["execution_epoch"], "historical_worker_execution");
+                    assert_eq!(
+                        historical["source_candidate_binding"],
+                        serde_json::to_value(&source_binding).unwrap()
+                    );
+                    assert_eq!(historical["commands"]["observation_count"], 1);
+                    assert_eq!(
+                        historical["commands"]["commands"][0]["aggregated_output"]["text"],
+                        "source Worker read its candidate\n"
+                    );
+                    let operations = bindings.validation_bindings["worker_execution_evidence"]
+                        .as_array()
+                        .unwrap();
+                    assert_eq!(operations.len(), 2);
+                    assert!(operations
+                        .iter()
+                        .all(|entry| entry["source_run_id"] == source_id.as_str()
+                            && entry["execution_epoch"] == "historical_worker_execution"));
+                }
+                Vec::new()
+            } else {
+                assert!(command.codex_native_delegation_is_disabled());
+                assert!(!command.codex_managed_worker_requests_enabled());
+                let contents = fs::read_to_string(command.cwd.join("README.md")).unwrap();
+                review_command_items(
+                    command,
+                    "reaudit-preserved-candidate",
+                    "/bin/bash -lc 'cat README.md'",
+                    0,
+                    Some(&contents),
+                )
+            };
+            let (input, output) = if name.contains("review-auditor") {
+                (5, 4)
+            } else {
+                (4, 3)
+            };
+            retained_review_turn_fixture(command, &mut run, items, input, output);
+        }
+        run
     };
     let report =
         run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)
@@ -751,7 +1034,27 @@ fi"#,
             write_injected_json(&command.output_last_message, &evidence);
             write_injected_usage(command, 1, 1);
         }
-        injected_verified_run(command)
+        let mut run = injected_verified_run(command);
+        assert_eq!(command.workspace_access, WorkspaceAccess::ReadOnly);
+        assert!(command.worker_journal_artifacts.is_empty());
+        let items = if name.contains("review-auditor") {
+            Vec::new()
+        } else {
+            assert!(command.codex_native_delegation_is_disabled());
+            assert!(!command.codex_managed_worker_requests_enabled());
+            // The physical denial probe above is separate from this explicit
+            // protocol observation retained for the returned parent run.
+            let contents = fs::read_to_string(command.cwd.join("README.md")).unwrap();
+            review_command_items(
+                command,
+                "reaudit-mutation-denied-candidate",
+                "/bin/bash -lc 'cat README.md'",
+                0,
+                Some(&contents),
+            )
+        };
+        retained_review_turn_fixture(command, &mut run, items, 1, 1);
+        run
     };
     let report =
         run_loaded_evidence_only_reaudit_with_selected_fixture(loaded, options, &temp, &mut runner)

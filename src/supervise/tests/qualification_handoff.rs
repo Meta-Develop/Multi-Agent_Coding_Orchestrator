@@ -103,6 +103,107 @@ fn handoff(case: &str) -> Result<()> {
                         "validations lack a held candidate binding"
                     );
                 }
+                if matches!(
+                    case,
+                    "packet" | "initial-only" | "initial-missing-output" | "large-output"
+                ) {
+                    let prompt = fs::read_to_string(&command.prompt).unwrap();
+                    let request: crate::review::ReviewLensRequest = serde_json::from_str(
+                        prompt
+                            .split_once("REVIEW_LENS_REQUEST_JSON:\n")
+                            .unwrap()
+                            .1
+                            .trim(),
+                    )
+                    .unwrap();
+                    assert!(
+                        serde_json::to_vec(&request).unwrap().len()
+                            <= REVIEW_LENS_REQUEST_LIMIT_BYTES
+                    );
+                    let crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+                        bindings,
+                        ..
+                    } = request.information
+                    else {
+                        panic!("expected full review");
+                    };
+                    let native = &bindings.validation_bindings["native_execution_evidence"];
+                    if case == "large-output" {
+                        assert!(
+                            serde_json::to_vec(&bindings).unwrap().len()
+                                < REVIEW_LENS_REQUEST_LIMIT_BYTES
+                        );
+                        assert!(
+                            !bindings.validation_bindings["worker_execution_evidence"].is_null()
+                        );
+                        let worker = native["targets"]
+                            .as_array()
+                            .unwrap()
+                            .iter()
+                            .find(|target| target["binding"]["role"] == "worker")
+                            .unwrap();
+                        let commands = worker["commands"]["commands"].as_array().unwrap();
+                        let sizes = [26895, 16849, 43076, 20676, 44002, 27527, 36772, 19012];
+                        assert_eq!(commands.len(), sizes.len());
+                        assert!(sizes.iter().sum::<usize>() > 64 * 1024);
+                        for (index, observed) in commands.iter().enumerate() {
+                            assert_eq!(
+                                observed["native_command"]["text"],
+                                format!("/bin/bash -lc 'fixture-worker-check-{index}'")
+                            );
+                            assert_eq!(observed["status"], "completed");
+                            assert_eq!(observed["exit_code"], 0);
+                            assert_eq!(
+                                observed["aggregated_output"]["original_bytes"],
+                                sizes[index]
+                            );
+                            assert_eq!(
+                                observed["aggregated_output"]["sha256"],
+                                crate::artifacts::state_auth::sha256_hex(
+                                    "x".repeat(sizes[index]).as_bytes()
+                                )
+                            );
+                            assert_eq!(observed["aggregated_output"]["view_truncated"], true);
+                        }
+                    }
+                    assert_eq!(native["required_for_acceptance"], true);
+                    assert_eq!(native["review_complete"], case != "initial-missing-output");
+                    let targets = native["targets"].as_array().unwrap();
+                    assert_eq!(
+                        targets.len(),
+                        3,
+                        "initial, final and Worker source are required"
+                    );
+                    let parents = targets
+                        .iter()
+                        .filter(|target| target["binding"]["task_id"] == parent.id)
+                        .collect::<Vec<_>>();
+                    assert_eq!(parents.len(), 2);
+                    assert_eq!(parents[0]["binding"]["attempt"], 1);
+                    assert_eq!(parents[1]["binding"]["attempt"], 2);
+                    assert_eq!(parents[0]["source_attempt"], 1);
+                    assert_eq!(parents[1]["source_attempt"], 1);
+                    assert_eq!(parents[1]["commands"]["observation_count"], 0);
+                    if case.starts_with("initial-") {
+                        let observed = &parents[0]["commands"]["commands"][0];
+                        assert_eq!(observed["status"], "failed");
+                        assert_eq!(observed["exit_code"], 7);
+                        assert_eq!(
+                            parents[0]["candidate_at_execution"],
+                            "unknown; not observed by command capture"
+                        );
+                        if case == "initial-only" {
+                            assert_eq!(
+                                observed["aggregated_output"]["text"],
+                                "initial-parent-only-result\n"
+                            );
+                        }
+                        assert!(targets
+                            .iter()
+                            .filter(|target| target["binding"]["role"] == "worker")
+                            .all(|target| target["commands"]["observation_count"] == 0));
+                    }
+                }
                 if case == "failed-candidate" {
                     let run = command
                         .prompt
@@ -185,6 +286,21 @@ fn handoff(case: &str) -> Result<()> {
                 "duration_ms":1, "timed_out":false
             }))
             .unwrap()];
+            if case.starts_with("initial-") {
+                worker.commands_run.clear();
+            }
+            if case == "large-output" {
+                worker.commands_run = (0..8)
+                    .map(|index| {
+                        serde_json::from_value(json!({
+                            "command":[format!("fixture-worker-check-{index}")], "cwd":command.cwd,
+                            "exit_code":0, "status":"succeeded", "timeout_seconds":1,
+                            "duration_ms":1, "timed_out":false
+                        }))
+                        .unwrap()
+                    })
+                    .collect();
+            }
             if case == "failed-candidate" {
                 worker.files_changed = parent.assigned_paths.clone();
                 child.files_changed = parent.assigned_paths.clone();
@@ -252,15 +368,41 @@ fn handoff(case: &str) -> Result<()> {
             )
             .unwrap();
         }
-        run.stdout.target_launch_attempted = true;
-        if is_worker {
-            let journals = run.worker_journal_artifacts().to_vec();
-            run.stdout = CapturedOutput::from_captured_bytes_for_test(&crate::process_runner::CapturedBytes::from_bytes_for_test(
-                b"{\"type\":\"native-worker-observation\"}\n{\"type\":\"turn.completed\",\"usage\":{\"input_tokens\":8,\"output_tokens\":3}}\n".to_vec()));
-            run.stdout.target_launch_attempted = true;
-            run.replace_worker_journal_artifacts(journals);
-            run.retain_live_budget_invocation_for_test(command);
-        }
+        let items = if phase == "parent" && case.starts_with("initial-") {
+            review_command_items(
+                command,
+                "initial-parent-command",
+                "/bin/bash -lc 'inspect-before-workers'",
+                7,
+                (case != "initial-missing-output").then_some("initial-parent-only-result\n"),
+            )
+        } else if is_worker && case == "large-output" {
+            let sizes = [26895, 16849, 43076, 20676, 44002, 27527, 36772, 19012];
+            sizes
+                .iter()
+                .enumerate()
+                .flat_map(|(index, size)| {
+                    review_command_items(
+                        command,
+                        &format!("native-worker-command-{index}"),
+                        &format!("/bin/bash -lc 'fixture-worker-check-{index}'"),
+                        0,
+                        Some(&"x".repeat(*size)),
+                    )
+                })
+                .collect()
+        } else if is_worker && !case.starts_with("initial-") {
+            review_command_items(
+                command,
+                "native-worker-observation",
+                "/bin/bash -lc 'fixture-worker-check'",
+                0,
+                Some("controlled Worker fixture result\n"),
+            )
+        } else {
+            Vec::new()
+        };
+        retained_review_turn_fixture(command, &mut run, items, 8, 3);
         if is_auditor && parent.id == first.id {
             let run_dir = command
                 .prompt
@@ -286,7 +428,11 @@ fn handoff(case: &str) -> Result<()> {
         &runner,
     )?;
     let calls = calls.into_inner().unwrap();
-    if case == "failed-candidate" {
+    if case == "initial-missing-output" {
+        assert!(!report.success, "missing initial output was accepted");
+        assert!(calls.iter().any(|call| call == "child-a:auditor"));
+        assert!(!calls.iter().any(|call| call.starts_with("second-parent")));
+    } else if case == "failed-candidate" {
         assert!(!report.success, "failed parent report became accepted");
         let root = crate::artifacts::run_dir(&repo, RunArtifactFamily::Supervise, &run_id);
         assert!(
@@ -381,3 +527,19 @@ fn q714_fixture_requires_stage_one_acceptance() -> Result<()> {
 
 #[path = "qualification_operation_evidence.rs"]
 mod operation_evidence;
+
+#[test]
+fn managed_review_retains_only_command_result_from_initial_parent() -> Result<()> {
+    handoff("initial-only")
+}
+
+#[test]
+fn managed_review_missing_initial_output_cannot_be_hidden_by_empty_final_turn() -> Result<()> {
+    handoff("initial-missing-output")
+}
+
+#[test]
+fn managed_large_native_fields_fit_with_worker_operation_evidence_and_all_command_identities(
+) -> Result<()> {
+    handoff("large-output")
+}

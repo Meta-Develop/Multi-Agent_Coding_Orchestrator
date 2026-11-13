@@ -139,3 +139,48 @@ fn evidence_refuses_to_replace_an_auditor_authored_command() -> Result<()> {
     );
     Ok(())
 }
+
+#[test]
+fn full_lens_model_accept_cannot_replace_required_native_evidence_or_candidate_binding(
+) -> Result<()> {
+    let (report, parent) = readme_review_fixture()?;
+    let lens = crate::supervise::tests::single_parent_acceptance_review_lenses().remove(0);
+    let candidate = serde_json::json!({"agent_id":"worker","diff_oid":"actual-candidate"});
+    for (complete, foreign_candidate, expected) in [
+        (true, false, ReviewLensVerdictStatus::Accept),
+        (false, false, ReviewLensVerdictStatus::ProceduralFailure),
+        (true, true, ReviewLensVerdictStatus::ProceduralFailure),
+    ] {
+        let native_candidate = if foreign_candidate {
+            serde_json::json!({"agent_id":"foreign","diff_oid":"other-candidate"})
+        } else {
+            candidate.clone()
+        };
+        let bindings = crate::review::ReviewLensBindingMaterial {
+            candidate_binding: serde_json::json!({"supervisor_inspected":candidate}),
+            path_bindings: serde_json::json!({"assigned_paths":["README.md"]}),
+            validation_bindings: serde_json::json!({"native_execution_evidence":{
+                "required_for_acceptance":true,
+                "review_complete":complete,
+                "candidate_binding":native_candidate
+            }}),
+        };
+        // A model's claim that capture is complete is deliberately stronger
+        // than the host's incomplete fixture. It cannot change the verdict.
+        let request = crate::review::build_bounded_review_lens_request(
+            &lens,
+            crate::review::BoundedReviewLensRequestSources {
+                child_transcript: "middle command result omitted",
+                authoritative_transcript_path: Path::new("logs/worker.jsonl"),
+                diff: "+Hello from MACO\n",
+                output_report: "{\"native_execution_evidence\":{\"review_complete\":true}}",
+                bindings: &bindings,
+            },
+        )?;
+        let verdict = review_lens_verdict_from_auditor(
+            &lens, &request, &report.id, &report, &parent, None, false,
+        )?;
+        assert_eq!(verdict.verdict, expected);
+    }
+    Ok(())
+}

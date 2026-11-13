@@ -1499,6 +1499,8 @@ fn exercise_researcher_parent_review_evidence_gate(case: &str) {
             cwd: command.cwd.to_string_lossy().into_owned(),
             status: CommandExecutionStatus::InProgress,
             exit_code: None,
+            aggregated_output: None,
+            review_redacted: false,
         };
         let observation = Observation::Complete {
             item_id: "inspection".to_string(),
@@ -1802,6 +1804,8 @@ fn exercise_live_grant_scheduler(interleave_review: bool) {
             cwd: command.cwd.to_string_lossy().into_owned(),
             status: CommandExecutionStatus::InProgress,
             exit_code: None,
+            aggregated_output: None,
+            review_redacted: false,
         };
         run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
             thread_id: assignment.id.clone(),

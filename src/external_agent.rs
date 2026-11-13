@@ -5436,9 +5436,41 @@ impl ExternalAgentRun {
     fn retain_codex_command_execution_evidence(
         &mut self,
         outcome: &codex_app_server::AppServerOutcome,
+        credential_redactor: &CredentialRedactor,
     ) {
-        self.stdout.run_metadata.codex_command_execution_evidence =
-            Some(outcome.command_execution_evidence.clone());
+        let mut evidence = outcome.command_execution_evidence.clone();
+        let redact = |snapshot: &mut codex_app_server::CommandExecutionSnapshot| {
+            let command = credential_redactor.redact_string(&snapshot.command);
+            let cwd = credential_redactor.redact_string(&snapshot.cwd);
+            let output = snapshot
+                .aggregated_output
+                .as_deref()
+                .map(|text| credential_redactor.redact_string(text));
+            snapshot.review_redacted |= command != snapshot.command
+                || cwd != snapshot.cwd
+                || output != snapshot.aggregated_output;
+            snapshot.command = command;
+            snapshot.cwd = cwd;
+            snapshot.aggregated_output = output;
+        };
+        for observation in &mut evidence.observations {
+            match observation {
+                codex_app_server::CommandExecutionObservation::Complete {
+                    started,
+                    completed,
+                    ..
+                } => {
+                    redact(started);
+                    redact(completed);
+                }
+                codex_app_server::CommandExecutionObservation::Incomplete { started, .. } => {
+                    if let Some(started) = started {
+                        redact(started);
+                    }
+                }
+            }
+        }
+        self.stdout.run_metadata.codex_command_execution_evidence = Some(evidence);
         self.stdout.run_metadata.budget_interruption = outcome.budget_interruption.clone();
     }
 
@@ -10728,7 +10760,17 @@ fn should_use_read_only_terminal_app_server(
         && spec
             .agent_lifecycle
             .as_ref()
-            .is_some_and(|identity| matches!(identity.role.as_str(), "researcher" | "auditor"))
+            .is_some_and(|identity| {
+                matches!(identity.role.as_str(), "researcher" | "auditor")
+                    // Evidence-only re-audit preserves the original lifecycle.
+                    // Managed parent turns retain their separate capturing route.
+                    || (matches!(identity.role.as_str(), "worker" | "child_orchestrator")
+                        && spec.codex_managed_readonly_route == CodexManagedReadonlyRoute::Off
+                        && !identity.run_id.is_empty()
+                        && !identity.task_id.is_empty()
+                        && spec.codex_native_delegation_disabled
+                        && spec.writable_launch_target == WritableLaunchTarget::ManagedChildWorktree)
+            })
 }
 
 fn managed_worker_app_server_shape(
@@ -11423,58 +11465,59 @@ fn run_read_only_terminal_app_server_process_with_auth(
     let cancellation = cancellation.child_scope();
     run_codex_interactive_process(process_spec, &cancellation, auth, |session| {
         let mut transport = codex_app_server::ContainedJsonLineTransport::new(session);
-        // Read-only terminal roles have no approval authority, even if a hosted reviewer exists.
-        let mut approval_requested = false;
-        let mut reviewer = |_: codex_app_server::ApprovalRequest| {
-            approval_requested = true;
-            Ok(codex_app_server::ApprovalReview::cancel(None))
-        };
-        let mut outcome = if spec.codex_managed_worker_requests_enabled() {
-            let launch = spec.assignment_messaging_launch.as_ref().ok_or_else(|| {
-                "managed initial Codex parent is missing its sealed inbox endpoint".to_string()
-            })?;
-            let identity = spec.agent_lifecycle.as_ref().ok_or_else(|| {
-                "managed initial Codex parent is missing lifecycle identity".to_string()
-            })?;
-            let grant = spec
-                .verified_live_token_grant()
-                .inspect_err(|_| cancellation.cancel())?;
-            let run_id = identity.run_id.as_str();
-            let task_id = identity.task_id.as_str();
-            let mut forward = |request: &serde_json::Value| {
-                launch
-                    .forward_worker_request(run_id, task_id, request, &|| {
-                        cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped())
-                    })
-                    .map_err(|error| error.to_string())
-            };
-            run_observed_app_server_turn(
-                &mut transport,
-                &turn,
-                spec,
-                &mut reviewer,
-                Some(&mut forward),
-                &cancellation,
-            )
-        } else {
-            run_observed_app_server_turn(
-                &mut transport,
-                &turn,
-                spec,
-                &mut reviewer,
-                None,
-                &cancellation,
-            )
-        }?;
-        if let Err(error) =
-            validate_read_only_terminal_app_server_outcome(&outcome, approval_requested)
-        {
-            fail_app_server_outcome(&mut outcome, error);
-        }
-        // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
-        // the existing verified outer profile remains enforced, and every approval cancels.
-        Ok(outcome)
+        run_read_only_terminal_app_server_turn(&mut transport, &turn, spec, &cancellation)
     })
+}
+
+fn run_read_only_terminal_app_server_turn<T: codex_app_server::JsonLineTransport>(
+    transport: &mut T,
+    turn: &codex_app_server::AppServerTurn,
+    spec: &ExternalAgentCommand,
+    cancellation: &ProcessCancellation,
+) -> Result<codex_app_server::AppServerOutcome, String> {
+    // Read-only terminal roles have no approval authority, even if a hosted reviewer exists.
+    let mut approval_requested = false;
+    let mut reviewer = |_: codex_app_server::ApprovalRequest| {
+        approval_requested = true;
+        Ok(codex_app_server::ApprovalReview::cancel(None))
+    };
+    let mut outcome = if spec.codex_managed_worker_requests_enabled() {
+        let launch = spec.assignment_messaging_launch.as_ref().ok_or_else(|| {
+            "managed initial Codex parent is missing its sealed inbox endpoint".to_string()
+        })?;
+        let identity = spec.agent_lifecycle.as_ref().ok_or_else(|| {
+            "managed initial Codex parent is missing lifecycle identity".to_string()
+        })?;
+        let grant = spec
+            .verified_live_token_grant()
+            .inspect_err(|_| cancellation.cancel())?;
+        let run_id = identity.run_id.as_str();
+        let task_id = identity.task_id.as_str();
+        let mut forward = |request: &serde_json::Value| {
+            launch
+                .forward_worker_request(run_id, task_id, request, &|| {
+                    cancellation.is_cancelled() || grant.is_some_and(|grant| grant.stopped())
+                })
+                .map_err(|error| error.to_string())
+        };
+        run_observed_app_server_turn(
+            transport,
+            turn,
+            spec,
+            &mut reviewer,
+            Some(&mut forward),
+            cancellation,
+        )
+    } else {
+        run_observed_app_server_turn(transport, turn, spec, &mut reviewer, None, cancellation)
+    }?;
+    if let Err(error) = validate_read_only_terminal_app_server_outcome(&outcome, approval_requested)
+    {
+        fail_app_server_outcome(&mut outcome, error);
+    }
+    // Duplex auto-review coverage is unnecessary here: the inner workspace is read-only,
+    // the existing verified outer profile remains enforced, and every approval cancels.
+    Ok(outcome)
 }
 
 pub(crate) fn run_managed_worker_app_server_turn<T: codex_app_server::JsonLineTransport>(
@@ -12139,7 +12182,7 @@ fn record_completed_app_server_target(
     });
     let mut final_message_error = None;
     if let Ok(outcome) = &protocol {
-        report.retain_codex_command_execution_evidence(outcome);
+        report.retain_codex_command_execution_evidence(outcome, credential_redactor);
         if let Some(error) = &outcome.protocol_error {
             report.error = append_external_error(
                 report.error.take(),
@@ -14376,3 +14419,6 @@ pub(crate) use tests::claude_identity::record_claude_completion_for_test;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) use tests::run_codex_batch_silent_child;
+
+#[cfg(all(test, unix))]
+pub(crate) use tests::retain_review_protocol_fixture;

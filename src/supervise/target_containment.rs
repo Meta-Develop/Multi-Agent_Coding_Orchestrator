@@ -6,6 +6,9 @@ use crate::artifacts::state_auth::sha256_hex;
 const VERSION: u32 = 1;
 const MAX_RECEIPT_BYTES: usize = 16 * 1024;
 
+#[path = "review_command_evidence.rs"]
+mod review_commands;
+
 #[path = "observed_identity.rs"]
 mod observed_identity;
 pub(crate) use observed_identity::observed_role_identity;
@@ -52,6 +55,7 @@ struct TargetContainmentReceipt {
 struct RetainedCommandSummary<'a> {
     #[serde(flatten)]
     command: &'a CommandRunRecord,
+    review_commands: review_commands::ReviewCommandCapture,
     #[serde(skip_serializing_if = "Option::is_none")]
     command_seal_snapshot: Option<serde_json::Value>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -132,6 +136,9 @@ pub(super) fn persist(
     let record = command_record_from_external_for_runtime(run, command, runtime);
     let mut summary = serde_json::to_vec_pretty(&RetainedCommandSummary {
         command: &record,
+        review_commands: review_commands::ReviewCommandCapture::capture(
+            artifacts, command, runtime, run,
+        )?,
         researcher_input_receipts: run.retained_researcher_input_receipts(),
         budget_interruption: run.budget_interruption(),
         command_seal_snapshot: command
@@ -198,6 +205,107 @@ pub(super) fn persist(
         &serde_json::to_value(&receipt.binding)?,
         run,
     )
+}
+
+/// Descriptive source identity only; no command, grant, or process-control
+/// object is retained across the review boundary.
+pub(super) struct ReviewAttemptSource {
+    expected: TargetBinding,
+    transcript: PathBuf,
+}
+
+impl ReviewAttemptSource {
+    pub(super) fn bind(
+        writer: &ArtifactRunWriter,
+        artifacts: &ChildAttemptArtifacts,
+        command: &ExternalAgentCommand,
+        runtime: SupervisorRuntime,
+    ) -> Result<Self> {
+        Ok(Self {
+            expected: binding(writer.run_dir(), artifacts, command, runtime)?,
+            transcript: artifacts.raw_stdout_relative.clone(),
+        })
+    }
+
+    pub(super) fn matches_assignment(&self, assignment: &OrchestratorAssignment) -> bool {
+        self.expected.task_id == assignment.id && self.expected.role == assignment.role.as_str()
+    }
+}
+
+pub(super) fn bound_review_evidence(
+    writer: &ArtifactRunWriter,
+    source: &ReviewAttemptSource,
+) -> Result<Value> {
+    review_commands::read_review_evidence(writer, &source.expected, &source.transcript)
+}
+
+#[cfg(test)]
+fn review_evidence(
+    writer: &ArtifactRunWriter,
+    artifacts: &ChildAttemptArtifacts,
+    command: &ExternalAgentCommand,
+    runtime: SupervisorRuntime,
+) -> Result<Value> {
+    bound_review_evidence(
+        writer,
+        &ReviewAttemptSource::bind(writer, artifacts, command, runtime)?,
+    )
+}
+
+/// Nested sources come only from the imported journal set and authored Worker
+/// identity. The parent source attempt is checked before reading any receipt.
+pub(super) fn nested_review_evidence(
+    writer: &ArtifactRunWriter,
+    parent: &str,
+    worker: &str,
+    attempt: usize,
+) -> Result<Value> {
+    let root = PathBuf::from("nested")
+        .join(parent)
+        .join(format!("attempt-{attempt}"))
+        .join(worker);
+    let summary = root.join("command.json");
+    let bytes = writer.read_authenticated(&receipt_path(&summary), MAX_RECEIPT_BYTES)?;
+    let receipt: TargetContainmentReceipt = serde_json::from_slice(&bytes)?;
+    let expected = TargetBinding {
+        run_id: writer
+            .run_dir()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .context("review run directory has no identity")?
+            .to_owned(),
+        task_id: worker.to_owned(),
+        parent: Some(parent.to_owned()),
+        attempt,
+        role: "worker".to_owned(),
+        runtime: receipt.binding.runtime,
+        command_summary: summary,
+    };
+    review_commands::read_review_evidence(writer, &expected, &root.join("stdout.jsonl"))
+}
+
+/// Same authenticated summary/receipt projection as a current capture. The
+/// expected source run and physical Worker attempt are never rewritten.
+pub(super) fn historical_nested_review_evidence(
+    reader: &ArtifactRunReader,
+    parent: &str,
+    worker: &str,
+    attempt: usize,
+) -> Result<Value> {
+    let root = PathBuf::from("nested")
+        .join(parent)
+        .join(format!("attempt-{attempt}"))
+        .join(worker);
+    let expected = TargetBinding {
+        run_id: reader.finalization().run_id.clone(),
+        task_id: worker.to_owned(),
+        parent: Some(parent.to_owned()),
+        attempt,
+        role: "worker".to_owned(),
+        runtime: SupervisorRuntime::Codex,
+        command_summary: root.join("command.json"),
+    };
+    review_commands::read_finalized_review_evidence(reader, &expected, &root.join("stdout.jsonl"))
 }
 
 fn validate(
@@ -920,5 +1028,682 @@ mod tests {
             &run
         )
         .is_err());
+    }
+
+    // This is an offline capture fixture. It launches no provider or command.
+    #[cfg(unix)]
+    fn native_review_run(
+        fixture: &Fixture,
+        transcript: &str,
+        output: Option<&str>,
+    ) -> ExternalAgentRun {
+        use crate::external_agent::codex_app_server::{
+            CommandExecutionEvidence, CommandExecutionObservation, CommandExecutionSnapshot,
+            CommandExecutionStatus, TurnTerminalStatus,
+        };
+        let mut run = super::super::tests::injected_verified_run(&fixture.command);
+        let bytes =
+            crate::process_runner::CapturedBytes::from_bytes_for_test(transcript.as_bytes());
+        run.stdout = crate::external_agent::CapturedOutput::from_captured_bytes_for_test(&bytes);
+        run.stdout.target_launch_attempted = true;
+        let started = CommandExecutionSnapshot {
+            command: "/bin/bash -lc 'diagnostic'".to_owned(),
+            cwd: fixture.command.cwd.to_string_lossy().into_owned(),
+            status: CommandExecutionStatus::InProgress,
+            exit_code: None,
+            aggregated_output: None,
+            review_redacted: false,
+        };
+        run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+            thread_id: "private-thread-id".to_owned(),
+            turn_id: "private-turn-id".to_owned(),
+            turn_status: TurnTerminalStatus::Completed,
+            observations: vec![CommandExecutionObservation::Complete {
+                item_id: "native-command-id".to_owned(),
+                started: started.clone(),
+                completed: CommandExecutionSnapshot {
+                    status: CommandExecutionStatus::Failed,
+                    exit_code: Some(7),
+                    aggregated_output: output.map(str::to_owned),
+                    ..started
+                },
+            }],
+        });
+        run
+    }
+
+    #[cfg(unix)]
+    fn retain_review_fixture(fixture: &mut Fixture, run: &ExternalAgentRun) -> Result<()> {
+        // The real importer writes the held stream after persisting the existing
+        // command summary and target receipt.
+        persist(
+            &mut fixture.writer,
+            &fixture.artifacts,
+            &fixture.command,
+            SupervisorRuntime::Codex,
+            run,
+        )?;
+        fixture.writer.write_bytes(
+            &fixture.artifacts.raw_stdout_relative,
+            run.stdout_bytes(),
+            ArtifactFileDisposition::PrivateEvidence,
+        )?;
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    fn read_review_fixture(fixture: &Fixture) -> Result<Value> {
+        review_evidence(
+            &fixture.writer,
+            &fixture.artifacts,
+            &fixture.command,
+            SupervisorRuntime::Codex,
+        )
+    }
+
+    #[test]
+    #[cfg(unix)] // Uses the existing owned-pipe CapturedBytes injection seam.
+    fn bounded_review_preserves_native_result_when_only_raw_result_is_in_omitted_middle(
+    ) -> Result<()> {
+        use crate::review::{
+            build_bounded_review_lens_request, BoundedReviewLensRequestSources,
+            ReviewLensBindingMaterial, ReviewLensScopedInformation,
+        };
+        let mut fixture = fixture();
+        let output = "{\"first\":1}\n{\"second\":2}\n";
+        let middle = json!({
+            "method":"item/completed",
+            "params":{"threadId":"private-thread-id","turnId":"private-turn-id",
+                "item":{"id":"native-command-id","type":"commandExecution",
+                    "command":"/bin/bash -lc 'diagnostic'",
+                    "cwd":fixture.command.cwd,"status":"failed","exitCode":7,
+                    "aggregatedOutput":output}}
+        })
+        .to_string();
+        let pad = "irrelevant reasoning\n".repeat(REVIEW_LENS_REQUEST_LIMIT_BYTES / 10);
+        let transcript = format!("{pad}{middle}\n{pad}");
+        let run = native_review_run(&fixture, &transcript, Some(output));
+        retain_review_fixture(&mut fixture, &run)?;
+        let evidence = read_review_fixture(&fixture)?;
+        assert_eq!(evidence["review_complete"], true);
+        assert_eq!(evidence["target_quiescence_verified"], true);
+        let observed = &evidence["commands"]["commands"][0];
+        assert_eq!(
+            observed["native_command"]["text"],
+            "/bin/bash -lc 'diagnostic'"
+        );
+        assert_eq!(observed["cwd"]["text"], json!(fixture.command.cwd));
+        assert_eq!(observed["status"], "failed");
+        assert_eq!(observed["exit_code"], 7);
+        assert_eq!(observed["aggregated_output"]["text"], output);
+        assert_eq!(observed["stdout"], "unavailable");
+        assert_eq!(observed["stderr"], "unavailable");
+        assert_eq!(observed["argv"], json!(["/bin/bash", "-lc", "diagnostic"]));
+        assert_eq!(observed["argv_status"], "captured");
+        assert_eq!(
+            super::super::researcher::observed_command_argv("/bin/bash -c '  diagnostic\n'"),
+            Some(vec![
+                "/bin/bash".to_owned(),
+                "-c".to_owned(),
+                "  diagnostic\n".to_owned()
+            ])
+        );
+        assert_eq!(
+            super::super::researcher::observed_command_argv("/bin/bash -lc '$UNEXPANDED' extra"),
+            None
+        );
+        assert_eq!(evidence["acceptance_authority"], false);
+        let semantic = serde_json::to_string(&evidence)?;
+        for excluded in [
+            "irrelevant reasoning",
+            "private-thread-id",
+            "private-turn-id",
+            "codex_permissions",
+            "command_seal_snapshot",
+            "budget_interruption",
+        ] {
+            assert!(
+                !semantic.contains(excluded),
+                "unexpected field/content: {excluded}"
+            );
+        }
+        let binding = json!({"agent_id":"research","diff_oid":"candidate"});
+        let bindings = ReviewLensBindingMaterial {
+            candidate_binding: json!({"supervisor_inspected":binding}),
+            path_bindings: json!({"assigned_paths":["README.md"]}),
+            validation_bindings: json!({"native_execution_evidence":{
+                "required_for_acceptance":true,"candidate_binding":binding,
+                "review_complete":true,"targets":[evidence]
+            }}),
+        };
+        let lens = super::super::tests::single_parent_acceptance_review_lenses().remove(0);
+        let sources = BoundedReviewLensRequestSources {
+            child_transcript: &transcript,
+            authoritative_transcript_path: &fixture.artifacts.raw_stdout_relative,
+            diff: "+diagnostic review\n",
+            output_report: "{\"claim\":\"success\"}",
+            bindings: &bindings,
+        };
+        let request = build_bounded_review_lens_request(&lens, sources)?;
+        let ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript,
+            bindings: received,
+            ..
+        } = &request.information
+        else {
+            panic!("missing bounded full transcript")
+        };
+        assert!(child_transcript.truncated);
+        assert!(child_transcript.omitted_bytes > 0);
+        assert!(!child_transcript.head_excerpt.contains("native-command-id"));
+        assert!(!child_transcript.tail_excerpt.contains("native-command-id"));
+        assert_eq!(received, &bindings);
+        // A changed result must change the request identity, even when the raw
+        // result would be entirely outside the selected transcript excerpts.
+        let mut changed = bindings.clone();
+        changed.validation_bindings["native_execution_evidence"]["targets"][0]["commands"]
+            ["commands"][0]["exit_code"] = json!(9);
+        let altered = build_bounded_review_lens_request(
+            &lens,
+            BoundedReviewLensRequestSources {
+                bindings: &changed,
+                ..sources
+            },
+        )?;
+        assert_ne!(request.request_binding, altered.request_binding);
+        for scope in [
+            ReviewInformationScope::DiffOnly,
+            ReviewInformationScope::OutputReportOnly,
+        ] {
+            let mut narrow = lens.clone();
+            narrow.information_scope = scope;
+            let request = build_bounded_review_lens_request(&narrow, sources)?;
+            let serialized = serde_json::to_string(&request)?;
+            for excluded in [
+                "native_execution_evidence",
+                "target_quiescence_verified",
+                "aggregated_output",
+                "native-command-id",
+            ] {
+                assert!(!serialized.contains(excluded));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn native_large_fields_remain_reviewable_with_all_commands_and_bounded_honest_views(
+    ) -> Result<()> {
+        use crate::review::{
+            build_bounded_review_lens_request, BoundedReviewLensRequestSources,
+            ReviewLensBindingMaterial, ReviewLensScopedInformation,
+        };
+        let mut fixture = fixture();
+        fixture.command = fixture
+            .command
+            .clone()
+            .with_workspace_access(WorkspaceAccess::ReadOnly)
+            .with_model_selection(Some("fixture-model".into()), Some("xhigh".into()));
+        // Explicit protocol fixture custody; no provider/process is launched.
+        for path in [
+            &fixture.artifacts.prompt_path,
+            &fixture.artifacts.log_path,
+            &fixture.artifacts.report_path,
+        ] {
+            fs::create_dir_all(path.parent().unwrap())?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o700))?;
+            }
+        }
+        fs::write(
+            &fixture.artifacts.prompt_path,
+            "inspect the controlled native field fixture",
+        )?;
+        fs::write(&fixture.artifacts.report_path, "{}")?;
+        let sizes = [26895, 16849, 43076, 20676, 44002, 27527, 36772, 19012];
+        let outputs = sizes
+            .iter()
+            .enumerate()
+            .map(|(index, size)| {
+                format!(
+                    "native field {index}\n{}",
+                    "x".repeat(*size - format!("native field {index}\n").len())
+                )
+            })
+            .collect::<Vec<_>>();
+        assert!(outputs.iter().map(String::len).sum::<usize>() > 64 * 1024);
+        let mut items = Vec::new();
+        for (index, output) in outputs.iter().enumerate() {
+            items.extend(super::super::tests::review_command_items(
+                &fixture.command,
+                &format!("native-result-{index}"),
+                &format!("/bin/bash -lc 'inspect-{index}'"),
+                0,
+                Some(output),
+            ));
+        }
+        let mut run = super::super::tests::injected_verified_run(&fixture.command);
+        super::super::tests::retained_review_turn_fixture(&fixture.command, &mut run, items, 8, 3);
+        assert_eq!(
+            run.codex_command_execution_evidence()
+                .unwrap()
+                .observations
+                .len(),
+            sizes.len()
+        );
+        retain_review_fixture(&mut fixture, &run)?;
+        let evidence = read_review_fixture(&fixture)?;
+        assert_eq!(
+            evidence["review_complete"],
+            true,
+            "native large-field review conditions: {}",
+            {
+                // Only bounded typed conditions: never print protocol text, command
+                // identities, hashes, paths, or private parent evidence on failure.
+                let status = |value: &Value| match value.as_str() {
+                    Some("captured") => "captured",
+                    Some("unavailable") => "unavailable",
+                    Some("incomplete") => "incomplete",
+                    Some("oversize") => "oversize",
+                    Some("redacted") => "redacted",
+                    _ => "invalid_or_missing",
+                };
+                let capture = &evidence["commands"];
+                let commands = capture["commands"].as_array().map(|commands| {
+                    commands.iter().take(8).map(|command| {
+                    let output = &command["aggregated_output"];
+                    json!({
+                        "command":status(&command["native_command"]["status"]),
+                        "argv":status(&command["argv_status"]),
+                        "cwd":status(&command["cwd"]["status"]),
+                        "output":status(&output["status"]),
+                        "output_bytes":output["original_bytes"].as_u64(),
+                        "output_text_present":output["text"].is_string(),
+                        "output_hash_present":output["sha256"].is_string(),
+                        "output_view_hash_present":output["view_sha256"].is_string(),
+                        "output_view_truncated":output["view_truncated"].as_bool(),
+                        "terminal_exit_consistent":
+                            (command["status"] == "completed" && command["exit_code"] == 0)
+                            || (command["status"] == "failed"
+                                && command["exit_code"].as_i64().is_some_and(|code| code != 0)),
+                    })
+                }).collect::<Vec<_>>()
+                });
+                let observations = run.codex_command_execution_evidence().unwrap()
+                .observations.iter().take(8).map(|observation| match observation {
+                    crate::external_agent::codex_app_server::CommandExecutionObservation::Complete {
+                        started, completed, ..
+                    } => format!("complete; redacted={}; start_valid={}; command_matches={}; cwd_matches={}",
+                        started.review_redacted || completed.review_redacted,
+                        started.status == crate::external_agent::codex_app_server::CommandExecutionStatus::InProgress
+                            && started.exit_code.is_none(),
+                        started.command == completed.command,
+                        started.cwd == completed.cwd),
+                    crate::external_agent::codex_app_server::CommandExecutionObservation::Incomplete {
+                        reason, ..
+                    } => format!("incomplete: {reason:?}"),
+                }).collect::<Vec<_>>();
+                let parent = run.authenticated_app_server_evidence();
+                json!({
+                    "quiescence_verified":evidence["target_quiescence_verified"].as_bool(),
+                    "capture_version":capture["version"].as_u64(),
+                    "capture_status":status(&capture["status"]),
+                    "host_completed":capture["host_process_completed"].as_bool(),
+                    "source_truncated":capture["source_truncated"].as_bool(),
+                    "turn_completed":capture["turn_status"] == "completed",
+                    "thread_hash_present":capture["thread_id_sha256"].is_string(),
+                    "turn_hash_present":capture["turn_id_sha256"].is_string(),
+                    "observation_count":capture["observation_count"].as_u64(),
+                    "command_count":capture["commands"].as_array().map(Vec::len),
+                    "run_publishable":run.publishable,
+                    "run_exit":run.exit_code,
+                    "run_timed_out":run.timed_out,
+                    "run_error_present":run.error.is_some(),
+                    "run_safety_verified":external_safety_verified(&run, SupervisorRuntime::Codex),
+                    "parent_identity_matches":parent.is_some_and(|parent| parent.identity_matches_request()),
+                    "parent_resolution_complete":parent.is_some_and(|parent| parent.resolution_status == "complete"),
+                    "parent_matches_retained":parent == run.codex_parent_evidence.as_ref(),
+                    "usage_available":run.authenticated_codex_usage().is_some(),
+                    "auditor_effort_qualified":run.codex_auditor_effort_qualified(),
+                    "observations":observations,
+                    "commands":commands,
+                })
+            }
+        );
+        assert_eq!(evidence["source_bytes"], run.stdout_bytes().len());
+        assert_eq!(evidence["source_sha256"], sha256_hex(run.stdout_bytes()));
+        let commands = evidence["commands"]["commands"].as_array().unwrap();
+        assert_eq!(
+            commands.len(),
+            sizes.len(),
+            "a large view must not drop command identities"
+        );
+        assert!(serde_json::to_vec(&evidence["commands"])?.len() <= 64 * 1024);
+        for (index, observed) in commands.iter().enumerate() {
+            assert_eq!(
+                observed["item_id_sha256"],
+                sha256_hex(format!("native-result-{index}").as_bytes())
+            );
+            assert_eq!(
+                observed["native_command"]["text"],
+                format!("/bin/bash -lc 'inspect-{index}'")
+            );
+            assert_eq!(
+                observed["argv"],
+                json!(["/bin/bash", "-lc", format!("inspect-{index}")])
+            );
+            assert_eq!(observed["cwd"]["text"], json!(fixture.command.cwd));
+            assert_eq!(observed["status"], "completed");
+            assert_eq!(observed["exit_code"], 0);
+            let output = &observed["aggregated_output"];
+            assert_eq!(
+                output["status"], "captured",
+                "native field is fully observed"
+            );
+            assert_eq!(output["original_bytes"], sizes[index]);
+            assert_eq!(output["sha256"], sha256_hex(outputs[index].as_bytes()));
+            assert_eq!(output["view_truncated"], true, "review view is an excerpt");
+            assert!(output["omitted_bytes"].as_u64().unwrap() > 0);
+            let text = output["text"].as_str().unwrap();
+            assert!(text.len() < 3 * 1024);
+            assert!(text.contains("omitted from review view"));
+            assert_ne!(text, outputs[index]);
+            assert_eq!(output["view_sha256"], sha256_hex(text.as_bytes()));
+            assert_eq!(observed["stdout"], "unavailable");
+            assert_eq!(observed["stderr"], "unavailable");
+        }
+        let candidate = json!({"agent_id":"research","diff_oid":"large-field-candidate"});
+        let bindings = ReviewLensBindingMaterial {
+            candidate_binding: json!({"supervisor_inspected":candidate}),
+            path_bindings: json!({"assigned_paths":["README.md"]}),
+            validation_bindings: json!({"native_execution_evidence":{
+                "required_for_acceptance":true, "candidate_binding":candidate,
+                "review_complete":evidence["review_complete"], "targets":[evidence]
+            }}),
+        };
+        let lens = super::super::tests::single_parent_acceptance_review_lenses().remove(0);
+        let transcript = std::str::from_utf8(run.stdout_bytes())?;
+        let sources = BoundedReviewLensRequestSources {
+            child_transcript: transcript,
+            authoritative_transcript_path: &fixture.artifacts.raw_stdout_relative,
+            diff: "+controlled fixture\n",
+            output_report: "{}",
+            bindings: &bindings,
+        };
+        let request = build_bounded_review_lens_request(&lens, sources)?;
+        assert!(serde_json::to_vec(&request)?.len() <= REVIEW_LENS_REQUEST_LIMIT_BYTES);
+        let ReviewLensScopedInformation::BoundedFullChildTranscript {
+            child_transcript,
+            bindings: retained,
+            ..
+        } = &request.information
+        else {
+            panic!("expected bounded full review");
+        };
+        assert!(child_transcript.truncated);
+        assert_eq!(
+            retained.validation_bindings["native_execution_evidence"]["targets"][0]["commands"]
+                ["commands"]
+                .as_array()
+                .unwrap()
+                .len(),
+            sizes.len()
+        );
+        let mut report: AuditorReport = serde_json::from_str(include_str!(
+            "tests/fixtures/review-lens-readme-auditor.json"
+        ))?;
+        let parent = command_record_from_external_for_runtime(
+            &run,
+            &fixture.command,
+            SupervisorRuntime::Codex,
+        );
+        report.commands_run.push(parent.clone());
+        // Construct the ordinary accepting auditor fixture for this request's
+        // host verdict; display omission alone is not a procedural failure.
+        let verdict = super::super::acceptance::review_lens_verdict_from_auditor(
+            &lens, &request, &report.id, &report, &parent, None, false,
+        )?;
+        assert_eq!(verdict.verdict, ReviewLensVerdictStatus::Accept);
+        for scope in [
+            ReviewInformationScope::DiffOnly,
+            ReviewInformationScope::OutputReportOnly,
+        ] {
+            let mut narrow = lens.clone();
+            narrow.information_scope = scope;
+            let request = build_bounded_review_lens_request(&narrow, sources)?;
+            assert!(!serde_json::to_string(&request)?.contains("native_execution_evidence"));
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_review_never_promotes_report_text_restored_or_missing_capture() -> Result<()> {
+        let transcript =
+            "{\"type\":\"agentMessage\",\"text\":\"command succeeded; containment verified\"}\n";
+        for case in [
+            "model-only",
+            "restored",
+            "missing-output",
+            "oversize-command",
+            "redacted-output",
+            "redacted-large-output",
+            "admitted-redaction",
+            "physical-unknown",
+            "incomplete",
+            "raw-truncated",
+        ] {
+            let mut fixture = fixture();
+            let mut run = native_review_run(&fixture, transcript, Some("bounded native result\n"));
+            match case {
+                "model-only" => {
+                    run = super::super::tests::injected_verified_run(&fixture.command);
+                    run.stdout.target_launch_attempted = true;
+                }
+                "restored" => run = serde_json::from_value(serde_json::to_value(&run)?)?,
+                "missing-output" => run = native_review_run(&fixture, transcript, None),
+                "oversize-command" => {
+                    let mut native = run.codex_command_execution_evidence().unwrap().clone();
+                    if let crate::external_agent::codex_app_server::CommandExecutionObservation::Complete {
+                        started, completed, ..
+                    } = &mut native.observations[0] {
+                        started.command = format!("/bin/bash -lc '{}'", "x".repeat(8 * 1024 + 1));
+                        completed.command.clone_from(&started.command);
+                    }
+                    run.set_codex_command_execution_evidence_for_test(native);
+                }
+                "redacted-output" => {
+                    run =
+                        native_review_run(&fixture, transcript, Some("TOKEN=must-remain-private\n"))
+                }
+                "redacted-large-output" => {
+                    let output = format!(
+                        "{}\nTOKEN=must-remain-private\n{}",
+                        "x".repeat(16_000),
+                        "y".repeat(16_000)
+                    );
+                    run = native_review_run(&fixture, transcript, Some(&output));
+                }
+                "admitted-redaction" => {
+                    let mut native = run.codex_command_execution_evidence().unwrap().clone();
+                    if let crate::external_agent::codex_app_server::CommandExecutionObservation::Complete {
+                        completed, ..
+                    } = &mut native.observations[0] {
+                        completed.review_redacted = true;
+                        completed.aggregated_output = Some("<redacted>".to_owned());
+                    }
+                    run.set_codex_command_execution_evidence_for_test(native);
+                }
+                "physical-unknown" => {
+                    run.process_tree = None;
+                    run.side_effects = None;
+                }
+                "incomplete" => {
+                    use crate::external_agent::codex_app_server::{
+                        CommandExecutionEvidence, CommandExecutionObservation,
+                        CommandExecutionObservationIssue, TurnTerminalStatus,
+                    };
+                    run.set_codex_command_execution_evidence_for_test(CommandExecutionEvidence {
+                        thread_id: "thread".into(),
+                        turn_id: "turn".into(),
+                        turn_status: TurnTerminalStatus::Completed,
+                        observations: vec![CommandExecutionObservation::Incomplete {
+                            item_id: "missing-result".into(),
+                            started: None,
+                            reason:
+                                CommandExecutionObservationIssue::MissingOrInvalidCompletedFields,
+                        }],
+                    });
+                }
+                "raw-truncated" => {
+                    let bytes =
+                        crate::process_runner::CapturedBytes::from_bytes_with_truncation_for_test(
+                            transcript.as_bytes(),
+                            true,
+                        );
+                    // Preserve the held semantic observations while replacing
+                    // only their source capture with explicitly lossy bytes.
+                    let native = run.codex_command_execution_evidence().unwrap().clone();
+                    run.stdout =
+                        crate::external_agent::CapturedOutput::from_captured_bytes_for_test(&bytes);
+                    run.stdout.target_launch_attempted = true;
+                    run.set_codex_command_execution_evidence_for_test(native);
+                }
+                _ => unreachable!(),
+            }
+            let retained = retain_review_fixture(&mut fixture, &run);
+            if case == "physical-unknown" {
+                // Existing helper-inventory refusal stays binding, after the
+                // summary and unknown target facts have been retained.
+                assert!(retained.is_err());
+                fixture.writer.write_bytes(
+                    &fixture.artifacts.raw_stdout_relative,
+                    run.stdout_bytes(),
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+            } else {
+                retained?;
+            }
+            let evidence = read_review_fixture(&fixture)?;
+            assert_eq!(evidence["review_complete"], false, "{case}");
+            assert_eq!(evidence["acceptance_authority"], false);
+            if matches!(case, "model-only" | "restored" | "physical-unknown") {
+                assert_eq!(evidence["target_quiescence_verified"], false);
+                assert_eq!(evidence["target_process_tree"]["status"], "unknown");
+                assert_eq!(evidence["target_side_effects"]["status"], "unknown");
+            }
+            assert!(!serde_json::to_string(&evidence)?.contains("must-remain-private"));
+            let expected = binding(
+                fixture.writer.run_dir(),
+                &fixture.artifacts,
+                &fixture.command,
+                SupervisorRuntime::Codex,
+            )?;
+            let reader = finalize(fixture.writer, &fixture.repo, &fixture.run_id);
+            let historical = review_commands::read_finalized_review_evidence(
+                &reader,
+                &expected,
+                &fixture.artifacts.raw_stdout_relative,
+            )?;
+            assert_eq!(historical, evidence, "finalization promoted {case}");
+            assert_eq!(historical["review_complete"], false, "{case}");
+        }
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn native_review_refuses_foreign_attempt_and_missing_or_changed_authenticated_source(
+    ) -> Result<()> {
+        let mut fixture = fixture();
+        let run = native_review_run(&fixture, "native capture\n", Some("observed output"));
+        retain_review_fixture(&mut fixture, &run)?;
+        let mut foreign = fixture.command.clone();
+        foreign.assignment_process_launch_attempt = Some(3);
+        assert!(review_evidence(
+            &fixture.writer,
+            &fixture.artifacts,
+            &foreign,
+            SupervisorRuntime::Codex
+        )
+        .is_err());
+        let source = fixture
+            .writer
+            .run_dir()
+            .join(&fixture.artifacts.raw_stdout_relative);
+        let bytes = fs::read(&source)?;
+        fs::write(&source, b"changed native capture")?;
+        assert!(read_review_fixture(&fixture).is_err());
+        fs::write(&source, bytes)?;
+        fs::remove_file(&source)?;
+        assert!(read_review_fixture(&fixture).is_err());
+        Ok(())
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn nested_review_keeps_native_facts_bound_to_parent_worker_and_attempt() -> Result<()> {
+        let mut fixture = fixture();
+        let root = PathBuf::from("nested/parent/attempt-2/research");
+        fixture.artifacts = ChildAttemptArtifacts {
+            prompt_path: fixture.writer.run_dir().join(&root).join("prompt.md"),
+            report_path: fixture.writer.run_dir().join("incoming/report.json"),
+            log_path: fixture.writer.run_dir().join("capture/events.jsonl"),
+            raw_report_relative: root.join("report.json"),
+            raw_stdout_relative: root.join("stdout.jsonl"),
+            command_record_relative: root.join("command.json"),
+        };
+        fixture.command = ExternalAgentCommand::codex(
+            "unused-codex",
+            &fixture.repo,
+            &fixture.artifacts.prompt_path,
+            &fixture.artifacts.log_path,
+            &fixture.artifacts.report_path,
+            Duration::from_secs(1),
+        )
+        .with_agent_lifecycle(&fixture.repo, "worker", fixture.run_id.as_str(), "research")
+        .with_agent_parent("parent");
+        fixture.command.assignment_process_launch_attempt = Some(2);
+        let run = native_review_run(
+            &fixture,
+            "native Worker source\n",
+            Some("native Worker output"),
+        );
+        retain_review_fixture(&mut fixture, &run)?;
+        let evidence = nested_review_evidence(&fixture.writer, "parent", "research", 2)?;
+        assert_eq!(evidence["binding"]["parent"], "parent");
+        assert_eq!(evidence["binding"]["task_id"], "research");
+        assert_eq!(evidence["binding"]["attempt"], 2);
+        assert_eq!(evidence["review_complete"], true);
+        for (parent, worker, attempt) in [
+            ("foreign", "research", 2),
+            ("parent", "foreign", 2),
+            ("parent", "research", 3),
+        ] {
+            assert!(nested_review_evidence(&fixture.writer, parent, worker, attempt).is_err());
+        }
+        let reader = finalize(fixture.writer, &fixture.repo, &fixture.run_id);
+        assert_eq!(
+            historical_nested_review_evidence(&reader, "parent", "research", 2)?,
+            evidence,
+        );
+        for (parent, worker, attempt) in [
+            ("foreign", "research", 2),
+            ("parent", "foreign", 2),
+            ("parent", "research", 3),
+        ] {
+            assert!(historical_nested_review_evidence(&reader, parent, worker, attempt).is_err());
+        }
+        let source =
+            crate::artifacts::run_dir(&fixture.repo, RunArtifactFamily::Supervise, &fixture.run_id)
+                .join(&fixture.artifacts.raw_stdout_relative);
+        fs::write(&source, b"corrupt historical capture")?;
+        assert!(historical_nested_review_evidence(&reader, "parent", "research", 2).is_err());
+        fs::remove_file(&source)?;
+        assert!(historical_nested_review_evidence(&reader, "parent", "research", 2).is_err());
+        Ok(())
     }
 }

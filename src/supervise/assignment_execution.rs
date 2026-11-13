@@ -3204,7 +3204,7 @@ fn prepare_child_attempt_with_purpose<'a>(
         command,
         launch_runtime,
         assignment.role,
-        managed_parent,
+        managed_parent || evidence_only_reaudit.is_some(),
     );
     if managed_parent && launch_runtime == SupervisorRuntime::Codex {
         command = if matches!(purpose, ChildAttemptPurpose::ManagedParentInitial) {
@@ -3541,6 +3541,8 @@ struct CollectedChildAttempt<'a> {
     model_provenance: CompletedLaunchModelProvenance,
     external_run: ExternalAgentRun,
     _worker_journal_evidence: WorkerExecutionJournalEvidenceSet,
+    // Descriptive sources only; no live command, grant or capture owner.
+    review_preceding_sources: Vec<super::target_containment::ReviewAttemptSource>,
     _primary_after: PrimaryWorktreeSnapshot,
     _primary_scope_after: Option<PrimaryScopeSnapshot>,
     _budget_reservation: DispatchBudgetReservation<'a>,
@@ -6188,6 +6190,7 @@ fn collect_captured_child_attempt<'a>(
         model_provenance,
         external_run,
         _worker_journal_evidence: worker_journal_evidence,
+        review_preceding_sources: Vec::new(),
         _primary_after: primary_after,
         _primary_scope_after: primary_scope_after,
         _budget_reservation: budget_reservation,
@@ -6395,6 +6398,7 @@ fn decide_child_attempt(
         model_provenance: _,
         external_run,
         _worker_journal_evidence,
+        review_preceding_sources: _,
         _primary_after,
         _budget_reservation,
         _capture_scratch,
@@ -8599,7 +8603,18 @@ fn execute_supervisor_assignment_inner(
                         return Err(error);
                     }
                 };
+                let mut collected = collected;
                 let attempted_launch_model_provenance = collected.model_provenance.clone();
+                let mut review_sources = std::mem::take(&mut collected.review_preceding_sources);
+                let review_source = with_supervisor_artifacts(artifacts, |writer, _| {
+                    super::target_containment::ReviewAttemptSource::bind(
+                        writer,
+                        &collected.attempt_artifacts,
+                        &collected._command,
+                        collected.model_provenance.launch_runtime,
+                    )
+                })?;
+                review_sources.push(review_source);
                 let attempt_external_run = collected.external_run.clone();
                 review_worker_journals.clone_from(&collected._worker_journal_evidence);
                 let disposition = match decide_child_attempt(
@@ -8676,8 +8691,12 @@ fn execute_supervisor_assignment_inner(
                         containment_verified,
                         gate_terminal,
                     } => {
-                        child_result =
-                            Some((report, attempted_launch_model_provenance, recorded_attempt));
+                        child_result = Some((
+                            report,
+                            attempted_launch_model_provenance,
+                            recorded_attempt,
+                            review_sources,
+                        ));
                         child_containment_verified = containment_verified;
                         child_gate_terminal = gate_terminal;
                         break;
@@ -8689,6 +8708,7 @@ fn execute_supervisor_assignment_inner(
                 mut child_report,
                 child_launch_model_provenance,
                 mut terminal_attempt_outcome,
+                review_sources,
             )) = child_result
             else {
                 let error = anyhow!(
@@ -8888,10 +8908,29 @@ fn execute_supervisor_assignment_inner(
                     pre_auditor_candidate.as_ref(),
                     parent_held_out.as_ref(),
                 )?;
-                review_bindings.validation_bindings["worker_execution_evidence"] =
+                let (worker_evidence, native_evidence) =
                     with_supervisor_artifacts(artifacts, |writer, _| {
-                        review_handoff::worker_evidence(writer, &review_worker_journals)
+                        review_handoff::execution_evidence(
+                            writer,
+                            review_handoff::NativeReviewSources {
+                                assignment,
+                                sources: &review_sources,
+                                source_attempt: terminal_attempt_outcome.attempt,
+                                journals: &review_worker_journals,
+                                candidate: pre_auditor_candidate
+                                    .as_ref()
+                                    .context("native review has no inspected candidate")?,
+                                repo,
+                                evidence_only_source: context.evidence_only_reaudit,
+                                required_for_acceptance: context.execution_runtime
+                                    == SupervisorExecutionRuntime::Verified
+                                    && child_launch_model_provenance.launch_runtime
+                                        == SupervisorRuntime::Codex,
+                            },
+                        )
                     })?;
+                review_bindings.validation_bindings["worker_execution_evidence"] = worker_evidence;
+                review_bindings.validation_bindings["native_execution_evidence"] = native_evidence;
                 let sources = crate::review::BoundedReviewLensRequestSources {
                     child_transcript: &child_transcript,
                     authoritative_transcript_path: transcript_relative,

@@ -1434,7 +1434,24 @@ pub(super) fn review_lens_verdict_from_auditor(
         } else {
             true
         };
-    let verdict = if process_procedural_failure || !structurally_valid {
+    // Only the host-built expected request supplies this requirement. A model
+    // cannot repair missing native capture by asserting success in its report.
+    let native_evidence_incomplete = match &expected_request.information {
+        crate::review::ReviewLensScopedInformation::BoundedFullChildTranscript {
+            bindings, ..
+        } => bindings
+            .validation_bindings
+            .get("native_execution_evidence")
+            .is_some_and(|native| {
+                native["required_for_acceptance"].as_bool() == Some(true)
+                    && (native["review_complete"].as_bool() != Some(true)
+                        || native["candidate_binding"]
+                            != bindings.candidate_binding["supervisor_inspected"])
+            }),
+        _ => false,
+    };
+    let verdict = if process_procedural_failure || !structurally_valid || native_evidence_incomplete
+    {
         ReviewLensVerdictStatus::ProceduralFailure
     } else if report.accepted && !report.rejected && report.status == ReviewStatus::Succeeded {
         ReviewLensVerdictStatus::Accept
