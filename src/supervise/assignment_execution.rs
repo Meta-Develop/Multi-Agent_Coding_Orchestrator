@@ -3062,7 +3062,16 @@ fn prepare_child_attempt_with_purpose<'a>(
         }
     }
     let attempt_prompt = match retry_feedback {
-        Some(ChildAttemptCorrection::StructuralReport) => prompt_with_structural_retry(&prompt),
+        Some(ChildAttemptCorrection::StructuralReport(shape_problems)) => {
+            let report_type = if assignment.role == AgentRole::Worker
+                && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
+            {
+                "WorkerReport"
+            } else {
+                "OrchestratorReviewReport"
+            };
+            prompt_with_structural_retry(&prompt, report_type, shape_problems)
+        }
         Some(ChildAttemptCorrection::Gate(denial, auditor_findings)) => {
             prompt_with_gate_correction(&prompt, denial, auditor_findings)?
         }
@@ -6640,7 +6649,7 @@ fn decide_child_attempt(
                 "scope": "attempt",
                 "attempt": attempt,
                 "reason": "structural report requires corrective retry",
-                "structural_problems": report_shape_problems,
+                "structural_problems": report_shape_problems.clone(),
             }),
         )?;
         record_shared_orchestration_event(
@@ -6652,7 +6661,9 @@ fn decide_child_attempt(
             lifecycle_event_payload("retrying", Some(attempt), None),
         )?;
         *structural_attempt = structural_attempt.saturating_add(1);
-        *retry_feedback = Some(ChildAttemptCorrection::StructuralReport);
+        *retry_feedback = Some(ChildAttemptCorrection::StructuralReport(
+            report_shape_problems,
+        ));
         return Ok(ChildAttemptDisposition::Retry);
     }
     let validation_blocker = if attempt_report.validation_results.is_empty() {

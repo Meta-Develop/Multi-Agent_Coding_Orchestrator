@@ -47,16 +47,44 @@ pub(super) fn worker_execution_journal_evidence_relative(
         .join(worker_execution_journal_file_name(worker_id))
 }
 
-pub(super) fn prompt_with_structural_retry(prompt: &str) -> String {
-    format!(
-        r#"{prompt}
+pub(super) fn prompt_with_structural_retry(
+    prompt: &str,
+    report_type: &str,
+    shape_problems: &[String],
+) -> String {
+    const MAX_PROBLEMS: usize = 8;
+    const MAX_PROBLEM_BYTES: usize = 1000;
+    if report_type != "WorkerReport" {
+        return format!(
+            "{prompt}\n\nSTRUCTURAL REPORT RETRY:\nThe previous response did not satisfy the trusted report schema.\n\nReturn only a compliant OrchestratorReviewReport JSON final response matching the schema. Do not include Markdown fences, prose, or any non-JSON wrapper.\n"
+        );
+    }
+    let mut result = format!(
+        "{prompt}\n\nSTRUCTURAL REPORT RETRY:\nThe previous response did not satisfy the trusted report schema.\n\nProblems found by the supervisor:\n"
+    );
+    for problem in shape_problems.iter().take(MAX_PROBLEMS) {
+        result.push_str("- ");
+        result.push_str(truncate_at_char_boundary(problem, MAX_PROBLEM_BYTES));
+        result.push('\n');
+    }
+    result.push_str(
+        "If your earlier changes are present in the worktree, keep them and do not redo completed work.\n",
+    );
+    result.push_str(&format!(
+        "Return only a compliant {report_type} JSON final response matching the schema. Do not include Markdown fences, prose, or any non-JSON wrapper.\n"
+    ));
+    result
+}
 
-STRUCTURAL REPORT RETRY:
-The previous response did not satisfy the trusted report schema.
-
-Return only a compliant OrchestratorReviewReport JSON final response matching the schema. Do not include Markdown fences, prose, or any non-JSON wrapper.
-"#
-    )
+fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    &value[..end]
 }
 
 pub(super) fn prompt_with_gate_correction(
