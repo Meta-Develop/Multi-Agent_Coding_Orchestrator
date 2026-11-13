@@ -35,7 +35,8 @@ lane-check s2 1200 'cargo test --locked --lib supervise::tests::budget::'
 | `supervise::tests::licensed_breakage` | `lib supervise-fixtures-licensed` |
 | `supervise::tests::plan_runtime`, `run_artifacts`, `qualification_handoff`, `reaudit` | `lib supervise-fixtures-runtime` |
 | Other `supervise::tests`, including new fixture modules | `lib supervise-fixtures` |
-| `external_agent` | `lib external-agent` |
+| `external_agent::vibe_tests`, `grok_worker_journal_binding_tests`, `worker_journal_append_binding_tests` | `lib external-agent-journal` |
+| Other `external_agent` | `lib external-agent` |
 | `worktree` | `lib worktree` |
 | Other library modules | `lib rest` |
 | `tests/merge_cli.rs`, `tests/pr_issue_cli.rs` | `non-lib merge` |
@@ -61,7 +62,7 @@ changes warrant all affected partitions, often the complete matrix.
 
 Doctests have a separate required execution because neither `--lib` nor explicit
 integration targets run them. The `supervise-decomposition` CI job runs them
-after its source-bound build and checks the full inventory against all fourteen
+after its source-bound build and checks the full inventory against all fifteen
 library shards, both integration shards and rustdoc. The check compares test
 occurrences, so repeated names in separate binaries remain distinct; explicit
 Criterion benchmarks are retained in addition to Cargo's default test set.

@@ -18,7 +18,8 @@ from typing import Sequence
 SHARDS = (
     "autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
     "supervise-nested-driver", "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
-    "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest",
+    "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "external-agent-journal",
+    "worktree", "rest",
 )
 # Balance the former 2,285-second hosted job using CT101's full fixture run:
 # approximately 824/668/875/755 summed test seconds (three test threads).
@@ -42,6 +43,15 @@ NESTED_DRIVER_PREFIXES = (
     "supervise::assignment_execution::worker_dispatch_limits_tests::",
     "supervise::assignment_execution::isolated_worker_evidence_tests::",
     "supervise::assignment_execution::messaging_ipc_tests::",
+)
+# Split the former external-agent job (hosted 20-45 minutes, cancelled at its
+# 45-minute limit in run 43372905095): these journal and binding modules hold
+# 13 of its 15 bodies that run over 60 seconds. New external_agent modules stay
+# in external-agent.
+EXTERNAL_AGENT_JOURNAL_PREFIXES = (
+    "external_agent::vibe_tests::",
+    "external_agent::grok_worker_journal_binding_tests::",
+    "external_agent::worker_journal_append_binding_tests::",
 )
 REST_SAFETY_PREFLIGHTS = (
     "process_runner::tests::gemini_online_profile_projects_only_the_trusted_resolver_file",
@@ -155,6 +165,8 @@ def partition_inventory(names: Sequence[str]) -> dict[str, list[str]]:
                     owner = "supervise-nested"
         elif name.startswith("external_agent::"):
             owner = "external-agent"
+            if any(name.startswith(prefix) for prefix in EXTERNAL_AGENT_JOURNAL_PREFIXES):
+                owner = "external-agent-journal"
         elif name.startswith("worktree::"):
             owner = "worktree"
         else:
