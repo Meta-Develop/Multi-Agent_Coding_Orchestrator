@@ -3424,3 +3424,26 @@ fn generated_direct_worker_prompt_binds_exact_attempt_journal_path_and_contract(
         assert!(!prompt.contains("runtime-native SubAgent"));
     }
 }
+
+#[test]
+fn worker_prompt_carries_cargo_build_script_race_rule() {
+    let prefix = worker_cacheable_prefix().expect("render worker cacheable prefix");
+    assert_eq!(prefix.matches("Cargo build-script race (#939)").count(), 1);
+    let preceding_rule = "rejected=true. Never rerun outside the wrapper.\n- Cargo build-script race (#939), not an append/observation error:";
+    assert!(prefix.contains(preceding_rule));
+    for expected in [
+        "Text file busy (os error 26)",
+        "(never executed)",
+        "run the identical journal-append invocation once more as a new invocation",
+        "environment_failures as sandbox_unavailable",
+    ] {
+        assert!(prefix.contains(expected), "{expected}");
+    }
+    let following_rule = "status=failed, accepted=false, rejected=true.\n- The exact precreated journal is the only non-source write";
+    assert!(prefix.contains(following_rule));
+    let race_position = prefix
+        .find("Cargo build-script race (#939)")
+        .expect("find Cargo build-script race rule");
+    let following_position = prefix.find(following_rule).expect("find following rule");
+    assert!(following_position > race_position);
+}
