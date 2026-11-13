@@ -21,6 +21,8 @@ const MAX_STREAM_LINES: usize = 100_000;
 const MAX_FINAL_TEXT_BYTES: usize = 256 * 1024;
 /// Maximum accepted length of a provider model id.
 const MAX_MODEL_ID_LEN: usize = 256;
+/// Maximum accepted length of the export `outcome` string.
+const MAX_OUTCOME_BYTES: usize = 64;
 
 /// Immutable argv template for a managed Vibe turn.
 ///
@@ -251,6 +253,71 @@ pub(crate) fn parse_usage(bytes: &[u8]) -> Result<VibeUsage> {
         cached_input_tokens: usage.cached_input_tokens,
         total_tokens: usage.total_tokens,
     })
+}
+
+#[derive(Deserialize)]
+struct OutcomeRoot {
+    #[serde(default)]
+    outcome: Option<String>,
+}
+
+/// Parse the top-level `outcome` string out of the bounded export root document.
+///
+/// Returns `Some` only when the document is within [`MAX_USAGE_BYTES`], parses,
+/// and the outcome is a bounded string of ASCII lowercase letters and
+/// underscores. Any other shape, including a missing or non-string outcome,
+/// returns `None`; the caller then keeps its conservative handling.
+pub(crate) fn parse_outcome(bytes: &[u8]) -> Option<String> {
+    if bytes.len() > MAX_USAGE_BYTES {
+        return None;
+    }
+    let root: OutcomeRoot = serde_json::from_slice(bytes).ok()?;
+    let outcome = root.outcome?;
+    if outcome.len() > MAX_OUTCOME_BYTES
+        || !outcome
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+    {
+        return None;
+    }
+    Some(outcome)
+}
+
+/// The value that follows `flag` in the immutable argv template, if present.
+fn template_argument(flag: &str) -> Option<String> {
+    let template = immutable_argument_template();
+    template
+        .iter()
+        .position(|argument| argument == flag)
+        .and_then(|index| template.get(index + 1))
+        .cloned()
+}
+
+/// Name the Vibe limit stop for the attempt's error.
+///
+/// Vibe ends a headless run on one of its own limits with process exit status
+/// 3 while still writing its export; the seven outcomes below are those
+/// limits. The launch numbers come from the immutable argv template instead of
+/// duplicated literals. Any other outcome returns `None`.
+pub(crate) fn stop_message(outcome: &str) -> Option<String> {
+    if !matches!(
+        outcome,
+        "turn_limit"
+            | "token_limit"
+            | "price_limit"
+            | "deadline"
+            | "terminated"
+            | "length"
+            | "refusal"
+    ) {
+        return None;
+    }
+    let max_turns = template_argument("--max-turns")?;
+    let max_tokens = template_argument("--max-tokens")?;
+    let time_limit = template_argument("--time-limit")?;
+    Some(format!(
+        "Vibe stopped without finishing: run outcome {outcome}; MACO launches Vibe with --max-turns {max_turns}, --max-tokens {max_tokens} and --time-limit {time_limit}"
+    ))
 }
 
 #[derive(Deserialize)]

@@ -1344,6 +1344,15 @@ Worker `role_models` entry still decides the Worker model, other roles never
 receive a Vibe candidate, and a run without a bound Vibe executable or without
 Vibe prior rows selects as before.
 
+MACO launches every Vibe Worker turn with `--max-turns 200`, `--max-tokens 10000000`
+and `--time-limit 3600`. The token limit counts Vibe's cumulative session tokens,
+including the context resent on every turn, so a Worker that makes many tool
+calls can reach it within minutes. When Vibe stops on one of its limits it exits
+with status 3 and still writes its export: MACO charges the export's exact token
+counts to the run budget, records the stop in the attempt's error (for example
+`run outcome token_limit`), and treats the attempt as failed. A missing,
+malformed or timed-out export is still charged conservatively.
+
 
 ## Development
 
