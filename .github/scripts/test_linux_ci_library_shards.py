@@ -27,7 +27,8 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
             self.shards.SHARDS,
             ("autopilot", "supervise-core", "supervise-bound", "supervise-decomposition", "supervise-parent",
              "supervise-nested-driver", "supervise-nested", "supervise-fixtures", "supervise-fixtures-budget",
-             "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "worktree", "rest"),
+             "supervise-fixtures-licensed", "supervise-fixtures-runtime", "external-agent", "external-agent-journal",
+             "worktree", "rest"),
         )
 
     def test_mixed_inventory_disjoint_complete_union(self) -> None:
@@ -67,6 +68,10 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
             "supervise::assignment_execution::attached_parent_capture_tests::new",
             "supervise::assignment_execution::bound_parent_turn_tests::new",
             "external_agent::new", "worktree::new", "future_module::new",
+            "external_agent::vibe_tests::new",
+            "external_agent::grok_worker_journal_binding_tests::new",
+            "external_agent::worker_journal_append_binding_tests::new",
+            "external_agent::vibe_testsx::lookalike",
             "future::external_agent::lookalike", "worktree_extra::lookalike",
         ]
         inventory = sorted(set(inventory))
@@ -83,7 +88,12 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
         self.assertIn("supervise::assignment_execution::managed_parent_process_tests::new", parts["supervise-nested"])
         self.assertIn("supervise::assignment_execution::nested_worker::new", parts["supervise-nested"])
         self.assertIn("supervise::assignment_execution::future_nested::new", parts["supervise-nested"])
-        self.assertEqual(sorted(n for key in ("external-agent", "worktree", "rest")
+        for prefix in self.shards.EXTERNAL_AGENT_JOURNAL_PREFIXES:
+            self.assertIn(f"{prefix}new", parts["external-agent-journal"])
+        self.assertIn("external_agent::new", parts["external-agent"])
+        self.assertIn("external_agent::vibe_testsx::lookalike", parts["external-agent"])
+        self.assertIn("future::external_agent::lookalike", parts["rest"])
+        self.assertEqual(sorted(n for key in ("external-agent", "external-agent-journal", "worktree", "rest")
                                 for n in parts[key]), old_rest)
         flattened = [n for group in parts.values() for n in group]
         self.assertEqual(sorted(flattened), inventory)

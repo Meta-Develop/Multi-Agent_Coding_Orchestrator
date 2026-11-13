@@ -806,7 +806,10 @@ mod future {
     mod autopilot { #[test] fn nested() {} }
     #[test] fn supervise_lookalike() {}
 }
-mod external_agent { #[test] fn new_external_body() {} }
+mod external_agent {
+    #[test] fn new_external_body() {}
+    mod vibe_tests { #[test] fn new_journal_body() {} }
+}
 mod worktree { #[test] fn new_worktree_body() {} }
 mod process_runner {
     mod tests {
@@ -828,7 +831,7 @@ mod runtime_adapter {
             subprocess.run(["rustc", "--test", str(fixture), "-o", str(binary)], check=True)
             runner = [str(binary)]
             inventory = shards.enumerate_tests(runner)
-            self.assertEqual(len(inventory), 30)
+            self.assertEqual(len(inventory), 31)
             partitions = shards.partition_inventory(inventory)
             observed = []
             for shard, names in partitions.items():
@@ -854,7 +857,7 @@ mod runtime_adapter {
                 )
                 self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
                 self.assertIn(f'"selected": "{shard}"', result.stdout)
-                self.assertIn('"total": 30', result.stdout)
+                self.assertIn('"total": 31', result.stdout)
 
 
 if __name__ == "__main__":
