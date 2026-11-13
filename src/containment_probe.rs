@@ -1,10 +1,63 @@
-//! Shared delegated-user-manager probe used by tests and benchmarks.
+//! Shared containment and host-ownership probes used by tests and benchmarks.
 //!
 //! Strict containment requires a Linux cgroup v2 path inside a `user@*.service`
 //! unit. Hosted CI runners typically lack that manager; callers print one
 //! `SKIP <test>: <reason>` line and return instead of failing.
+//! Nested user namespaces must also map uid 0 and recognize the host root's owner.
 
 use std::io;
+
+/// Returns whether a `/proc/self/uid_map` snapshot maps uid 0 inside the namespace.
+pub fn root_uid_mapped(uid_map: &str) -> bool {
+    uid_map.lines().any(|line| {
+        let mut fields = line.split_whitespace().map(str::parse::<u64>);
+        matches!(
+            (fields.next(), fields.next(), fields.next(), fields.next()),
+            (Some(Ok(0)), Some(Ok(_)), Some(Ok(1..)), None)
+        )
+    })
+}
+
+/// Returns the shared skip line when namespace uid 0 is not mapped.
+pub fn host_ownership_skip_reason(test_name: &str, uid_map: &str) -> Option<String> {
+    host_ownership_skip_reason_for_root(test_name, uid_map, 0)
+}
+
+fn host_ownership_skip_reason_for_root(
+    test_name: &str,
+    uid_map: &str,
+    root_uid: u32,
+) -> Option<String> {
+    if root_uid_mapped(uid_map) && root_uid == 0 {
+        return None;
+    }
+    Some(format!(
+        "SKIP {test_name}: user namespace does not map uid 0, so root-owned host paths appear unowned (nested sandbox)"
+    ))
+}
+
+/// Checks the namespace uid map and the actual owner of `/` on Linux.
+#[cfg(target_os = "linux")]
+pub fn skip_if_host_ownership_unavailable(test_name: &str) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+
+    let uid_map = std::fs::read_to_string("/proc/self/uid_map")?;
+    // Mapping namespace uid 0 to an offset does not make host uid 0 visible.
+    let root_uid = std::fs::metadata("/")?.uid();
+    match host_ownership_skip_reason_for_root(test_name, &uid_map, root_uid) {
+        Some(message) => {
+            eprintln!("{message}");
+            Ok(true)
+        }
+        None => Ok(false),
+    }
+}
+
+/// Non-Linux hosts do not use this host-ownership gate; callers run the test body.
+#[cfg(not(target_os = "linux"))]
+pub fn skip_if_host_ownership_unavailable(_test_name: &str) -> io::Result<bool> {
+    Ok(false)
+}
 
 /// Returns whether `cgroups` places the process inside a delegated systemd user manager.
 pub fn delegated_user_manager_available(cgroups: &str) -> bool {
@@ -42,11 +95,14 @@ pub fn skip_if_unavailable_for_cgroups(test_name: &str, cgroups: &str) -> bool {
     }
 }
 
-/// Reads `/proc/self/cgroup` on Linux and applies [`skip_if_unavailable_for_cgroups`].
+/// Checks delegated containment first, then host ownership, on Linux.
 #[cfg(target_os = "linux")]
 pub fn skip_if_unavailable(test_name: &str) -> io::Result<bool> {
     let cgroups = std::fs::read_to_string("/proc/self/cgroup")?;
-    Ok(skip_if_unavailable_for_cgroups(test_name, &cgroups))
+    if skip_if_unavailable_for_cgroups(test_name, &cgroups) {
+        return Ok(true);
+    }
+    skip_if_host_ownership_unavailable(test_name)
 }
 
 /// Non-Linux hosts do not use this cgroup gate; callers run the test body.
@@ -58,6 +114,44 @@ pub fn skip_if_unavailable(_test_name: &str) -> io::Result<bool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn root_uid_mapping_requires_inside_root() {
+        assert!(root_uid_mapped("0 100000 65536\n"));
+        assert!(root_uid_mapped("         0          0 4294967295\n"));
+        assert!(!root_uid_mapped("30033 30033 1\n"));
+        assert!(!root_uid_mapped("1000 0 1\n"));
+        assert!(!root_uid_mapped(""));
+        assert!(!root_uid_mapped("x y z\n"));
+    }
+
+    #[test]
+    fn host_ownership_skip_reason_uses_the_shared_skip_message() {
+        assert_eq!(
+            host_ownership_skip_reason("example::tests::needs_host", "30033 30033 1\n"),
+            Some("SKIP example::tests::needs_host: user namespace does not map uid 0, so root-owned host paths appear unowned (nested sandbox)".to_owned())
+        );
+        assert!(
+            host_ownership_skip_reason("example::tests::needs_host", "0 100000 65536\n").is_none()
+        );
+    }
+
+    #[test]
+    fn offset_mapping_still_requires_the_host_root_owner() {
+        let uid_map = "0 100000 65536\n";
+        assert!(root_uid_mapped(uid_map));
+        assert!(host_ownership_skip_reason("example::tests::needs_host", uid_map).is_none());
+        assert_eq!(
+            host_ownership_skip_reason_for_root("example::tests::needs_host", uid_map, 65534),
+            Some("SKIP example::tests::needs_host: user namespace does not map uid 0, so root-owned host paths appear unowned (nested sandbox)".to_owned())
+        );
+        assert!(host_ownership_skip_reason_for_root(
+            "example::tests::needs_host",
+            "0 0 4294967295\n",
+            0,
+        )
+        .is_none());
+    }
 
     #[test]
     fn delegated_user_manager_detection_matches_integration_helper() {
