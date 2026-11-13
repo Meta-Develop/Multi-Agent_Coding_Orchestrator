@@ -4532,6 +4532,8 @@ pub(crate) struct WorkerJournalObservation {
     declared_paths: Vec<PathBuf>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     failure: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    exit_code: Option<i32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]

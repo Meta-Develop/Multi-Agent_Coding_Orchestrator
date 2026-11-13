@@ -224,6 +224,37 @@ fn q714_oversized_operation_is_manifested_without_partial_record() -> Result<()>
 }
 
 #[test]
+fn q714_journal_over_budget_keeps_newest_records() -> Result<()> {
+    let journal = (0..200)
+        .map(|i| json_line(json!({"command":["step", format!("{i}")], "output":"x".repeat(1500)})))
+        .collect::<Vec<_>>()
+        .concat();
+    let stream = json_line(
+        json!({"method":"item/completed","params":{"item":{"type":"reasoning","id":"small"}}}),
+    );
+    let value = packet(&journal, &stream, 1)?;
+    let entry = value
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["kind"] == "worker_journal")
+        .unwrap();
+    let evidence = &entry["evidence"];
+    assert_source_partition(evidence, &journal);
+    let lines = evidence["records"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|record| record["line"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(lines.contains(&200));
+    assert_eq!(evidence["omission_manifest"]["ranges"][0]["first_line"], 1);
+    assert!(lines.windows(2).all(|pair| pair[0] < pair[1]));
+    assert!(serde_json::to_vec(&value)?.len() <= PACKET_LIMIT);
+    Ok(())
+}
+
+#[test]
 fn q714_packet_budget_covers_multiple_workers_and_manifests() -> Result<()> {
     let journal = (0..150)
         .map(|i| json_line(json!({"command":["read", &format!("{i}")]})))

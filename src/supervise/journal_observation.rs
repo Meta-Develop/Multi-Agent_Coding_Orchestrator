@@ -357,6 +357,7 @@ fn run_worker_execution_journal_command_with_environment_and_clock(
             after: before.clone(),
             declared_paths: normalize_paths(entry.changed_paths.clone())?,
             failure: None,
+            exit_code: None,
         });
         let status = if observe_changes {
             None
@@ -402,6 +403,9 @@ fn run_worker_execution_journal_command_with_environment_and_clock(
                 .expect("observation set above");
             if !observe_changes {
                 observation.phase = WorkerJournalObservationPhase::Completed;
+            }
+            if let Some(Ok(status)) = &status {
+                observation.exit_code = status.code();
             }
             observation.after = after;
             completed.changed_paths = changed_paths(&observation.before, &observation.after);
