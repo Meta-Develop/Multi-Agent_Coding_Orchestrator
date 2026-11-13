@@ -19,6 +19,11 @@ before setup and immediately before release. Sockets, FIFOs, device nodes, cross
 subtrees, and hard-link aliases outside writable roots are rejected. Creation of sockets,
 hard-links, FIFOs/device nodes, mounts, namespaces, and privileged kernel interfaces is denied as
 appropriate to the profile.
+Because hard-link creation is denied, Cargo copies build scripts into its target directory instead of
+hard-linking them. A child process forked while such a copy is still open can make Cargo's next exec
+of that build script fail with `Text file busy (os error 26)` (more likely under the unit's CPU
+quota; #939). Workers rerun that one invocation once through the journal wrapper and report both
+runs; a repeated failure is reported as a `sandbox_unavailable` environment failure.
 
 The verified profiles clear ambient environment variables, use fixed executable search paths,
 request private IPC/devices/temporary storage, mask user-systemd, D-Bus, credential, container,

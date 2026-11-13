@@ -250,6 +250,7 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
 - If reporting native apply_patch argv is necessary, replace ONLY the post-edit observation's -- true with -- apply_patch '<exact full patch passed to the native tool as ONE argument>'. Observation never executes argv; do not apply the patch again. Only this payload-bearing observation supports ["apply_patch", "<exact full patch>"] in commands_run. A ["true"] observation cannot support it. The timestamps describe observation time, not an unobserved native edit's execution time.
 - Do not pre-journal apply_patch as shell argv.
 - Append/observation error: stop; no repair/retry except the Codex-only proven-no-launch correction or WorkerJournalObservationRequired recovery explicitly authorized by the parent-bound operation below. No hand JSON, identity discovery, PATH change or recursive journaling. For environment errors include the observed error in environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true. Never rerun outside the wrapper.
+- Cargo build-script race (#939), not an append/observation error: hard links are denied in this sandbox, so Cargo copies build scripts, and a cargo command can fail with `Text file busy (os error 26)` for a just-built `build-script-build` that it reports as `(never executed)`. Only for a failed command whose output shows both texts, run the identical journal-append invocation once more as a new invocation and report both runs in commands_run, the first with its real exit status. If that rerun fails with the same two texts, stop and report it in environment_failures as sandbox_unavailable with the observed error; status=failed, accepted=false, rejected=true.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Empty command/payload/cwd/timestamps or invalid paths: WorkerExecutionJournalRecordError; stop.
 - WorkerReport.commands_run cwd is the exact absolute worktree from the journal, not a repository-relative path or a redacted placeholder. WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
 - Report the inner argv after --: direct prefix ... -- bash -lc 'true' or /bin/bash -lc 'prefix ...' reports ["bash","-lc","true"]; the inner bash -lc array stays intact, with a matching finished journal record.
@@ -2174,12 +2175,12 @@ pub(super) fn apply_canonical_environment_requirements(
 mod regression_tests {
     use super::*;
 
-    // Cost decision: allow at most 2 KiB per worker template for the integrated
+    // Cost decision: allow at most 3 KiB per worker template for the integrated
     // native-edit identity, automatic timestamp, serial journal and explicit
-    // recovery contracts. The child fixture embeds the worker contract once
-    // and gets the same allowance. This is test-only: production
+    // recovery contracts, including the Cargo build-script race (#939). The child fixture
+    // embeds the worker contract once and gets the same allowance. This is test-only: production
     // measurement fields and trusted launch/acceptance limits remain unchanged.
-    const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 2 * 1024;
+    const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 3 * 1024;
 
     fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")
