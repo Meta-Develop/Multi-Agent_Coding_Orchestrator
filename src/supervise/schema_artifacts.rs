@@ -1515,6 +1515,19 @@ fn assignment_selection_ledger_schema_value() -> serde_json::Value {
                         }
                     }
                 },
+                "absent_lanes": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["runtime", "code", "detail"],
+                        "properties": {
+                            "runtime": {"type": "string", "minLength": 1},
+                            "code": {"type": "string", "minLength": 1},
+                            "detail": {"type": "string", "minLength": 1}
+                        }
+                    }
+                },
                 "quota_evidence": runtime_pool_state_schema_value(),
                 "evidence_gap": {"type": ["string", "null"], "minLength": 1}
             }

@@ -17225,6 +17225,32 @@
               "items": {
                 "additionalProperties": false,
                 "properties": {
+                  "absent_lanes": {
+                    "items": {
+                      "additionalProperties": false,
+                      "properties": {
+                        "code": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "detail": {
+                          "minLength": 1,
+                          "type": "string"
+                        },
+                        "runtime": {
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "runtime",
+                        "code",
+                        "detail"
+                      ],
+                      "type": "object"
+                    },
+                    "type": "array"
+                  },
                   "assignment_id": {
                     "minLength": 1,
                     "type": "string"

@@ -479,3 +479,182 @@ fn explicit_worker_override_for_codex_keeps_vibe_out() -> Result<()> {
         .all(|candidate| candidate.candidate.runtime != "vibe"));
     Ok(())
 }
+
+#[test]
+fn vibe_lane_absence_is_empty_when_the_lane_is_offered() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    let resolution = resolve_automatic(&mut plan)?;
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let decision = worker_provenance(&resolution)?;
+    assert!(super::vibe_lane_absence_for_ledger(AgentRole::Worker, decision).is_none());
+    for event in resolution
+        .decisions
+        .iter()
+        .filter(|event| event.role != AgentRole::Worker)
+    {
+        assert!(super::vibe_lane_absence_for_ledger(event.role, &event.provenance).is_none());
+    }
+    Ok(())
+}
+
+#[test]
+fn vibe_lane_absence_records_unbound_executable() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, false)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    let resolution = resolve_automatic(&mut plan)?;
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let decision = worker_provenance(&resolution)?;
+    let absence =
+        super::vibe_lane_absence_for_ledger(AgentRole::Worker, decision).context("absence")?;
+    assert_eq!(absence.runtime, "vibe");
+    assert_eq!(absence.code, "executable_not_bound");
+    Ok(())
+}
+
+#[test]
+fn vibe_lane_absence_records_missing_prior_rows() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let mut plan = automatic_worker_plan()?;
+    let resolution = resolve_automatic(&mut plan)?;
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let decision = worker_provenance(&resolution)?;
+    let absence =
+        super::vibe_lane_absence_for_ledger(AgentRole::Worker, decision).context("absence")?;
+    assert_eq!(absence.runtime, "vibe");
+    assert_eq!(absence.code, "no_prior_rows");
+    Ok(())
+}
+
+#[test]
+fn vibe_lane_absence_records_debug_override() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    plan.role_models.insert(
+        AgentRole::Worker,
+        role_selection(FRONTIER_PROFILE_MODEL.into(), Some("high")),
+    );
+    let resolution = resolve_automatic(&mut plan)?;
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let decision = worker_provenance(&resolution)?;
+    let absence =
+        super::vibe_lane_absence_for_ledger(AgentRole::Worker, decision).context("absence")?;
+    assert_eq!(absence.runtime, "vibe");
+    assert_eq!(absence.code, "debug_override_pins_other_runtime");
+    Ok(())
+}
+
+#[test]
+fn vibe_lane_absence_is_empty_when_the_ceiling_rejects_vibe() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let _prior =
+        vibe_selection_prior(&repo, Some(selection::TaskShapeCeiling::bounded_terminal()))?;
+    let resolved_profile = default_resolved_profile();
+    let mut input = super::selection_input_for_role_with_assessment(
+        SelectionInputForRoleArgs {
+            role: AgentRole::Worker,
+            runtime: SupervisorRuntime::Codex,
+            catalog: &codex_catalog()?,
+            advertised: &AdvertisedCatalogSet::empty(),
+            admission: &test_admission(),
+            resolved_objective_profile: &resolved_profile,
+            quota_context: None,
+            quota_ledger: None,
+            account_observation: None,
+            signals: DynamicSignals {
+                retry_count: 0,
+                budget_signal: BudgetSignal::Continue,
+                previous_choice: None,
+                previous_catalog_digest: None,
+                environment_rejections: Vec::new(),
+                accepted_task_cost_context: None,
+                accepted_task_cost_observations: Vec::new(),
+            },
+            debug_override: None,
+            history: None,
+        },
+        None,
+        None,
+        None,
+    )?;
+    input.task.risk = RiskLevel::High;
+    input.task.boundedness = Boundedness::Bounded;
+    input.task.context = ContextSize::Medium;
+    input.task.horizon = TaskHorizon::Medium;
+    let decision = selection::select(&input)?;
+    assert!(super::vibe_lane_absence_for_ledger(AgentRole::Worker, &decision).is_none());
+    Ok(())
+}
+
+#[test]
+fn vibe_lane_absence_round_trips_in_ledger_entry() -> Result<()> {
+    let absence = AssignmentLaneAbsence {
+        runtime: "vibe".to_string(),
+        code: "executable_not_bound".to_string(),
+        detail: "no Vibe executable is bound for this run".to_string(),
+    };
+    let entry = |absent_lanes| AssignmentSelectionLedgerEntry {
+        assignment_id: "assignment".to_string(),
+        attempt: 1,
+        role: AgentRole::Worker,
+        role_assignment: None,
+        selection_source: AssignmentSelectionSource::Automatic,
+        selected_runtime: Some("codex".to_string()),
+        selected_model: Some("model".to_string()),
+        selected_reasoning_effort: Some("high".to_string()),
+        catalog_source: AssignmentCatalogSource::None,
+        catalog_snapshot_digest: None,
+        catalog_revisions: Vec::new(),
+        rejected_candidates: Vec::new(),
+        absent_lanes,
+        quota_evidence: None,
+        evidence_gap: None,
+    };
+    let with_absence = entry(vec![absence.clone()]);
+    let serialized = serde_json::to_value(&with_absence)?;
+    assert!(serialized
+        .get("absent_lanes")
+        .context("absent_lanes key")?
+        .is_array());
+    assert_eq!(
+        serde_json::from_value::<AssignmentSelectionLedgerEntry>(serialized.clone())?,
+        with_absence
+    );
+    let without_absence = entry(Vec::new());
+    let serialized = serde_json::to_value(&without_absence)?;
+    assert!(serialized.get("absent_lanes").is_none());
+    assert_eq!(
+        serde_json::from_value::<AssignmentSelectionLedgerEntry>(serialized)?,
+        without_absence
+    );
+    Ok(())
+}
