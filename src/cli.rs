@@ -54,7 +54,7 @@ use crate::{
         ForgeKind, IssuePublicationOptions, PrPublicationOptions, PrPublicationReport,
         PrPublicationStatus,
     },
-    repo_map::{self, RepoEntryKind, RepoMap},
+    repo_map::{self, IncompleteRepoMap, RepoEntryKind, RepoMap},
     repo_semantic::{self, SemanticRepoMap},
     review::{self, ReviewPrOptions, ReviewerConfig, ReviewerMode},
     safe_state::BoundedRegularReader,
@@ -551,6 +551,9 @@ impl RepoCommand {
                 if args.semantic {
                     let map = repo_semantic::scan_repository(args.repo)?;
                     print_semantic_repo_map(&map, args.json)
+                } else if args.allow_incomplete {
+                    let map = repo_map::scan_repository_allowing_incomplete(args.repo)?;
+                    print_incomplete_repo_map(&map, args.json)
                 } else {
                     let map = repo_map::scan_repository(args.repo)?;
                     print_repo_map(&map, args.json)
@@ -824,6 +827,9 @@ struct MapRepoArgs {
     /// Build a Rust semantic map instead of the coarse file map.
     #[arg(long)]
     semantic: bool,
+    /// Report unreadable directories as warnings instead of failing.
+    #[arg(long, conflicts_with = "semantic")]
+    allow_incomplete: bool,
     /// Emit machine-readable JSON.
     #[arg(long)]
     json: bool,

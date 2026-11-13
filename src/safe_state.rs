@@ -896,6 +896,11 @@ pub(crate) struct BoundedTreeWalkOptions {
 pub(crate) struct BoundedTreeWalkResult {
     pub entries: Vec<BoundedTreeEntry>,
     pub nested_repository_boundaries: Vec<PathBuf>,
+    /// Repository-relative paths of directories that could not be opened or
+    /// listed because of a permission error. Only the
+    /// `walk_bound_with_options_detailed_allowing_unreadable` entry point can
+    /// populate this; every other walk keeps permission errors fatal.
+    pub unreadable_directories: Vec<PathBuf>,
 }
 
 impl BoundedTreeWalkLimits {
@@ -1244,7 +1249,37 @@ impl BoundedTreeWalker {
         root_binding: &DirectoryBindingGuard,
         limits: BoundedTreeWalkLimits,
         options: BoundedTreeWalkOptions,
+        action: F,
+    ) -> Result<BoundedTreeWalkResult>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        Self::walk_bound_with_options_detailed_mode(root_binding, limits, options, action, false)
+    }
+
+    /// Walks with permission-denied directories recorded instead of fatal: the
+    /// directory entry itself is still recorded, its contents are skipped, and
+    /// its repository-relative path is returned in
+    /// [`BoundedTreeWalkResult::unreadable_directories`]. Every other error
+    /// keeps its strict treatment in this mode too.
+    pub(crate) fn walk_bound_with_options_detailed_allowing_unreadable<F>(
+        root_binding: &DirectoryBindingGuard,
+        limits: BoundedTreeWalkLimits,
+        options: BoundedTreeWalkOptions,
+        action: F,
+    ) -> Result<BoundedTreeWalkResult>
+    where
+        F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
+    {
+        Self::walk_bound_with_options_detailed_mode(root_binding, limits, options, action, true)
+    }
+
+    fn walk_bound_with_options_detailed_mode<F>(
+        root_binding: &DirectoryBindingGuard,
+        limits: BoundedTreeWalkLimits,
+        options: BoundedTreeWalkOptions,
         mut action: F,
+        allow_unreadable_directories: bool,
     ) -> Result<BoundedTreeWalkResult>
     where
         F: FnMut(&BoundedTreeEntry) -> Result<BoundedTreeWalkAction>,
@@ -1261,6 +1296,9 @@ impl BoundedTreeWalker {
                 None
             };
             let mut budget = InventoryBudget::new(limits)?;
+            if allow_unreadable_directories {
+                budget.enable_unreadable_directory_tolerance();
+            }
             let mut entries = Vec::new();
             let mut nested_repository_boundaries = Vec::new();
             let mut walker = InventoryWalkState {
@@ -1278,14 +1316,19 @@ impl BoundedTreeWalker {
             budget.ensure_before_deadline("after repository traversal")?;
             root_binding.verify()?;
             nested_repository_boundaries.sort();
+            let mut unreadable_directories = std::mem::take(&mut budget.unreadable_directories);
+            unreadable_directories.sort();
+            unreadable_directories.dedup();
             Ok(BoundedTreeWalkResult {
                 entries,
                 nested_repository_boundaries,
+                unreadable_directories,
             })
         }
 
         #[cfg(windows)]
         {
+            let _ = allow_unreadable_directories;
             walk_bound_windows(root_binding, limits, options, action)
         }
         #[cfg(not(any(unix, windows)))]
@@ -1328,6 +1371,7 @@ where
     Ok(BoundedTreeWalkResult {
         entries,
         nested_repository_boundaries,
+        unreadable_directories: Vec::new(),
     })
 }
 

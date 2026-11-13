@@ -1370,6 +1370,13 @@ struct InventoryBudget {
     deadline: Instant,
     current_relative_directory: PathBuf,
     entries_inspected: usize,
+    /// Opt-in tolerance for permission-denied directories, set only by the
+    /// allow-unreadable walk entry point.
+    allow_unreadable_directories: bool,
+    /// Repository-relative paths of directories that could not be opened or
+    /// listed because of a permission error while the tolerance above was
+    /// enabled.
+    unreadable_directories: Vec<PathBuf>,
 }
 
 impl InventoryBudget {
@@ -1385,7 +1392,15 @@ impl InventoryBudget {
             deadline,
             current_relative_directory: PathBuf::new(),
             entries_inspected: 0,
+            allow_unreadable_directories: false,
+            unreadable_directories: Vec::new(),
         })
+    }
+
+    /// Enables the opt-in permission-denied directory tolerance for the rest
+    /// of this walk.
+    fn enable_unreadable_directory_tolerance(&mut self) {
+        self.allow_unreadable_directories = true;
     }
 
     fn consume_entry(&mut self) -> Result<()> {
@@ -1551,7 +1566,20 @@ where
                 relative_directory.display()
             );
         }
-        let names = inventory_directory_entries(directory_fd, self.budget)?;
+        let names = match inventory_directory_entries(directory_fd, self.budget) {
+            Ok(names) => names,
+            Err(error) => {
+                if self.budget.allow_unreadable_directories
+                    && is_permission_denied_error(&error)
+                {
+                    self.budget
+                        .unreadable_directories
+                        .push(relative_directory.to_path_buf());
+                    return Ok(());
+                }
+                return Err(error);
+            }
+        };
         for name in names {
             self.budget
                 .ensure_before_deadline("during entry inspection")?;
@@ -1625,33 +1653,49 @@ where
                         relative.display()
                     );
                 }
-                let child = openat_directory(directory_fd, &name_c).with_context(|| {
-                    format!(
-                        "failed to open repository directory without following links: {}",
-                        relative.display()
-                    )
-                })?;
-                let opened = fstat(child.as_raw_fd())?;
-                if opened.st_mode & libc::S_IFMT != libc::S_IFDIR
-                    || identity_from_stat(&opened) != entry.identity
-                    || (self.limits.same_device && opened.st_dev != self.root_device)
-                {
-                    bail!(
-                        "repository directory changed during bounded traversal: {}",
-                        relative.display()
-                    );
-                }
-                #[cfg(target_os = "linux")]
-                if let Some(root_mount_id) = self.root_mount_id {
-                    if linux_mount_identity_for_fd(child.as_raw_fd())?.mount_id != root_mount_id {
+                let child = match openat_directory(directory_fd, &name_c) {
+                    Ok(child) => Some(child),
+                    Err(error) => {
+                        if self.budget.allow_unreadable_directories
+                            && is_permission_denied_error(&error)
+                        {
+                            self.budget.unreadable_directories.push(relative.clone());
+                            None
+                        } else {
+                            return Err(error).with_context(|| {
+                                format!(
+                                    "failed to open repository directory without following links: {}",
+                                    relative.display()
+                                )
+                            });
+                        }
+                    }
+                };
+                if let Some(child) = &child {
+                    let opened = fstat(child.as_raw_fd())?;
+                    if opened.st_mode & libc::S_IFMT != libc::S_IFDIR
+                        || identity_from_stat(&opened) != entry.identity
+                        || (self.limits.same_device && opened.st_dev != self.root_device)
+                    {
                         bail!(
-                            "repository directory crossed a mount boundary while opening: {}",
+                            "repository directory changed during bounded traversal: {}",
                             relative.display()
                         );
                     }
+                    #[cfg(target_os = "linux")]
+                    if let Some(root_mount_id) = self.root_mount_id {
+                        if linux_mount_identity_for_fd(child.as_raw_fd())?.mount_id
+                            != root_mount_id
+                        {
+                            bail!(
+                                "repository directory crossed a mount boundary while opening: {}",
+                                relative.display()
+                            );
+                        }
+                    }
+                    self.walk(child.as_raw_fd(), &relative, entry_depth)?;
+                    self.budget.current_relative_directory = relative_directory.to_path_buf();
                 }
-                self.walk(child.as_raw_fd(), &relative, entry_depth)?;
-                self.budget.current_relative_directory = relative_directory.to_path_buf();
             }
             let rebound = fstatat_no_follow(directory_fd, &name_c).with_context(|| {
                 format!(
@@ -1681,6 +1725,16 @@ where
         }
         Ok(())
     }
+}
+
+/// True only for EACCES/EPERM-class failures, which std maps to
+/// `ErrorKind::PermissionDenied`.
+fn is_permission_denied_error(error: &anyhow::Error) -> bool {
+    error.chain().any(|cause| {
+        cause
+            .downcast_ref::<std::io::Error>()
+            .is_some_and(|io_error| io_error.kind() == std::io::ErrorKind::PermissionDenied)
+    })
 }
 
 #[cfg(unix)]

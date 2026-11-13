@@ -2381,6 +2381,24 @@ fn print_repository_info(info: &RepositoryInfo, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn print_incomplete_repo_map(map: &IncompleteRepoMap, json: bool) -> Result<()> {
+    if json {
+        println!("{}", serde_json::to_string_pretty(map)?);
+    } else {
+        print_repo_map(
+            &RepoMap {
+                root: map.root.clone(),
+                entries: map.entries.clone(),
+            },
+            false,
+        )?;
+        for warning in &map.warnings {
+            println!("incomplete\t{}\t{}", warning.path.display(), warning.category);
+        }
+    }
+    Ok(())
+}
+
 fn print_repo_map(map: &RepoMap, json: bool) -> Result<()> {
     if json {
         println!("{}", serde_json::to_string_pretty(map)?);
