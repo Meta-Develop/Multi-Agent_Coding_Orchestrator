@@ -776,7 +776,10 @@ mod tests {
 
     #[test]
     fn parent_endpoint_is_kernel_bound_before_registration_or_request() {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("maco-t")
+            .tempdir_in("/tmp")
+            .unwrap();
         let socket = root.path().join("parent.sock");
         let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
         fs::set_permissions(&socket, fs::Permissions::from_mode(0o600)).unwrap();
