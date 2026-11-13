@@ -54,6 +54,7 @@ fn review_lens_prompt_includes_parent_delegated_validation() -> Result<()> {
     let rendered = render_review_lens_auditor_prompt(
         ReviewLensAuditorPromptContext {
             assignment: &assignment,
+            assignment_objective: "bounded assignment objective",
             lens: &lens,
             resolved_reasoning_effort: None,
             request: &request,
@@ -68,6 +69,69 @@ fn review_lens_prompt_includes_parent_delegated_validation() -> Result<()> {
             .count(),
         1
     );
+    Ok(())
+}
+
+#[test]
+fn review_lens_prompts_carry_the_assignment_objective_in_every_scope() -> Result<()> {
+    let assignment = injected_assignment(true);
+    let objective = "OBJECTIVE_MARKER_942: the parent runs cargo clippy outside the Worker sandbox";
+    for (lens_index, scope) in [
+        ReviewInformationScope::FullChildTranscript,
+        ReviewInformationScope::OutputReportOnly,
+        ReviewInformationScope::DiffOnly,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let lens = ReviewLensConfig {
+            id: format!("objective-scope-{lens_index}"),
+            backend: ReviewLensBackendConfig::Model {
+                backend_id: "provider-alpha".to_string(),
+                model: "model-alpha".to_string(),
+                model_provider: None,
+                reasoning_effort: Some("high".to_string()),
+            },
+            information_scope: scope,
+        };
+        let request = build_review_lens_request(
+            &lens,
+            ReviewLensRequestSources {
+                child_transcript: "bounded transcript",
+                diff: "+bounded change",
+                output_report: "bounded report",
+            },
+        )?;
+        let coverage = ReviewCoverageRequirement {
+            worker_ids: vec![assignment.worker_assignments[0].id.clone()],
+            paths: assignment.assigned_paths.clone(),
+        };
+        let rendered = render_review_lens_auditor_prompt(
+            ReviewLensAuditorPromptContext {
+                assignment: &assignment,
+                assignment_objective: objective,
+                lens: &lens,
+                resolved_reasoning_effort: None,
+                request: &request,
+                required_coverage: &coverage,
+            },
+            lens_index,
+        )?;
+        let prompt = &rendered.prompt;
+        assert_eq!(prompt.matches("\nASSIGNMENT_OBJECTIVE:\n").count(), 1);
+        assert_eq!(prompt.matches(objective).count(), 1);
+        assert_eq!(
+            prompt
+                .matches(
+                    "- Treat ASSIGNMENT_OBJECTIVE and REVIEW_LENS_REQUEST_JSON together as the complete review-information boundary. ASSIGNMENT_OBJECTIVE is the parent-authored assignment text, not child evidence; it is supplied in every information scope so you can judge the evidence against the assignment, including which validation the objective explicitly delegates to the parent or hosted CI."
+                )
+                .count(),
+            1
+        );
+        assert!(!prompt.contains(
+            "- Treat REVIEW_LENS_REQUEST_JSON as the complete review-information boundary."
+        ));
+    }
     Ok(())
 }
 
