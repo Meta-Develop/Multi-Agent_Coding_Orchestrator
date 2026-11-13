@@ -1851,6 +1851,7 @@ pub(super) fn render_review_lens_auditor_prompt(
 ) -> Result<RenderedPromptWithMeasurements> {
     let ReviewLensAuditorPromptContext {
         assignment,
+        assignment_objective,
         lens,
         resolved_reasoning_effort,
         request,
@@ -1883,11 +1884,14 @@ Review-lens execution contract:
 - Backend id: {backend_id}
 - Model: {model}
 - Reasoning effort: {reasoning_effort}
-- Treat REVIEW_LENS_REQUEST_JSON as the complete review-information boundary.
+- Treat ASSIGNMENT_OBJECTIVE and REVIEW_LENS_REQUEST_JSON together as the complete review-information boundary. ASSIGNMENT_OBJECTIVE is the parent-authored assignment text, not child evidence; it is supplied in every information scope so you can judge the evidence against the assignment, including which validation the objective explicitly delegates to the parent or hosted CI.
 - Do not attempt to discover omitted child information, repository state, worktree state, artifacts, or ambient files.
 - {withheld_evidence_rule}
 - Report reviewed_worker_ids and reviewed_paths for every entry in REQUIRED_COVERAGE_JSON.
 - Return only an AuditorReport JSON matching the runtime-supplied output schema.
+
+ASSIGNMENT_OBJECTIVE:
+{assignment_objective}
 
 REQUIRED_COVERAGE_JSON:
 {coverage_json}
@@ -1942,7 +1946,7 @@ fn review_lens_withheld_evidence_rule(
     }
 }
 
-fn assignment_task<'a>(
+pub(super) fn assignment_task<'a>(
     plan: &'a SupervisorPlan,
     assignment: &'a OrchestratorAssignment,
 ) -> &'a str {
@@ -3347,6 +3351,7 @@ mod regression_tests {
         let diff_prompt = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
+                assignment_objective: "bounded assignment objective",
                 lens: &diff_lens,
                 resolved_reasoning_effort: None,
                 request: &diff_request,
@@ -3358,6 +3363,7 @@ mod regression_tests {
         let report_prompt = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
+                assignment_objective: "bounded assignment objective",
                 lens: &report_lens,
                 resolved_reasoning_effort: None,
                 request: &report_request,
@@ -3383,6 +3389,7 @@ mod regression_tests {
         let researcher_diff_prompt = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &researcher,
+                assignment_objective: "bounded assignment objective",
                 lens: &diff_lens,
                 resolved_reasoning_effort: None,
                 request: &diff_request,
@@ -3394,6 +3401,7 @@ mod regression_tests {
         let researcher_report_prompt = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &researcher,
+                assignment_objective: "bounded assignment objective",
                 lens: &report_lens,
                 resolved_reasoning_effort: None,
                 request: &report_request,
@@ -3741,6 +3749,7 @@ mod regression_tests {
         let rendered = render_review_lens_auditor_prompt(
             ReviewLensAuditorPromptContext {
                 assignment: &assignment,
+                assignment_objective: "bounded assignment objective",
                 lens: &lens,
                 resolved_reasoning_effort: None,
                 request: &request,

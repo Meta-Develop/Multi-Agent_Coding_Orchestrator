@@ -4325,6 +4325,7 @@ struct ParentReviewAuditorPromptContext<'a> {
 
 struct ReviewLensAuditorPromptContext<'a> {
     assignment: &'a OrchestratorAssignment,
+    assignment_objective: &'a str,
     lens: &'a ReviewLensConfig,
     resolved_reasoning_effort: Option<&'a str>,
     request: &'a ReviewLensRequest,

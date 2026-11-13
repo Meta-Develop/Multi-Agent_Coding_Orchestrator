@@ -7062,6 +7062,7 @@ fn prepare_parent_auditor<'a>(
     } = render_review_lens_auditor_prompt(
         ReviewLensAuditorPromptContext {
             assignment,
+            assignment_objective: assignment_task(plan, assignment),
             lens,
             resolved_reasoning_effort: Some(&resolved_auditor_effort.resolved),
             request: expected_request,
@@ -16038,6 +16039,7 @@ done
             let rendered = render_review_lens_auditor_prompt(
                 ReviewLensAuditorPromptContext {
                     assignment,
+                    assignment_objective: "bounded assignment objective",
                     lens,
                     resolved_reasoning_effort: Some(&resolved_effort.resolved),
                     request: &request,
