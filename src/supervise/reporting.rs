@@ -1125,24 +1125,41 @@ where
         }
     }
 
+    let mut last_object_error = None;
     if let Some(object) = last_top_level_json_object(contents) {
-        if let Ok(report) = serde_json::from_str(object) {
-            return Ok(ParsedReport {
-                report,
-                recovered: true,
-            });
-        }
-    }
-
-    if let Some(stripped) = strip_surrounding_markdown_fence(contents) {
-        if let Some(object) = last_top_level_json_object(stripped) {
-            if let Ok(report) = serde_json::from_str(object) {
+        match serde_json::from_str(object) {
+            Ok(report) => {
                 return Ok(ParsedReport {
                     report,
                     recovered: true,
                 });
             }
+            Err(error) => last_object_error = Some(error),
         }
+    }
+
+    if let Some(stripped) = strip_surrounding_markdown_fence(contents) {
+        if let Some(object) = last_top_level_json_object(stripped) {
+            match serde_json::from_str(object) {
+                Ok(report) => {
+                    return Ok(ParsedReport {
+                        report,
+                        recovered: true,
+                    });
+                }
+                Err(error) => {
+                    if last_object_error.is_none() {
+                        last_object_error = Some(error);
+                    }
+                }
+            }
+        }
+    }
+
+    if let Some(object_error) = last_object_error {
+        return Err(anyhow!(
+            "report JSON/contract parse failed: {direct_error}; lenient JSON extraction did not produce a contract-valid report; last top-level JSON object failed: {object_error}"
+        ));
     }
 
     Err(anyhow!(

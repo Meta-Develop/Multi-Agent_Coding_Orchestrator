@@ -3329,17 +3329,31 @@ pub(super) fn should_retry_child_report(
     if report_shape_problems.is_empty() || attempt > usize::from(max_child_retries) {
         return false;
     }
+    // A direct worker that never captured a report is the token_limit stop
+    // tracked separately; the structural retry only applies to a captured
+    // report that failed to parse or failed its contract.
+    if report_shape_problems
+        .iter()
+        .any(|problem| problem.contains(DIRECT_WORKER_REPORT_NOT_CAPTURED))
+    {
+        return false;
+    }
     if report.worker_reports.iter().any(report_failed)
         || report.validation_results.iter().any(validation_failed)
     {
         return false;
     }
-    !report.findings.iter().any(|finding| {
-        finding.severity == FindingSeverity::Error
-            && !report_shape_problems
+    report.findings.iter().all(|finding| {
+        finding.severity != FindingSeverity::Error
+            || report_shape_problems
                 .iter()
                 .any(|problem| finding.message.contains(problem))
-            && !retryable_cascaded_shape_message(&finding.message)
+            || retryable_cascaded_shape_message(&finding.message)
+            || (report.role == AgentRole::Worker
+                && retryable_direct_worker_cascaded_shape_message(
+                    &finding.message,
+                    report_shape_problems,
+                ))
     })
 }
 
@@ -3348,6 +3362,36 @@ fn retryable_cascaded_shape_message(message: &str) -> bool {
         || message.contains("contained zero worker_reports despite assigned worker IDs")
 }
 
+const DIRECT_WORKER_REPORT_NOT_CAPTURED: &str =
+    "external run did not capture a descriptor-held direct worker report";
+
+// The direct-Worker collection path itself records error findings for the same
+// invalid report; those cascaded findings must not block the structural retry.
+fn retryable_direct_worker_cascaded_shape_message(
+    message: &str,
+    report_shape_problems: &[String],
+) -> bool {
+    if message.contains("0 WorkerReport entries") {
+        return true;
+    }
+    let Some(underlying) = message
+        .strip_prefix("required child report is missing or invalid: ")
+        .or_else(|| direct_worker_contract_failure_error(message))
+    else {
+        return false;
+    };
+    report_shape_problems.iter().any(|problem| {
+        problem
+            .strip_prefix("required assignment report is missing or invalid: ")
+            .is_some_and(|error| error == underlying)
+    })
+}
+
+fn direct_worker_contract_failure_error(message: &str) -> Option<&str> {
+    let prefix_end = message.find("': ")? + "': ".len();
+    let suffix_start = message.find(". Corrective action: ")?;
+    (prefix_end <= suffix_start).then(|| &message[prefix_end..suffix_start])
+}
 pub(super) fn validation_failed(result: &ValidationResult) -> bool {
     result.status != ReviewStatus::Succeeded
 }

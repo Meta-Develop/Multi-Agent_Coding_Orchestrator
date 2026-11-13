@@ -18,6 +18,7 @@ mod run_artifacts;
 mod scheduler;
 mod source_base;
 mod static_repository_preflight;
+mod structural_retry;
 use super::*;
 use crate::{
     external_agent::{

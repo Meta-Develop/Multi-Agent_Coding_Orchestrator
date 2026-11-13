@@ -4541,7 +4541,7 @@ struct ChildAttemptHistory {
 }
 
 enum ChildAttemptCorrection {
-    StructuralReport,
+    StructuralReport(Vec<String>),
     Gate(GateDenial, Vec<Finding>),
 }
 
