@@ -145,6 +145,7 @@ pub struct TaskScoreWeights {
 #[serde(rename_all = "snake_case")]
 pub enum TaskEstimateMatch {
     DeclaredTaskContainsAsciiInsensitive,
+    DeclaredTaskContainsWordAsciiInsensitive,
     ScopePathPrefix,
 }
 

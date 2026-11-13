@@ -869,7 +869,9 @@ fn task_estimation_policy() -> Value {
         "rules" => array(strict_object!(
             "id" => nonempty_string(),
             "match_kind" => enum_schema(&[
-                "declared_task_contains_ascii_insensitive", "scope_path_prefix"
+                "declared_task_contains_ascii_insensitive",
+                "declared_task_contains_word_ascii_insensitive",
+                "scope_path_prefix"
             ]),
             "pattern" => nonempty_string(),
             "complexity_basis_points" => basis_points(),

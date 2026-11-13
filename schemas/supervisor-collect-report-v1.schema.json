@@ -5650,6 +5650,7 @@
                                 "match_kind": {
                                   "enum": [
                                     "declared_task_contains_ascii_insensitive",
+                                    "declared_task_contains_word_ascii_insensitive",
                                     "scope_path_prefix"
                                   ],
                                   "type": "string"
@@ -12779,6 +12780,7 @@
                                       "match_kind": {
                                         "enum": [
                                           "declared_task_contains_ascii_insensitive",
+                                          "declared_task_contains_word_ascii_insensitive",
                                           "scope_path_prefix"
                                         ],
                                         "type": "string"
@@ -24290,6 +24292,7 @@
                                             "match_kind": {
                                               "enum": [
                                                 "declared_task_contains_ascii_insensitive",
+                                                "declared_task_contains_word_ascii_insensitive",
                                                 "scope_path_prefix"
                                               ],
                                               "type": "string"

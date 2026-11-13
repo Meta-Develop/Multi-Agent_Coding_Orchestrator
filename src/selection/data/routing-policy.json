@@ -57,7 +57,7 @@
     "rules": [
       {
         "id": "declared-deletion",
-        "match_kind": "declared_task_contains_ascii_insensitive",
+        "match_kind": "declared_task_contains_word_ascii_insensitive",
         "pattern": "delete",
         "complexity_basis_points": 0,
         "risk_basis_points": 6000,
