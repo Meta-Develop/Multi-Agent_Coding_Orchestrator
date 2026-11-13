@@ -1107,7 +1107,13 @@ fn preview_registered_repository_local_worktrees(
             .context("worktree GC apparent considered bytes overflowed")?;
         let untracked_paths = match preview_registered_worktree_dirtiness(&path)? {
             WorktreeGcDirtiness::Clean => Vec::new(),
-            WorktreeGcDirtiness::TrackedDirty => {
+            WorktreeGcDirtiness::TrackedDirty(records)
+                if options.targets_only
+                    && records.iter().all(|(path, _)| !path.starts_with("target")) =>
+            {
+                Vec::new()
+            }
+            WorktreeGcDirtiness::TrackedDirty(_) => {
                 report.protected_count = report
                     .protected_count
                     .checked_add(1)
@@ -1810,6 +1816,7 @@ struct WorktreeGcCandidate {
     merged_into_reference: Option<String>,
     removal_lease: Option<ManagedWorktreeRemovalLease>,
     untracked_paths: Vec<PathBuf>,
+    tracked_records: BoundedStatusPathRecords,
     apparent_worktree_bytes: u64,
     apparent_target_bytes: Option<u64>,
     rebuild_cost_ms: Option<u64>,
@@ -1890,7 +1897,7 @@ fn remove_gc_candidate(
     }
     let final_dirtiness = gc_worktree_dirtiness(&binding.path)?;
     match &final_dirtiness {
-        WorktreeGcDirtiness::TrackedDirty => {
+        WorktreeGcDirtiness::TrackedDirty(_) => {
             return Ok(WorktreeGcRemovalOutcome::DirtinessChanged {
                 reason: WorktreeGcReason::Dirty,
                 untracked_paths: Vec::new(),
@@ -1910,7 +1917,7 @@ fn remove_gc_candidate(
     }
     let final_untracked_paths = match &final_dirtiness {
         WorktreeGcDirtiness::UntrackedOnly(paths) => paths.clone(),
-        WorktreeGcDirtiness::Clean | WorktreeGcDirtiness::TrackedDirty => Vec::new(),
+        WorktreeGcDirtiness::Clean | WorktreeGcDirtiness::TrackedDirty(_) => Vec::new(),
     };
     let dirtiness = managed_gc_dirtiness_snapshot(&final_dirtiness)?;
     let target_snapshot = match target {
@@ -2036,7 +2043,7 @@ fn is_active_lease_error(error: &anyhow::Error) -> bool {
 
 enum WorktreeGcDirtiness {
     Clean,
-    TrackedDirty,
+    TrackedDirty(Vec<(PathBuf, [u8; 2])>),
     UntrackedOnly(Vec<PathBuf>),
 }
 
@@ -2082,8 +2089,15 @@ fn gc_dirtiness_from_status(status: BoundedStatusPathRecords) -> Result<Worktree
     if status.is_empty() {
         return Ok(WorktreeGcDirtiness::Clean);
     }
-    if status.iter().any(|(_, status)| *status != [b'?', b'?']) {
-        return Ok(WorktreeGcDirtiness::TrackedDirty);
+    let mut tracked_records: Vec<_> = status
+        .iter()
+        .filter(|(_, status)| *status != *b"??")
+        .cloned()
+        .collect();
+    if !tracked_records.is_empty() {
+        tracked_records.sort();
+        tracked_records.dedup();
+        return Ok(WorktreeGcDirtiness::TrackedDirty(tracked_records));
     }
     Ok(WorktreeGcDirtiness::UntrackedOnly(
         status.into_iter().map(|(path, _)| path).collect(),
@@ -2127,6 +2141,7 @@ fn preview_registered_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtin
             }
             let mut total_bytes = 0usize;
             let mut untracked = Vec::new();
+            let mut tracked_records = Vec::new();
             for entry in statuses.iter() {
                 let entry_path = entry
                     .path()
@@ -2137,9 +2152,6 @@ fn preview_registered_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtin
                 if total_bytes > MAX_WORKTREE_STATUS_OUTPUT_BYTES {
                     bail!("registered worktree preview status exceeds its output limit");
                 }
-                if entry.status() != Status::WT_NEW {
-                    return Ok(WorktreeGcDirtiness::TrackedDirty);
-                }
                 let path = PathBuf::from(entry_path);
                 if path.is_absolute()
                     || path
@@ -2148,11 +2160,19 @@ fn preview_registered_worktree_dirtiness(path: &Path) -> Result<WorktreeGcDirtin
                 {
                     bail!("registered worktree preview returned an unsafe status path");
                 }
-                untracked.push(path);
+                if entry.status() != Status::WT_NEW {
+                    tracked_records.push((path, *b" M"));
+                } else {
+                    untracked.push(path);
+                }
             }
+            tracked_records.sort();
+            tracked_records.dedup();
             untracked.sort();
             untracked.dedup();
-            if untracked.is_empty() {
+            if !tracked_records.is_empty() {
+                Ok(WorktreeGcDirtiness::TrackedDirty(tracked_records))
+            } else if untracked.is_empty() {
                 Ok(WorktreeGcDirtiness::Clean)
             } else {
                 Ok(WorktreeGcDirtiness::UntrackedOnly(untracked))
@@ -2166,7 +2186,7 @@ fn managed_gc_dirtiness_snapshot(
 ) -> Result<ManagedGcDirtinessSnapshot> {
     match dirtiness {
         WorktreeGcDirtiness::Clean => Ok(ManagedGcDirtinessSnapshot::Clean),
-        WorktreeGcDirtiness::TrackedDirty => {
+        WorktreeGcDirtiness::TrackedDirty(_) => {
             bail!("tracked-dirty worktree state cannot be approved for GC")
         }
         WorktreeGcDirtiness::UntrackedOnly(paths) => {
@@ -2486,10 +2506,28 @@ fn worktree_gc_dirtiness_disposition(
     dirtiness: WorktreeGcDirtiness,
     targets_only: bool,
     allowed_untracked_paths: &BTreeSet<PathBuf>,
+    tracked_records: &[(PathBuf, [u8; 2])],
 ) -> WorktreeGcDirtinessDisposition {
+    if targets_only {
+        let current_tracked_records = match &dirtiness {
+            WorktreeGcDirtiness::TrackedDirty(records) => records.as_slice(),
+            WorktreeGcDirtiness::Clean | WorktreeGcDirtiness::UntrackedOnly(_) => &[],
+        };
+        if current_tracked_records != tracked_records {
+            return WorktreeGcDirtinessDisposition::Protected {
+                reason: WorktreeGcReason::Dirty,
+                untracked_paths: Vec::new(),
+            };
+        }
+    }
     match dirtiness {
         WorktreeGcDirtiness::Clean => WorktreeGcDirtinessDisposition::Eligible(Vec::new()),
-        WorktreeGcDirtiness::TrackedDirty => WorktreeGcDirtinessDisposition::Protected {
+        WorktreeGcDirtiness::TrackedDirty(records)
+            if targets_only && records.iter().all(|(path, _)| !path.starts_with("target")) =>
+        {
+            WorktreeGcDirtinessDisposition::Eligible(Vec::new())
+        }
+        WorktreeGcDirtiness::TrackedDirty(_) => WorktreeGcDirtinessDisposition::Protected {
             reason: WorktreeGcReason::Dirty,
             untracked_paths: Vec::new(),
         },

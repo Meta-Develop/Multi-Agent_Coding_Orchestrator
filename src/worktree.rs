@@ -3771,9 +3771,15 @@ impl WorktreeManager {
                 .apparent_considered_bytes
                 .checked_add(size.worktree_bytes)
                 .context("worktree GC apparent considered bytes overflowed")?;
-            let untracked_paths = match gc_worktree_dirtiness(&verified.path)? {
-                WorktreeGcDirtiness::Clean => Vec::new(),
-                WorktreeGcDirtiness::TrackedDirty => {
+            let (untracked_paths, tracked_records) = match gc_worktree_dirtiness(&verified.path)? {
+                WorktreeGcDirtiness::Clean => (Vec::new(), Vec::new()),
+                WorktreeGcDirtiness::TrackedDirty(records)
+                    if options.targets_only
+                        && records.iter().all(|(path, _)| !path.starts_with("target")) =>
+                {
+                    (Vec::new(), records)
+                }
+                WorktreeGcDirtiness::TrackedDirty(_) => {
                     report.protected_count = report
                         .protected_count
                         .checked_add(1)
@@ -3820,7 +3826,7 @@ impl WorktreeManager {
                         });
                         continue;
                     }
-                    paths
+                    (paths, Vec::new())
                 }
             };
             let superseded = superseded_by_agent_id.contains_key(&binding.name);
@@ -3834,6 +3840,7 @@ impl WorktreeManager {
                     .map(|(reference, _)| reference.clone()),
                 removal_lease,
                 untracked_paths,
+                tracked_records,
                 apparent_worktree_bytes: size.worktree_bytes,
                 apparent_target_bytes: size.target_bytes,
                 rebuild_cost_ms: load_lane_rebuild_cost(&verified.path),
@@ -3892,6 +3899,7 @@ impl WorktreeManager {
                     gc_worktree_dirtiness(&candidate.binding.path)?,
                     options.targets_only,
                     &allowed_untracked_paths,
+                    &candidate.tracked_records,
                 ) {
                     WorktreeGcDirtinessDisposition::Eligible(paths) => {
                         candidate.untracked_paths = paths;
@@ -4140,6 +4148,7 @@ impl WorktreeManager {
                             gc_worktree_dirtiness(&candidate.binding.path)?,
                             options.targets_only,
                             &allowed_untracked_paths,
+                            &candidate.tracked_records,
                         ) {
                             WorktreeGcDirtinessDisposition::Eligible(paths) => {
                                 candidate.untracked_paths = paths;

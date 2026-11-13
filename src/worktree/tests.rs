@@ -4006,6 +4006,206 @@ fn gc_targets_only_reclaims_untracked_lane_target_and_keeps_lane_branch_and_orph
 
 #[cfg(target_os = "linux")]
 #[test]
+fn gc_targets_only_reclaims_tracked_dirty_lane_target_and_keeps_files() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let manager = WorktreeManager::new(&repo_path);
+    let created = create_gc_worktree(&manager, "tracked-target-only-lane", &worktree_root);
+    let readme = b"# Finished worker candidate\n";
+    let notes = b"untracked worker notes\n";
+    fs::write(created.path.join("README.md"), readme).expect("tracked candidate");
+    fs::write(created.path.join("notes.txt"), notes).expect("untracked notes");
+    fs::create_dir_all(created.path.join("target/debug")).expect("lane target");
+    fs::write(created.path.join("target/debug/artifact"), "artifact\n").expect("target artifact");
+
+    let preview = manager
+        .gc_with_target_liveness(
+            gc_targets_only_options(Some(worktree_root.clone()), true),
+            |_| WorktreeTargetLiveness::Clear,
+        )
+        .expect("target-only dry run");
+    let target_bytes = preview.entries[0]
+        .apparent_target_bytes
+        .expect("target byte estimate");
+    assert!(target_bytes > 0);
+    assert_eq!(preview.target_removed_count, 0);
+    assert_eq!(preview.entries[0].status, WorktreeGcStatus::Retained);
+    assert_eq!(
+        preview.entries[0].reason,
+        WorktreeGcReason::TargetWouldRemove
+    );
+    assert_eq!(preview.estimated_reclaimable_bytes, target_bytes);
+    assert_eq!(preview.estimated_reclaimed_bytes, 0);
+    assert!(preview.entries[0].untracked_paths.is_empty());
+    assert!(created.path.join("target").exists());
+
+    let report = manager
+        .gc_with_target_liveness(gc_targets_only_options(Some(worktree_root), false), |_| {
+            WorktreeTargetLiveness::Clear
+        })
+        .expect("tracked-dirty target-only GC");
+
+    assert_eq!(report.removed_count, 0);
+    assert_eq!(report.target_removed_count, 1, "{report:#?}");
+    assert_eq!(report.entries[0].reason, WorktreeGcReason::TargetRemoved);
+    assert_eq!(report.estimated_reclaimable_bytes, target_bytes);
+    assert_eq!(report.estimated_reclaimed_bytes, target_bytes);
+    assert!(report.entries[0].untracked_paths.is_empty());
+    assert!(!created.path.join("target").exists());
+    assert_eq!(
+        fs::read(created.path.join("README.md")).expect("candidate"),
+        readme
+    );
+    assert_eq!(
+        fs::read(created.path.join("notes.txt")).expect("notes"),
+        notes
+    );
+    assert!(repo.find_branch(&created.branch, BranchType::Local).is_ok());
+    assert_eq!(manager.list().expect("retained lane"), vec![created]);
+}
+
+#[test]
+fn gc_targets_only_requires_identical_normalized_tracked_records() {
+    let expected = vec![
+        (PathBuf::from("README.md"), *b" M"),
+        (PathBuf::from("target-other/file"), *b" M"),
+    ];
+    let mut status = vec![
+        expected[1].clone(),
+        expected[0].clone(),
+        expected[0].clone(),
+    ];
+    status.push((PathBuf::from("notes.txt"), *b"??"));
+    let dirtiness = gc_dirtiness_from_status(status).expect("classify status");
+    let WorktreeGcDirtiness::TrackedDirty(records) = &dirtiness else {
+        panic!("expected tracked records");
+    };
+    assert_eq!(records, &expected);
+    let allowed = BTreeSet::new();
+    assert!(matches!(
+        worktree_gc_dirtiness_disposition(dirtiness, true, &allowed, &expected),
+        WorktreeGcDirtinessDisposition::Eligible(paths) if paths.is_empty()
+    ));
+
+    for dirtiness in [
+        WorktreeGcDirtiness::Clean,
+        WorktreeGcDirtiness::UntrackedOnly(vec![PathBuf::from("notes.txt")]),
+        WorktreeGcDirtiness::TrackedDirty(vec![(PathBuf::from("README.md"), *b" D")]),
+    ] {
+        assert!(matches!(
+            worktree_gc_dirtiness_disposition(dirtiness, true, &allowed, &expected),
+            WorktreeGcDirtinessDisposition::Protected {
+                reason: WorktreeGcReason::Dirty,
+                ..
+            }
+        ));
+    }
+    for (path, targets_only, initial_records) in [
+        ("target", true, true),
+        ("target/keep.txt", true, true),
+        ("README.md", true, false),
+        ("README.md", false, true),
+    ] {
+        let records = vec![(PathBuf::from(path), *b" M")];
+        let expected = if initial_records {
+            records.as_slice()
+        } else {
+            &[]
+        };
+        assert!(matches!(
+            worktree_gc_dirtiness_disposition(
+                WorktreeGcDirtiness::TrackedDirty(records.clone()),
+                targets_only,
+                &allowed,
+                expected,
+            ),
+            WorktreeGcDirtinessDisposition::Protected {
+                reason: WorktreeGcReason::Dirty,
+                ..
+            }
+        ));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_targets_only_protects_tracked_changes_inside_target() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    fs::create_dir_all(repo_path.join("target")).expect("tracked target directory");
+    fs::write(repo_path.join("target/keep.txt"), "tracked target\n").expect("tracked target");
+    let mut index = repo.index().expect("index");
+    index
+        .add_path(Path::new("target/keep.txt"))
+        .expect("add target");
+    index.write().expect("write index");
+    commit_readme(&repo).expect("initial commit with tracked target");
+    let manager = WorktreeManager::new(&repo_path);
+    let created = create_gc_worktree(&manager, "tracked-inside-target", &worktree_root);
+    fs::write(
+        created.path.join("target/keep.txt"),
+        "changed tracked target content\n",
+    )
+    .expect("tracked edit");
+
+    let report = manager
+        .gc_with_target_liveness(gc_targets_only_options(Some(worktree_root), false), |_| {
+            WorktreeTargetLiveness::Clear
+        })
+        .expect("tracked target protection");
+
+    assert_eq!(report.target_removed_count, 0, "{report:#?}");
+    assert_eq!(report.protected_count, 1, "{report:#?}");
+    assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
+    assert!(created.path.join("target").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn gc_targets_only_protects_changed_tracked_status_at_boundary() {
+    skip_without_containment!();
+    let temp = TempDir::new().expect("tempdir");
+    let repo_path = temp.path().join("repo");
+    let worktree_root = temp.path().join("worktrees");
+    WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+    let repo = crate::git_repository::open(&repo_path).expect("open repo");
+    commit_readme(&repo).expect("initial commit");
+    let manager = WorktreeManager::new(&repo_path);
+    let created = create_gc_worktree(&manager, "tracked-status-boundary", &worktree_root);
+    fs::write(created.path.join("README.md"), "candidate\n").expect("tracked candidate");
+    fs::create_dir_all(created.path.join("target/debug")).expect("lane target");
+    fs::write(created.path.join("target/debug/artifact"), "artifact\n").expect("target artifact");
+    let liveness_calls = std::cell::Cell::new(0usize);
+
+    let report = manager
+        .gc_with_target_liveness(gc_targets_only_options(Some(worktree_root), false), |_| {
+            let call = liveness_calls.get();
+            liveness_calls.set(call.saturating_add(1));
+            if call == 1 {
+                fs::remove_file(created.path.join("README.md")).expect("delete tracked candidate");
+            }
+            WorktreeTargetLiveness::Clear
+        })
+        .expect("changed tracked status protection");
+
+    assert_eq!(liveness_calls.get(), 2, "preflight and boundary probes");
+    assert_eq!(report.target_removed_count, 0, "{report:#?}");
+    assert_eq!(report.protected_count, 1, "{report:#?}");
+    assert_eq!(report.entries[0].reason, WorktreeGcReason::Dirty);
+    assert!(created.path.join("target").exists());
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn gc_refuses_live_nested_cargo_target_for_full_and_target_only_reclaim() {
     skip_without_containment!();
     let temp = TempDir::new().expect("tempdir");

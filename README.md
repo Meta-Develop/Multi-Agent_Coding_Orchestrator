@@ -2506,9 +2506,13 @@ managed lane, branch, untracked file, and registered association. Because it is
 a separate operation, it rejects `--keep-targets`, every retention filter
 (including `--max-total-bytes`),
 untracked-path allowances, and machine-global orphan-cleanup bindings, and it
-does not run orphan pruning. Tracked changes, active claims, and active leases
-still protect the target; an untracked-only lane does not require an allowlist
-because the lane and its files remain. On Linux, every target deletion scans a
+does not run orphan pruning. Active claims and active leases still protect the
+target. Tracked changes protect it only when a changed tracked path lies inside
+`target/` or when the tracked changes differ from those seen when the lane was
+first examined; otherwise a tracked-dirty lane, such as a finished supervised
+Worker lane whose candidate is its uncommitted diff, is eligible because the
+lane and all of its files remain. An untracked-only lane does not require an
+allowlist for the same reason. On Linux, every target deletion scans a
 bounded `/proc` snapshot for same-user processes. Explicit `CARGO_TARGET_DIR`
 values are resolved in the process's own view: absolute paths through
 `/proc/<pid>/root` and relative paths through `/proc/<pid>/cwd`. Canonical path
