@@ -87,6 +87,11 @@ fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
     &value[..end]
 }
 
+const EVIDENCE_CORRECTION_BLOCK: &str = "EVIDENCE CORRECTION:\n\
+The reviewers rejected the evidence for this attempt, not the implementation. \
+Keep the implementation unless a finding names a defect in it. The re-audit on the \"Next safe operation\" line above is the parent's fallback if this correction does not resolve the findings. \
+Regenerate the evidence that the findings question: run each such listed validation command again exactly as listed, then return a WorkerReport whose commands_run and validation_results match the execution journal, with one commands_run entry for every run, including each earlier failed run.\n";
+
 pub(super) fn prompt_with_gate_correction(
     prompt: &str,
     denial: &GateDenial,
@@ -99,6 +104,15 @@ pub(super) fn prompt_with_gate_correction(
     if matches!(denial.reason, GateDenialReason::AuditorRepair { .. }) {
         prompt.push('\n');
         prompt.push_str(&auditor_repair_findings_block(auditor_findings)?);
+        if matches!(
+            denial.reason,
+            GateDenialReason::AuditorRepair {
+                rejection: AuditorRejectionKind::EvidenceQuality,
+            }
+        ) {
+            prompt.push('\n');
+            prompt.push_str(EVIDENCE_CORRECTION_BLOCK);
+        }
     }
     Ok(prompt)
 }

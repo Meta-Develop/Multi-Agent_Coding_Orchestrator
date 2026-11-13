@@ -7945,6 +7945,19 @@ fn gate_denial_is_model_quality_failure(denial: &GateDenial) -> bool {
     )
 }
 
+fn evidence_quality_correction_allowed(
+    rejection_kind: Option<AuditorRejectionKind>,
+    procedural_failure: bool,
+    evidence_only_reaudit_run: bool,
+    corrections_used: u8,
+    correction_budget: u8,
+) -> bool {
+    rejection_kind == Some(AuditorRejectionKind::EvidenceQuality)
+        && !procedural_failure
+        && !evidence_only_reaudit_run
+        && corrections_used < correction_budget
+}
+
 fn parent_auditor_rejection_kind(
     assignment: &OrchestratorAssignment,
     child_report: &OrchestratorReviewReport,
@@ -8058,6 +8071,18 @@ fn decide_parent_auditor_gate(
     let evidence_only_rejection = parent_auditor_failed
         && (auditor_rejection_kind == Some(AuditorRejectionKind::EvidenceQuality)
             || (procedural_failure && procedural_budget.is_none()));
+    let (corrections_used, correction_budget) = outcome
+        .gate_tracker
+        .as_ref()
+        .map(|tracker| (tracker.used, tracker.budget))
+        .unwrap_or((0, 0));
+    let evidence_correction = evidence_quality_correction_allowed(
+        auditor_rejection_kind,
+        procedural_failure,
+        context.evidence_only_reaudit.is_some(),
+        corrections_used,
+        correction_budget,
+    );
     if parent_auditor_repair_eligible(
         parent_auditor_failed,
         assignment_containment_verified,
@@ -8109,7 +8134,7 @@ fn decide_parent_auditor_gate(
             VerifiedGateContext::new(&assignment.id, source, paths)?,
         )
         .context("failed to construct parent-auditor gate denial")?;
-        if evidence_only_rejection || procedural_failure {
+        if (evidence_only_rejection && !evidence_correction) || procedural_failure {
             outcome
                 .gate_tracker
                 .as_mut()
@@ -9209,6 +9234,61 @@ mod decomposition_tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::time::Instant;
+    #[test]
+    fn evidence_correction_allowed_only_for_budgeted_ordinary_evidence_rejections() {
+        assert!(evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            false,
+            false,
+            0,
+            1
+        ));
+        assert!(evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            false,
+            false,
+            1,
+            2
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            None, false, false, 0, 1
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::ImplementationDefect),
+            false,
+            false,
+            0,
+            1
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            true,
+            false,
+            0,
+            1
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            false,
+            true,
+            0,
+            1
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            false,
+            false,
+            1,
+            1
+        ));
+        assert!(!evidence_quality_correction_allowed(
+            Some(AuditorRejectionKind::EvidenceQuality),
+            false,
+            false,
+            0,
+            0
+        ));
+    }
     use std::{ffi::OsString, sync::MutexGuard};
 
     #[cfg(target_os = "linux")]
@@ -10520,7 +10600,13 @@ mod decomposition_tests {
             max_child_assignments: 1,
             max_child_retries: 0,
             max_gate_corrections: u8::from(
-                case.starts_with("lens-") && !case.starts_with("lens-implementation"),
+                // With a zero correction budget an evidence rejection still
+                // escalates; the budgeted correction is covered by
+                // evidence_correction_allowed_only_for_budgeted_ordinary_evidence_rejections
+                // and reaudit_source_evidence_rejection_gets_one_worker_turn_then_accepts.
+                case.starts_with("lens-")
+                    && !case.starts_with("lens-implementation")
+                    && !case.starts_with("lens-evidence"),
             ),
             child_timeout_seconds: 10,
             semantic_coordination: SemanticCoordinationMode::Off,
