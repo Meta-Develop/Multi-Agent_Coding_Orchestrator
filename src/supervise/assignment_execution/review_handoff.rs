@@ -339,7 +339,7 @@ fn select_worker_operations(
     // Selecting one record can split one omission range in two. Reserve 512 B
     // for the additional range (coordinates, counts, kinds, reasons and hash),
     // independently of the exact serialized, redacted record size.
-    for record in &mut records {
+    for record in records.iter_mut().rev() {
         if !record.required && !whole {
             continue;
         }

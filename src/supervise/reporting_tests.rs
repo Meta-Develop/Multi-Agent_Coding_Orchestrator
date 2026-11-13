@@ -205,6 +205,43 @@ fn observed_entry(worktree: &Path, command: &[&str]) -> WorkerExecutionJournalEn
 }
 
 #[test]
+fn worker_journal_completion_records_wrapped_exit_code() {
+    let (_temp, worktree, path, identity) = observed_fixture();
+    run_worker_execution_journal_command(
+        &path,
+        &identity,
+        &observed_entry(&worktree, &["/bin/sh", "-c", "exit 0"]),
+        false,
+    )
+    .unwrap();
+    let error = run_worker_execution_journal_command(
+        &path,
+        &identity,
+        &observed_entry(&worktree, &["/bin/sh", "-c", "exit 3"]),
+        false,
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("wrapped command failed"));
+    let bytes = fs::read(&path).unwrap();
+    let records = bytes
+        .split(|byte| *byte == b'\n')
+        .filter(|line| !line.is_empty())
+        .map(|line| serde_json::from_slice::<WorkerExecutionJournalEntry>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(records.len(), 4);
+    assert_eq!(records[0].observation.as_ref().unwrap().exit_code, None);
+    assert_eq!(records[1].observation.as_ref().unwrap().exit_code, Some(0));
+    assert_eq!(records[2].observation.as_ref().unwrap().exit_code, None);
+    assert_eq!(records[3].observation.as_ref().unwrap().exit_code, Some(3));
+    for index in [1, 3] {
+        assert_eq!(
+            records[index].observation.as_ref().unwrap().phase,
+            WorkerJournalObservationPhase::Completed
+        );
+    }
+}
+
+#[test]
 fn worker_journal_wrapped_edit_observes_paths_without_declaration() {
     let (_temp, worktree, path, identity) = observed_fixture();
     let record = observed_entry(
