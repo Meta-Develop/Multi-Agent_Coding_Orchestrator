@@ -84,9 +84,7 @@ fn automatic_worker_plan() -> Result<SupervisorPlan> {
     Ok(plan)
 }
 
-fn resolve_automatic(
-    plan: &mut SupervisorPlan,
-) -> Result<SupervisorSelectionResolution> {
+fn resolve_automatic(plan: &mut SupervisorPlan) -> Result<SupervisorSelectionResolution> {
     initialize_supervisor_selection(
         plan,
         SupervisorRuntime::Codex,
@@ -96,9 +94,7 @@ fn resolve_automatic(
     )
 }
 
-fn worker_provenance(
-    resolution: &SupervisorSelectionResolution,
-) -> Result<&SelectionProvenance> {
+fn worker_provenance(resolution: &SupervisorSelectionResolution) -> Result<&SelectionProvenance> {
     Ok(&resolution
         .decisions
         .iter()
@@ -148,14 +144,212 @@ fn vibe_prior_backed_worker_is_selected_automatically_when_cheaper() -> Result<(
 }
 
 #[test]
+fn vibe_reselection_keeps_bound_vibe_lane_for_worker() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    assert_bound_vibe_reselection(resolve_automatic(&mut plan)?)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn vibe_reselection_keeps_bound_vibe_lane_with_account_observed_primary() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, true)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    let accounts = vec![(
+        SupervisorRuntime::Codex,
+        qualified_account_fixture("codex-cli", FRONTIER_PROFILE_MODEL, "xhigh"),
+    )];
+    let (assessment, _, _) = fixture_task_assessment(&plan)?;
+    let resolution = initialize_supervisor_selection_with_shapes(
+        &mut plan,
+        SupervisorRuntime::Codex,
+        &codex_catalog()?,
+        &test_admission(),
+        &AdvertisedCatalogSet::empty(),
+        Some(&default_resolved_profile()),
+        SupervisorQuotaSelectionInput::default(),
+        None,
+        &accounts,
+        Some(&assessment),
+        &AssignmentSelectionShapes::default(),
+    )?;
+    assert_eq!(
+        resolution
+            .automatic_state
+            .as_ref()
+            .context("automatic account selection state")?
+            .account_observations,
+        accounts
+    );
+    assert_bound_vibe_reselection(resolution)
+}
+
+fn assert_bound_vibe_reselection(resolution: SupervisorSelectionResolution) -> Result<()> {
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let initial = worker_provenance(&resolution)?;
+    let choice = initial.choice.as_ref().context("initial Worker choice")?;
+    assert_eq!(
+        (&*choice.candidate.runtime, &*choice.candidate.model),
+        ("vibe", VIBE_MODEL)
+    );
+    let initial_pools = initial.normalized_input.pools.clone();
+    let state = resolution
+        .automatic_state
+        .context("automatic selection state")?;
+    let catalog = codex_catalog()?;
+    for keep_vibe_pool in [true, false] {
+        let mut state = state.clone();
+        if !keep_vibe_pool {
+            state
+                .decisions
+                .get_mut(&AgentRole::Worker)
+                .context("Worker replay state")?
+                .normalized_input
+                .pools
+                .retain(|pool| pool.runtime != "vibe");
+        }
+        for retry_count in [0, 1] {
+            let replay = reselect_assignment_from_supplied_catalog_snapshot(
+                &mut state,
+                SupervisorRuntime::Codex,
+                &catalog,
+                &[AgentRole::Worker],
+                retry_count,
+                BudgetSignal::Continue,
+                &[],
+                None,
+            )?;
+            let decision = &replay.decisions[0].1;
+            let input = &decision.normalized_input;
+            assert_eq!(
+                input
+                    .catalogs
+                    .iter()
+                    .filter(|catalog| catalog.runtime == "vibe")
+                    .count(),
+                1
+            );
+            assert!(input.constraints.allowed_runtimes.contains("vibe"));
+            assert_eq!(
+                input
+                    .pools
+                    .iter()
+                    .filter(|pool| pool.runtime == "vibe")
+                    .count(),
+                1
+            );
+            if keep_vibe_pool {
+                assert_eq!(input.pools, initial_pools);
+            }
+            let choice = decision
+                .choice
+                .as_ref()
+                .context("reselected Worker choice")?;
+            assert_eq!(
+                (&*choice.candidate.runtime, &*choice.candidate.model),
+                ("vibe", VIBE_MODEL)
+            );
+        }
+    }
+    let non_worker_roles = state
+        .decisions
+        .keys()
+        .copied()
+        .filter(|role| *role != AgentRole::Worker)
+        .collect::<Vec<_>>();
+    let replay = reselect_assignment_from_supplied_catalog_snapshot(
+        &mut state.clone(),
+        SupervisorRuntime::Codex,
+        &catalog,
+        &non_worker_roles,
+        0,
+        BudgetSignal::Continue,
+        &[],
+        None,
+    )?;
+    for (_, decision) in replay.decisions {
+        assert!(decision
+            .normalized_input
+            .catalogs
+            .iter()
+            .all(|catalog| catalog.runtime != "vibe"));
+    }
+    Ok(())
+}
+
+#[test]
+fn vibe_reselection_without_bound_executable_adds_no_lane() -> Result<()> {
+    let _policy = bind_fixture_routing_policy()?;
+    let (_temporary, repo) = super::super::tests::injected_repository();
+    let _binding = bind_vibe_fixture_programs(&repo, false)?;
+    let _prior = vibe_selection_prior(&repo, None)?;
+    let mut plan = automatic_worker_plan()?;
+    let resolution = resolve_automatic(&mut plan)?;
+    assert!(
+        resolution.selection_preflight_failure.is_none(),
+        "{:?}",
+        resolution.selection_preflight_failure
+    );
+    let mut state = resolution
+        .automatic_state
+        .context("automatic selection state")?;
+    for retry_count in [0, 1] {
+        let replay = reselect_assignment_from_supplied_catalog_snapshot(
+            &mut state,
+            SupervisorRuntime::Codex,
+            &codex_catalog()?,
+            &[AgentRole::Worker],
+            retry_count,
+            BudgetSignal::Continue,
+            &[],
+            None,
+        )?;
+        let decision = &replay.decisions[0].1;
+        assert!(decision
+            .normalized_input
+            .catalogs
+            .iter()
+            .all(|catalog| catalog.runtime != "vibe"));
+        assert!(decision
+            .normalized_input
+            .pools
+            .iter()
+            .all(|pool| pool.runtime != "vibe"));
+        assert!(!decision
+            .normalized_input
+            .constraints
+            .allowed_runtimes
+            .contains("vibe"));
+        assert_eq!(
+            decision
+                .choice
+                .as_ref()
+                .context("reselected Worker choice")?
+                .candidate
+                .runtime,
+            "codex"
+        );
+    }
+    Ok(())
+}
+
+#[test]
 fn vibe_prior_task_shape_ceiling_excludes_high_risk_worker_task() -> Result<()> {
     let _policy = bind_fixture_routing_policy()?;
     let (_temporary, repo) = super::super::tests::injected_repository();
     let _binding = bind_vibe_fixture_programs(&repo, true)?;
-    let _prior = vibe_selection_prior(
-        &repo,
-        Some(selection::TaskShapeCeiling::bounded_terminal()),
-    )?;
+    let _prior =
+        vibe_selection_prior(&repo, Some(selection::TaskShapeCeiling::bounded_terminal()))?;
     let resolved_profile = default_resolved_profile();
     let mut input = super::selection_input_for_role_with_assessment(
         SelectionInputForRoleArgs {
