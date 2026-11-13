@@ -16,6 +16,11 @@ use std::{
 };
 use tempfile::TempDir;
 
+fn skip_without_host_ownership(name: &str) -> bool {
+    multi_agent_coding_orchestrator::containment_probe::skip_if_host_ownership_unavailable(name)
+        .unwrap()
+}
+
 struct Fixture {
     temp: TempDir,
     trust_path: PathBuf,
@@ -219,6 +224,9 @@ const COMPLETE: &str = "printf 'new\\n' > a.txt; printf '{\"candidate\":true}' >
 
 #[test]
 fn completion_and_exact_cleanup_over_real_local_helper() {
+    if skip_without_host_ownership("completion_and_exact_cleanup_over_real_local_helper") {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     let executor = f.executor();
     let (manifest, launch, outputs) = f.payload();
@@ -284,6 +292,11 @@ fn completion_and_exact_cleanup_over_real_local_helper() {
 
 #[test]
 fn lost_launch_and_collection_replies_reuse_identity_without_relaunch() {
+    if skip_without_host_ownership(
+        "lost_launch_and_collection_replies_reuse_identity_without_relaunch",
+    ) {
+        return;
+    }
     for loss in ["launch", "collect"] {
         let f = Fixture::new(COMPLETE, loss);
         let executor = f.executor();
@@ -336,6 +349,11 @@ fn lost_launch_and_collection_replies_reuse_identity_without_relaunch() {
 
 #[test]
 fn cancellation_controls_owned_process_and_collects_terminal_evidence() {
+    if skip_without_host_ownership(
+        "cancellation_controls_owned_process_and_collects_terminal_evidence",
+    ) {
+        return;
+    }
     let f = Fixture::new("printf '{}' > \"$1\"; sleep 20", "none");
     let executor = f.executor();
     let (manifest, launch, outputs) = f.payload();
@@ -400,6 +418,11 @@ fn cancellation_controls_owned_process_and_collects_terminal_evidence() {
 
 #[test]
 fn trust_tamper_permissions_replacement_and_target_mismatch_refuse() {
+    if skip_without_host_ownership(
+        "trust_tamper_permissions_replacement_and_target_mismatch_refuse",
+    ) {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     fs::set_permissions(&f.trust_path, fs::Permissions::from_mode(0o644)).unwrap();
     assert!(OperatorTrust::load(&f.trust_path).is_err());
@@ -442,11 +465,19 @@ fn trust_tamper_permissions_replacement_and_target_mismatch_refuse() {
 
 #[test]
 fn cli_configured_dispatch_persists_candidate_and_keeps_native_gate() {
+    if skip_without_host_ownership(
+        "cli_configured_dispatch_persists_candidate_and_keeps_native_gate",
+    ) {
+        return;
+    }
     cli_dispatch_case(false);
 }
 
 #[test]
 fn review_absent_delegation_is_actionable_and_retryable() {
+    if skip_without_host_ownership("review_absent_delegation_is_actionable_and_retryable") {
+        return;
+    }
     if std::env::var_os("MACO_I717L_DELEGATION_PROBE").is_none() {
         let status = std::process::Command::new("systemd-run")
             .args(["--user", "--scope", "--quiet", "-p", "Delegate=no"])
@@ -645,6 +676,9 @@ printf '{"candidate":true}' > "$result"
 
 #[test]
 fn review_binary_same_second_rewrite_must_revoke_trust() {
+    if skip_without_host_ownership("review_binary_same_second_rewrite_must_revoke_trust") {
+        return;
+    }
     use std::os::unix::fs::MetadataExt;
     let mut observed = false;
     for _ in 0..5 {
@@ -676,6 +710,9 @@ fn review_binary_same_second_rewrite_must_revoke_trust() {
 
 #[test]
 fn review_ssh_binary_symlink_ancestor_must_refuse() {
+    if skip_without_host_ownership("review_ssh_binary_symlink_ancestor_must_refuse") {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     let real = f.temp.path().join("real-bin");
     fs::create_dir(&real).unwrap();
@@ -767,6 +804,9 @@ fn pipe_probe(script: &str, large_input: bool) -> Duration {
 
 #[test]
 fn review_transport_exit_must_not_disable_pipe_deadline() {
+    if skip_without_host_ownership("review_transport_exit_must_not_disable_pipe_deadline") {
+        return;
+    }
     let elapsed = review_pipe_probe("#!/bin/bash\ncat >/dev/null\nsleep 2 &\nexit 0\n");
     assert!(
         elapsed < Duration::from_secs(1),
@@ -776,6 +816,9 @@ fn review_transport_exit_must_not_disable_pipe_deadline() {
 
 #[test]
 fn review_transport_kill_must_not_block_on_escaped_pipe_owner() {
+    if skip_without_host_ownership("review_transport_kill_must_not_block_on_escaped_pipe_owner") {
+        return;
+    }
     let elapsed = review_pipe_probe("#!/bin/bash\ncat >/dev/null\nsetsid sleep 2 &\nsleep 5\n");
     assert!(
         elapsed < Duration::from_secs(1),
@@ -785,6 +828,9 @@ fn review_transport_kill_must_not_block_on_escaped_pipe_owner() {
 
 #[test]
 fn review_trust_must_reject_openssh_environment_expansion_paths() {
+    if skip_without_host_ownership("review_trust_must_reject_openssh_environment_expansion_paths") {
+        return;
+    }
     let mut accepted = Vec::new();
     for field in ["identity_file", "known_hosts_file"] {
         for token in ["${REVIEW_VARIABLE}", "%h", "~"] {
@@ -808,6 +854,9 @@ fn review_trust_must_reject_openssh_environment_expansion_paths() {
 
 #[test]
 fn blocked_stdin_and_escaped_pipe_owner_share_one_deadline() {
+    if skip_without_host_ownership("blocked_stdin_and_escaped_pipe_owner_share_one_deadline") {
+        return;
+    }
     let elapsed = pipe_probe("#!/bin/bash\nsetsid sleep 2 &\nexit 0\n", true);
     assert!(
         elapsed < Duration::from_secs(1),
@@ -817,6 +866,10 @@ fn blocked_stdin_and_escaped_pipe_owner_share_one_deadline() {
 
 #[test]
 fn consumer_reads_validated_trust_bytes_after_source_replacement() {
+    if skip_without_host_ownership("consumer_reads_validated_trust_bytes_after_source_replacement")
+    {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     write(
         &f.temp.path().join("replace-trust-after-validation"),
@@ -862,6 +915,9 @@ fn consumer_reads_validated_trust_bytes_after_source_replacement() {
 
 #[test]
 fn trust_revocation_is_a_bounded_local_refusal() {
+    if skip_without_host_ownership("trust_revocation_is_a_bounded_local_refusal") {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     write(&f.temp.path().join("known-placeholder"), b"changed", 0o600);
     let error = f.client.preflight().unwrap_err();
@@ -873,6 +929,9 @@ fn trust_revocation_is_a_bounded_local_refusal() {
 
 #[test]
 fn review_large_executable_validation_respects_deadline() {
+    if skip_without_host_ownership("review_large_executable_validation_respects_deadline") {
+        return;
+    }
     let f = Fixture::new(COMPLETE, "none");
     let binary = f.temp.path().join("ssh");
     let mut image = fs::read(&binary).unwrap();

@@ -382,6 +382,13 @@ mod tests {
 
     #[test]
     fn credential_snapshot_survives_replacement_after_validation() {
+        if crate::containment_probe::skip_if_host_ownership_unavailable(
+            "external_agent::executor::lifecycle::trust::tests::credential_snapshot_survives_replacement_after_validation",
+        )
+        .unwrap()
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic-identity");
         source(&path, b"validated fixture bytes", 0o600);
@@ -405,6 +412,13 @@ mod tests {
 
     #[test]
     fn executes_sealed_image_after_source_path_replacement() {
+        if crate::containment_probe::skip_if_host_ownership_unavailable(
+            "external_agent::executor::lifecycle::trust::tests::executes_sealed_image_after_source_path_replacement",
+        )
+        .unwrap()
+        {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("synthetic-ssh");
         let marker = dir.path().join("marker");
