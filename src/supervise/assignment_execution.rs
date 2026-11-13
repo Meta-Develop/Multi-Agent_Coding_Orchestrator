@@ -3075,6 +3075,9 @@ fn prepare_child_attempt_with_purpose<'a>(
         Some(ChildAttemptCorrection::Gate(denial, auditor_findings)) => {
             prompt_with_gate_correction(&prompt, denial, auditor_findings)?
         }
+        Some(ChildAttemptCorrection::ValidationGate(denial, results)) => {
+            prompt_with_validation_correction(&prompt, denial, results)?
+        }
         None => prompt,
     };
     let source_inputs = assignment_metadata
@@ -6736,7 +6739,10 @@ fn decide_child_attempt(
                 if eligible_warning {
                     *warning_streak = warning_streak_state;
                 }
-                *retry_feedback = Some(ChildAttemptCorrection::Gate(authorized_denial, Vec::new()));
+                *retry_feedback = Some(ChildAttemptCorrection::ValidationGate(
+                    authorized_denial,
+                    attempt_report.validation_results.clone(),
+                ));
                 return Ok(ChildAttemptDisposition::Retry);
             }
         } else if matches!(

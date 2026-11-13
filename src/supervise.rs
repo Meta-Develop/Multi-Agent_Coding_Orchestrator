@@ -4544,6 +4544,7 @@ struct ChildAttemptHistory {
 enum ChildAttemptCorrection {
     StructuralReport(Vec<String>),
     Gate(GateDenial, Vec<Finding>),
+    ValidationGate(GateDenial, Vec<ValidationResult>),
 }
 
 #[derive(Debug, Clone, Copy)]
