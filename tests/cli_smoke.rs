@@ -2364,6 +2364,91 @@ fn run_success_json<const N: usize>(args: [&str; N]) -> Result<Value> {
     run_success_json_args(&args)
 }
 
+#[cfg(unix)]
+#[test]
+fn cli_repo_map_allow_incomplete_reports_unreadable_directory() -> Result<()> {
+    support::require_containment!("cli_repo_map_allow_incomplete_reports_unreadable_directory");
+    // Root bypasses directory permissions, so the fixture cannot be built.
+    if unsafe { libc::geteuid() } == 0 {
+        return Ok(());
+    }
+    let temp = TempDir::new().context("tempdir")?;
+    let repo_path = create_committed_repo(temp.path())?;
+    let locked = repo_path.join("locked");
+    fs::create_dir_all(&locked).context("create locked")?;
+    fs::write(locked.join("secret.txt"), "secret\n").context("write secret")?;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).context("chmod 000")?;
+
+    let incomplete_result = (|| -> Result<Value> {
+        let output = Command::new(BIN)
+            .args([
+                "repo",
+                "map",
+                "--repo",
+                repo_path.to_str().context("repo path utf8")?,
+                "--allow-incomplete",
+                "--json",
+            ])
+            .output()
+            .context("run maco repo map --allow-incomplete")?;
+        if !output.status.success() {
+            anyhow::bail!(
+                "maco repo map --allow-incomplete failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        serde_json::from_slice(&output.stdout).context("parse json")
+    })()?;
+
+    assert_eq!(incomplete_result["complete"], false);
+    let warnings = incomplete_result["warnings"]
+        .as_array()
+        .context("warnings array")?;
+    assert_eq!(warnings.len(), 1);
+    assert_eq!(warnings[0]["path"], "locked");
+    assert_eq!(warnings[0]["category"], "permission_denied");
+    let entries = incomplete_result["entries"]
+        .as_array()
+        .context("entries array")?;
+    assert!(entries
+        .iter()
+        .any(|entry| entry["path"] == "locked" && entry["kind"] == "directory"));
+    assert!(entries.iter().any(|entry| entry["path"] == "README.md"));
+
+    let strict = Command::new(BIN)
+        .args([
+            "repo",
+            "map",
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--json",
+        ])
+        .output()
+        .context("run maco repo map without --allow-incomplete")?;
+    fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).context("chmod 755")?;
+    assert!(!strict.status.success());
+
+    let refused = Command::new(BIN)
+        .args([
+            "repo",
+            "map",
+            "--repo",
+            repo_path.to_str().context("repo path utf8")?,
+            "--allow-incomplete",
+            "--semantic",
+            "--json",
+        ])
+        .output()
+        .context("run maco repo map --allow-incomplete --semantic")?;
+    assert!(!refused.status.success());
+    let refused_stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(
+        refused_stderr.contains("cannot be used with"),
+        "expected an argument conflict error: {refused_stderr}"
+    );
+    Ok(())
+}
+
 #[test]
 fn cli_orchestrate_run_refuses_dirty_primary_with_actionable_error() -> Result<()> {
     support::require_containment!(

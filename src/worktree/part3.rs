@@ -4189,7 +4189,7 @@ fn validate_default_exclude_text_budget(
     deadline: Instant,
 ) -> Result<()> {
     ensure_worktree_status_deadline(deadline, "before default exclude budget recount")?;
-    let inputs = validate_bounded_git_text_inputs_bound(binding, deadline)?;
+    let (inputs, _) = validate_bounded_git_text_inputs_bound(binding, deadline, false)?;
     let mut total = inputs
         .info_exclude
         .as_ref()
@@ -5577,6 +5577,34 @@ pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted(
     ))
 }
 
+/// Trusted bounded Git status whose metadata validation walk records
+/// permission-denied directories instead of failing. The fourth tuple element
+/// lists those worktree-relative directory paths, deduplicated and sorted.
+pub(crate) fn bounded_repository_status_paths_bound_with_process_wait_trusted_allowing_unreadable(
+    binding: &RepositoryBindingGuard,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<(BoundedStatusPathRecords, Duration, Duration, Vec<PathBuf>)> {
+    binding.verify()?;
+    let records = bounded_worktree_records_trusted_allowing_unreadable(
+        binding.worktree(),
+        max_entries,
+        max_output_bytes,
+        timeout,
+    )?;
+    binding.verify()?;
+    let mut unreadable_directories = records.unreadable_directories;
+    unreadable_directories.sort();
+    unreadable_directories.dedup();
+    Ok((
+        parse_porcelain_v1_z(&records.status, max_entries)?,
+        records.process_queue_wait,
+        records.cleanup_elapsed,
+        unreadable_directories,
+    ))
+}
+
 pub(crate) fn bounded_repository_visible_paths_bound_with_process_wait(
     binding: &RepositoryBindingGuard,
     max_entries: usize,
@@ -5604,4 +5632,8 @@ struct BoundedWorktreeRecords {
     ignored: Vec<u8>,
     process_queue_wait: Duration,
     cleanup_elapsed: Duration,
+    /// Worktree-relative paths of directories the Git text prevalidation walk
+    /// could not open or list because of a permission error. Only the
+    /// allow-unreadable status mode populates this; it stays empty otherwise.
+    unreadable_directories: Vec<PathBuf>,
 }

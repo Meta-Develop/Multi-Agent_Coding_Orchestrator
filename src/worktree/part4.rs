@@ -11,6 +11,7 @@ fn bounded_worktree_records(
         timeout,
         false,
         BoundedGitIsolation::Verified,
+        false,
     )
 }
 
@@ -27,6 +28,27 @@ fn bounded_worktree_records_trusted(
         timeout,
         false,
         BoundedGitIsolation::Trusted,
+        false,
+    )
+}
+
+/// Trusted bounded status whose Git text prevalidation walk records
+/// permission-denied directories instead of failing; their paths are returned
+/// in `BoundedWorktreeRecords::unreadable_directories`.
+fn bounded_worktree_records_trusted_allowing_unreadable(
+    path: &Path,
+    max_entries: usize,
+    max_output_bytes: usize,
+    timeout: Duration,
+) -> Result<BoundedWorktreeRecords> {
+    bounded_worktree_records_mode(
+        path,
+        max_entries,
+        max_output_bytes,
+        timeout,
+        false,
+        BoundedGitIsolation::Trusted,
+        true,
     )
 }
 
@@ -74,6 +96,7 @@ fn bounded_worktree_records_with_ignored_isolation(
         timeout,
         true,
         isolation,
+        false,
     )
 }
 
@@ -84,6 +107,7 @@ fn bounded_worktree_records_mode(
     timeout: Duration,
     collect_ignored: bool,
     isolation: BoundedGitIsolation,
+    allow_unreadable_directories: bool,
 ) -> Result<BoundedWorktreeRecords> {
     let (_process_lock, deadline, process_queue_wait) =
         enter_bounded_status_process_scope(timeout)?;
@@ -103,6 +127,7 @@ fn bounded_worktree_records_mode(
         deadline,
         collect_ignored,
         isolation,
+        allow_unreadable_directories,
         &mut timings,
     )?;
     records.process_queue_wait = process_queue_wait;
@@ -288,7 +313,7 @@ where
 {
     let now = worktree_status_now();
     let mut timings = crate::process_runner::PhaseTimings::new(now, Some(deadline), deadline.saturating_duration_since(now), Duration::ZERO, "repository_binding");
-    let result = bounded_worktree_status_in_runtime_until_timed(path, max_entries, max_output_bytes, state_root, after_index_snapshot, deadline, collect_ignored, isolation, &mut timings);
+    let result = bounded_worktree_status_in_runtime_until_timed(path, max_entries, max_output_bytes, state_root, after_index_snapshot, deadline, collect_ignored, isolation, false, &mut timings);
     diagnose_bounded_status_result(result, &timings)
 }
 
@@ -302,6 +327,7 @@ fn bounded_worktree_status_in_runtime_until_timed<F>(
     deadline: Instant,
     collect_ignored: bool,
     isolation: BoundedGitIsolation,
+    allow_unreadable_directories: bool,
     timings: &mut crate::process_runner::PhaseTimings,
 ) -> Result<BoundedWorktreeRecords>
 where
@@ -336,7 +362,8 @@ where
     let common_dir_binding = DirectoryBindingGuard::bind(repository_binding.common_dir())
         .context("failed to bind bounded-status Git common directory")?;
     verify_repository_status_bindings(worktree_binding, &git_dir_binding, &common_dir_binding)?;
-    let git_text_inputs = validate_bounded_git_text_inputs_bound(&repository_binding, deadline)?;
+    let (git_text_inputs, unreadable_directories) =
+        validate_bounded_git_text_inputs_bound(&repository_binding, deadline, allow_unreadable_directories)?;
     ensure_worktree_status_deadline(deadline, "after opening bounded-status repository")?;
     timings.enter("head_capture", worktree_status_now());
     let raw_head = repository_binding
@@ -536,6 +563,7 @@ where
             ignored,
             process_queue_wait: Duration::ZERO,
             cleanup_elapsed: Duration::ZERO,
+            unreadable_directories,
         })
     })();
     // Cleanup has a separate budget; it must not become part of the failing main phase.
@@ -1147,13 +1175,14 @@ fn validate_bounded_git_text_inputs(
     if binding.git_dir() != git_dir || binding.common_dir() != common_dir {
         bail!("bounded-status repository metadata paths changed before prevalidation");
     }
-    validate_bounded_git_text_inputs_bound(&binding, deadline)
+    validate_bounded_git_text_inputs_bound(&binding, deadline, false).map(|(inputs, _)| inputs)
 }
 
 fn validate_bounded_git_text_inputs_bound(
     repository: &RepositoryBindingGuard,
     deadline: Instant,
-) -> Result<BoundedGitTextInputs> {
+    allow_unreadable_directories: bool,
+) -> Result<(BoundedGitTextInputs, Vec<PathBuf>)> {
     let git_dir = repository.git_dir();
     let common_dir = repository.common_dir();
     if repository
@@ -1165,49 +1194,59 @@ fn validate_bounded_git_text_inputs_bound(
     {
         bail!("bounded-status rejects Git object alternates");
     }
-    let inventory = BoundedTreeWalker::walk_bound_with_options_detailed(
-        repository.worktree_binding(),
-        BoundedTreeWalkLimits {
-            max_depth: 128,
-            max_entries: MAX_WORKTREE_STATUS_ENTRIES,
-            max_path_bytes: MAX_PERSISTED_PATH_BYTES,
-            max_total_path_bytes: MAX_WORKTREE_STATUS_OUTPUT_BYTES.saturating_mul(32),
-            max_duration: remaining_worktree_status_time(
-                deadline,
-                "before Git ignore prevalidation",
-            )?,
-            same_device: true,
-        },
-        crate::safe_state::BoundedTreeWalkOptions {
-            stop_at_nested_repositories: true,
-        },
-        |entry| {
-            if entry.relative_path == Path::new(".git") {
-                return Ok(BoundedTreeWalkAction::Skip);
-            }
-            // Treat managed-worktree stores and other runtime roots as walk
-            // boundaries so the walker never descends those trees.
-            if is_bounded_status_runtime_path(&entry.relative_path) {
-                return Ok(BoundedTreeWalkAction::Skip);
-            }
-            if entry.kind == BoundedTreeEntryKind::Directory {
-                return Ok(BoundedTreeWalkAction::RecordAndDescend);
-            }
-            let file_name = entry.relative_path.file_name();
-            let is_gitignore = file_name == Some(OsStr::new(".gitignore"));
-            let is_gitmodules = file_name == Some(OsStr::new(".gitmodules"));
-            if is_gitignore || is_gitmodules {
-                if !entry.is_safe_regular_file() {
-                    if is_gitignore {
-                        bail!("Git ignore input is not a safe single-link regular file");
-                    }
-                    bail!("Git submodule metadata is not a safe single-link regular file");
+    let mut prevalidation_action =
+        |entry: &crate::safe_state::BoundedTreeEntry| -> Result<BoundedTreeWalkAction> {
+        if entry.relative_path == Path::new(".git") {
+            return Ok(BoundedTreeWalkAction::Skip);
+        }
+        // Treat managed-worktree stores and other runtime roots as walk
+        // boundaries so the walker never descends those trees.
+        if is_bounded_status_runtime_path(&entry.relative_path) {
+            return Ok(BoundedTreeWalkAction::Skip);
+        }
+        if entry.kind == BoundedTreeEntryKind::Directory {
+            return Ok(BoundedTreeWalkAction::RecordAndDescend);
+        }
+        let file_name = entry.relative_path.file_name();
+        let is_gitignore = file_name == Some(OsStr::new(".gitignore"));
+        let is_gitmodules = file_name == Some(OsStr::new(".gitmodules"));
+        if is_gitignore || is_gitmodules {
+            if !entry.is_safe_regular_file() {
+                if is_gitignore {
+                    bail!("Git ignore input is not a safe single-link regular file");
                 }
-                return Ok(BoundedTreeWalkAction::Record);
+                bail!("Git submodule metadata is not a safe single-link regular file");
             }
-            Ok(BoundedTreeWalkAction::Skip)
-        },
-    )?;
+            return Ok(BoundedTreeWalkAction::Record);
+        }
+        Ok(BoundedTreeWalkAction::Skip)
+    };
+    let prevalidation_limits = BoundedTreeWalkLimits {
+        max_depth: 128,
+        max_entries: MAX_WORKTREE_STATUS_ENTRIES,
+        max_path_bytes: MAX_PERSISTED_PATH_BYTES,
+        max_total_path_bytes: MAX_WORKTREE_STATUS_OUTPUT_BYTES.saturating_mul(32),
+        max_duration: remaining_worktree_status_time(deadline, "before Git ignore prevalidation")?,
+        same_device: true,
+    };
+    let prevalidation_options = crate::safe_state::BoundedTreeWalkOptions {
+        stop_at_nested_repositories: true,
+    };
+    let inventory = if allow_unreadable_directories {
+        BoundedTreeWalker::walk_bound_with_options_detailed_allowing_unreadable(
+            repository.worktree_binding(),
+            prevalidation_limits,
+            prevalidation_options,
+            &mut prevalidation_action,
+        )?
+    } else {
+        BoundedTreeWalker::walk_bound_with_options_detailed(
+            repository.worktree_binding(),
+            prevalidation_limits,
+            prevalidation_options,
+            &mut prevalidation_action,
+        )?
+    };
     if inventory
         .entries
         .iter()
@@ -1300,10 +1339,13 @@ fn validate_bounded_git_text_inputs_bound(
     if total > MAX_WORKTREE_GIT_TEXT_TOTAL_BYTES {
         bail!("repository exceeds its Git metadata aggregate byte limit");
     }
-    Ok(BoundedGitTextInputs {
-        info_exclude: Some(effective_exclude),
-        core_filemode: local_config.core_filemode,
-    })
+    Ok((
+        BoundedGitTextInputs {
+            info_exclude: Some(effective_exclude),
+            core_filemode: local_config.core_filemode,
+        },
+        inventory.unreadable_directories,
+    ))
 }
 
 fn path_from_git_bytes(raw: &[u8]) -> Result<PathBuf> {

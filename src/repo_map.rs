@@ -9,7 +9,7 @@ use std::{
 use crate::megafile::FileSizeSample;
 use crate::safe_state::{
     BoundedTreeEntry, BoundedTreeEntryKind, BoundedTreeWalkAction, BoundedTreeWalkLimits,
-    BoundedTreeWalker,
+    BoundedTreeWalkOptions, BoundedTreeWalker,
 };
 
 const REPOSITORY_MAP_MAX_DEPTH: usize = 128;
@@ -46,6 +46,24 @@ pub enum RepoEntryKind {
     File,
     Symlink,
     Other,
+}
+
+/// One skipped region of an incomplete repository map.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RepoMapWarning {
+    pub path: PathBuf,
+    pub category: String,
+}
+
+/// Repository map that may be incomplete: directories that could not be
+/// opened or listed because of a permission error are recorded as warnings
+/// instead of failing the scan.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct IncompleteRepoMap {
+    pub root: PathBuf,
+    pub entries: Vec<RepoMapEntry>,
+    pub complete: bool,
+    pub warnings: Vec<RepoMapWarning>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -95,6 +113,71 @@ pub fn scan_repository(repo_path: impl AsRef<Path>) -> Result<RepoMap> {
     remaining_map_time(deadline, "after repository map")?;
 
     Ok(RepoMap { root, entries })
+}
+
+/// Opt-in variant of [`scan_repository`]: a directory that cannot be opened or
+/// listed because of a permission error (EACCES or EPERM only) is not fatal.
+/// The directory entry itself is still recorded, its contents are skipped, and
+/// its repository-relative path is reported once as a `permission_denied`
+/// warning. Every other error keeps its strict treatment. An incomplete result
+/// always has `complete == false` and at least one warning; a fully readable
+/// repository has `complete == true` and no warnings.
+pub fn scan_repository_allowing_incomplete(
+    repo_path: impl AsRef<Path>,
+) -> Result<IncompleteRepoMap> {
+    let repo = crate::git_repository::discover(repo_path.as_ref()).with_context(|| {
+        format!(
+            "failed to discover repository from {}",
+            repo_path.as_ref().display()
+        )
+    })?;
+    let root = repo
+        .workdir()
+        .context("repository map requires a non-bare repository")?
+        .to_path_buf();
+    let repository_binding = crate::worktree::RepositoryBindingGuard::bind(&root)?;
+    let mut deadline = Instant::now()
+        .checked_add(REPOSITORY_MAP_MAX_DURATION)
+        .context("repository map deadline overflowed")?;
+    let first =
+        capture_repository_map_snapshot_allowing_incomplete(&repository_binding, &mut deadline)?;
+    let second =
+        capture_repository_map_snapshot_allowing_incomplete(&repository_binding, &mut deadline)?;
+    let ((statuses, inventory), unreadable_directories) = if first.0 == second.0 {
+        second
+    } else {
+        let retry = capture_repository_map_snapshot_allowing_incomplete(
+            &repository_binding,
+            &mut deadline,
+        )?;
+        if second.0 != retry.0 {
+            anyhow::bail!("repository map changed across its bounded retry");
+        }
+        retry
+    };
+    let entries = inventory
+        .into_iter()
+        .map(|entry| map_inventory_entry(&statuses, entry, deadline))
+        .collect::<Result<Vec<_>>>()?;
+    repository_binding.verify()?;
+    remaining_map_time(deadline, "after repository map")?;
+    let mut paths = unreadable_directories;
+    paths.sort();
+    paths.dedup();
+    let warnings = paths
+        .into_iter()
+        .map(|path| RepoMapWarning {
+            path,
+            category: "permission_denied".to_string(),
+        })
+        .collect::<Vec<_>>();
+    let complete = warnings.is_empty();
+    Ok(IncompleteRepoMap {
+        root,
+        entries,
+        complete,
+        warnings,
+    })
 }
 
 /// Explicitly reads every regular file in a bounded coarse repository map and
@@ -216,6 +299,55 @@ fn capture_repository_map_snapshot(
     )?;
     binding.verify()?;
     Ok((statuses, inventory))
+}
+
+fn capture_repository_map_snapshot_allowing_incomplete(
+    binding: &crate::worktree::RepositoryBindingGuard,
+    deadline: &mut Instant,
+) -> Result<(RepositoryMapSnapshot, Vec<PathBuf>)> {
+    let (statuses, process_queue_wait, cleanup_elapsed, status_unreadable) =
+        crate::worktree::bounded_repository_status_paths_bound_with_process_wait_trusted_allowing_unreadable(
+            binding,
+            REPOSITORY_MAP_MAX_ENTRIES,
+            REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
+            remaining_map_time(*deadline, "before bounded Git status")?,
+        )?;
+    extend_map_deadline(
+        deadline,
+        process_queue_wait,
+        "bounded Git status queue wait",
+    )?;
+    extend_map_deadline(
+        deadline,
+        cleanup_elapsed,
+        "bounded Git status final cleanup",
+    )?;
+    let statuses = statuses.into_iter().collect::<BTreeMap<_, _>>();
+    let inventory = BoundedTreeWalker::walk_bound_with_options_detailed_allowing_unreadable(
+        binding.worktree_binding(),
+        BoundedTreeWalkLimits {
+            max_depth: REPOSITORY_MAP_MAX_DEPTH,
+            max_entries: REPOSITORY_MAP_MAX_ENTRIES,
+            max_path_bytes: REPOSITORY_MAP_MAX_PATH_BYTES,
+            max_total_path_bytes: REPOSITORY_MAP_MAX_TOTAL_PATH_BYTES,
+            max_duration: remaining_map_time(*deadline, "before descriptor inventory")?,
+            same_device: true,
+        },
+        BoundedTreeWalkOptions::default(),
+        |entry| {
+            Ok(if is_ignored_path(&entry.relative_path) {
+                BoundedTreeWalkAction::Skip
+            } else if entry.kind == BoundedTreeEntryKind::Directory {
+                BoundedTreeWalkAction::RecordAndDescend
+            } else {
+                BoundedTreeWalkAction::Record
+            })
+        },
+    )?;
+    binding.verify()?;
+    let mut unreadable_directories = status_unreadable;
+    unreadable_directories.extend(inventory.unreadable_directories);
+    Ok(((statuses, inventory.entries), unreadable_directories))
 }
 
 fn extend_map_deadline(deadline: &mut Instant, duration: Duration, phase: &str) -> Result<()> {
@@ -605,5 +737,141 @@ mod tests {
             .entries
             .iter()
             .any(|entry| entry.path == Path::new("outside-link/secret")));
+    }
+
+    fn commit_all(repo: &git2::Repository, message: &str) {
+        let mut index = repo.index().expect("open index");
+        index
+            .add_all(["*"].iter(), git2::IndexAddOption::DEFAULT, None)
+            .expect("add all");
+        index.write().expect("write index");
+        let tree_id = index.write_tree().expect("write tree");
+        let tree = repo.find_tree(tree_id).expect("find tree");
+        let signature =
+            git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
+        repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
+            .expect("commit");
+    }
+
+    #[cfg(unix)]
+    fn running_as_root() -> bool {
+        // SAFETY: geteuid has no preconditions and does not access Rust memory.
+        (unsafe { libc::geteuid() }) == 0
+    }
+
+    #[cfg(unix)]
+    fn lock_directory(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o000)).expect("chmod 000");
+    }
+
+    #[cfg(unix)]
+    fn unlock_directory(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(path, fs::Permissions::from_mode(0o755)).expect("chmod 755");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_allowing_incomplete_reports_unreadable_untracked_directory() {
+        skip_without_containment!();
+        if running_as_root() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        let repo = git2::Repository::open(&repo_path).expect("open repo");
+        commit_all(&repo, "initial commit");
+        fs::create_dir_all(repo_path.join("locked")).expect("create locked");
+        fs::write(repo_path.join("locked/secret.txt"), "secret\n").expect("write secret");
+        lock_directory(&repo_path.join("locked"));
+
+        let strict_error = scan_repository(&repo_path).expect_err("strict scan must fail");
+        let incomplete = scan_repository_allowing_incomplete(&repo_path).expect("incomplete scan");
+        unlock_directory(&repo_path.join("locked"));
+
+        assert!(
+            strict_error
+                .to_string()
+                .contains("failed to open repository directory without following links"),
+            "unexpected strict error: {strict_error:#}"
+        );
+        assert!(!incomplete.complete);
+        assert_eq!(incomplete.warnings.len(), 1);
+        assert_eq!(incomplete.warnings[0].path, PathBuf::from("locked"));
+        assert_eq!(incomplete.warnings[0].category, "permission_denied");
+        let paths = incomplete
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&PathBuf::from("README.md")));
+        assert!(paths.contains(&PathBuf::from("locked")));
+        assert!(!paths.contains(&PathBuf::from("locked/secret.txt")));
+        assert!(incomplete.entries.iter().any(
+            |entry| entry.path == Path::new("locked") && entry.kind == RepoEntryKind::Directory
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn scan_allowing_incomplete_reports_unreadable_tracked_directory() {
+        skip_without_containment!();
+        if running_as_root() {
+            return;
+        }
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        fs::create_dir_all(repo_path.join("tracked")).expect("create tracked");
+        fs::write(repo_path.join("tracked/file.txt"), "data\n").expect("write file");
+        let repo = git2::Repository::open(&repo_path).expect("open repo");
+        commit_all(&repo, "initial commit");
+        lock_directory(&repo_path.join("tracked"));
+
+        let strict_error = scan_repository(&repo_path).expect_err("strict scan must fail");
+        let incomplete = scan_repository_allowing_incomplete(&repo_path).expect("incomplete scan");
+        unlock_directory(&repo_path.join("tracked"));
+
+        assert!(
+            strict_error
+                .to_string()
+                .contains("failed to open repository directory without following links"),
+            "unexpected strict error: {strict_error:#}"
+        );
+        assert!(!incomplete.complete);
+        assert_eq!(incomplete.warnings.len(), 1);
+        assert_eq!(incomplete.warnings[0].path, PathBuf::from("tracked"));
+        assert_eq!(incomplete.warnings[0].category, "permission_denied");
+        let paths = incomplete
+            .entries
+            .iter()
+            .map(|entry| entry.path.clone())
+            .collect::<Vec<_>>();
+        assert!(paths.contains(&PathBuf::from("README.md")));
+        assert!(paths.contains(&PathBuf::from("tracked")));
+        assert!(!paths.contains(&PathBuf::from("tracked/file.txt")));
+    }
+
+    #[test]
+    fn scan_allowing_incomplete_reports_complete_readable_repository() {
+        skip_without_containment!();
+        let temp = TempDir::new().expect("tempdir");
+        let repo_path = temp.path().join("repo");
+        WorktreeManager::init_repository(&repo_path, "main").expect("init repo");
+        fs::create_dir_all(repo_path.join("src")).expect("create src");
+        fs::write(repo_path.join("README.md"), "# Test\n").expect("write readme");
+        fs::write(repo_path.join("src/lib.rs"), "pub fn ok() {}\n").expect("write lib");
+
+        let strict = scan_repository(&repo_path).expect("strict scan");
+        let incomplete = scan_repository_allowing_incomplete(&repo_path).expect("incomplete scan");
+
+        assert!(incomplete.complete);
+        assert!(incomplete.warnings.is_empty());
+        assert_eq!(incomplete.root, strict.root);
+        assert_eq!(incomplete.entries, strict.entries);
     }
 }
