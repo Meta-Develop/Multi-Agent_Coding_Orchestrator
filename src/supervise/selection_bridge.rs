@@ -3489,6 +3489,76 @@ fn append_vibe_worker_catalog(
     Ok(())
 }
 
+fn vibe_lane_absence_for_ledger(
+    role: AgentRole,
+    provenance: &SelectionProvenance,
+) -> Option<AssignmentLaneAbsence> {
+    let input = &provenance.normalized_input;
+    if role != AgentRole::Worker
+        || input.task.authority_role != AuthorityRole::TerminalLeaf
+        || input
+            .catalogs
+            .iter()
+            .any(|catalog| catalog.runtime == "vibe")
+    {
+        return None;
+    }
+    if let Some(request) = input.debug_override.as_ref() {
+        if request.candidate.runtime != "vibe" {
+            let runtime = request.candidate.runtime.clone();
+            return Some(AssignmentLaneAbsence {
+                runtime: "vibe".to_string(),
+                code: "debug_override_pins_other_runtime".to_string(),
+                detail: format!(
+                    "a debug override pins runtime '{runtime}', so the Vibe Worker lane was not offered"
+                ),
+            });
+        }
+    }
+    if super::runtime_executables::bound_catalog_program(SupervisorRuntime::Vibe).is_none() {
+        return Some(AssignmentLaneAbsence {
+            runtime: "vibe".to_string(),
+            code: "executable_not_bound".to_string(),
+            detail: "no Vibe executable is bound for this run".to_string(),
+        });
+    }
+    if !input
+        .priors
+        .models
+        .iter()
+        .any(|prior| prior.runtime == "vibe")
+    {
+        return Some(AssignmentLaneAbsence {
+            runtime: "vibe".to_string(),
+            code: "no_prior_rows".to_string(),
+            detail: "the operator prior data has no vibe rows".to_string(),
+        });
+    }
+    let admitted = runtime_catalog_from_priors(
+        "vibe",
+        &RuntimeModelCatalog::OperatorDeclared,
+        &input.task,
+        &input.priors,
+    )
+    .map(|catalog| !catalog.models.is_empty())
+    .unwrap_or(false);
+    if !admitted {
+        return Some(AssignmentLaneAbsence {
+            runtime: "vibe".to_string(),
+            code: "task_shape_not_admitted".to_string(),
+            detail: format!(
+                "no vibe prior row admits task class '{}' at this task shape",
+                input.task.task_class
+            ),
+        });
+    }
+    Some(AssignmentLaneAbsence {
+        runtime: "vibe".to_string(),
+        code: "not_offered_by_selection_path".to_string(),
+        detail: "the Vibe Worker lane is bound and admits this task, but this selection path did not offer it".to_string(),
+    })
+}
+
 #[cfg(target_os = "linux")]
 fn runtime_from_account_provider(provider_id: &str) -> Result<&'static str> {
     match provider_id {
@@ -4254,6 +4324,7 @@ pub(super) fn apply_budget_degradations_to_selection_ledger(
         entry.catalog_snapshot_digest = None;
         entry.catalog_revisions.clear();
         entry.rejected_candidates.clear();
+        entry.absent_lanes.clear();
         entry.evidence_gap = Some(
             "the budget-degradation record is authoritative for the final Worker binding; selector candidate provenance described the superseded binding and was discarded, and the degradation decision retained no catalog snapshot digest or revisions"
                 .to_string(),
@@ -4972,6 +5043,7 @@ fn ledger_entry_for_assignment(
             catalog_snapshot_digest: None,
             catalog_revisions: Vec::new(),
             rejected_candidates: Vec::new(),
+            absent_lanes: Vec::new(),
             quota_evidence: None,
             evidence_gap: Some(
                 "legacy fake runtime does not consult a catalog or record eligibility evidence"
@@ -4994,6 +5066,7 @@ fn ledger_entry_for_assignment(
             catalog_snapshot_digest: None,
             catalog_revisions: Vec::new(),
             rejected_candidates: Vec::new(),
+            absent_lanes: Vec::new(),
             quota_evidence: None,
             evidence_gap: Some(
                 "no selector decision was recorded for this assignment role".to_string(),
@@ -5090,6 +5163,9 @@ fn ledger_entry_for_assignment(
             .filter(|digest| !digest.is_empty()),
         catalog_revisions: event.provenance.catalog_revisions.clone(),
         rejected_candidates,
+        absent_lanes: vibe_lane_absence_for_ledger(role, &event.provenance)
+            .into_iter()
+            .collect(),
         quota_evidence,
         evidence_gap,
     }

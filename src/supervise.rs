@@ -1724,6 +1724,14 @@ pub struct AssignmentRejectionReason {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
+pub struct AssignmentLaneAbsence {
+    pub runtime: String,
+    pub code: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct AssignmentSelectionLedgerEntry {
     pub assignment_id: String,
     pub attempt: usize,
@@ -1742,6 +1750,9 @@ pub struct AssignmentSelectionLedgerEntry {
     pub catalog_revisions: Vec<crate::selection::CatalogRevisionProvenance>,
     #[serde(default)]
     pub rejected_candidates: Vec<AssignmentRejectedCandidate>,
+    /// Lanes the operator declared that this decision did not offer, with why.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub absent_lanes: Vec<AssignmentLaneAbsence>,
     /// Exact local quota row used for the selected runtime. `None` is the legacy/no-config path.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub quota_evidence: Option<crate::selection::RuntimePoolState>,

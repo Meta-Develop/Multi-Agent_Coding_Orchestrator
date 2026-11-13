@@ -3012,6 +3012,7 @@ fn build_supervisor_final_report(
         entry.catalog_snapshot_digest = None;
         entry.catalog_revisions.clear();
         entry.rejected_candidates.clear();
+        entry.absent_lanes.clear();
         entry.quota_evidence = None;
         entry.evidence_gap = Some(
             "assignment parked by the pre-claim viability gate before model or effort selection"
