@@ -1723,7 +1723,7 @@ pub(super) fn reselect_assignment_from_supplied_catalog_snapshot(
                 })
                 .unwrap_or_default();
         }
-        let constructed = if state.account_observations.is_empty() {
+        let mut constructed = if state.account_observations.is_empty() {
             constructed_selection_catalogs(
                 runtime,
                 catalog,
@@ -1735,6 +1735,29 @@ pub(super) fn reselect_assignment_from_supplied_catalog_snapshot(
         } else {
             account_selection_catalogs(&state.account_observations, &input.task, &input.priors)?
         };
+        let constructed_count = constructed.len();
+        append_vibe_worker_catalog(&mut constructed, role, None, &input.task, &input.priors)?;
+        if constructed.len() != constructed_count {
+            let primary_pool = input
+                .pools
+                .iter()
+                .find(|pool| pool.runtime == runtime_name(runtime))
+                .cloned()
+                .context("automatic selector replay has no primary admission pool")?;
+            for pool in pools_for_constructed_catalogs(
+                &constructed[constructed_count..],
+                runtime_name(runtime),
+                primary_pool,
+            ) {
+                if !input
+                    .pools
+                    .iter()
+                    .any(|existing| existing.runtime == pool.runtime)
+                {
+                    input.pools.push(pool);
+                }
+            }
+        }
         input.constraints.allowed_runtimes = constructed
             .iter()
             .map(|runtime_catalog| runtime_catalog.runtime.clone())
