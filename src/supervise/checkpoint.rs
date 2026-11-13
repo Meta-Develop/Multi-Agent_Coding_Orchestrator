@@ -3,7 +3,7 @@ use crate::{
     artifacts::{
         repository_auth_writer, validate_repository_authenticated_state, ArtifactRunResumeBinding,
     },
-    state_journal::{JournalRecord, StateJournal},
+    state_journal::{CheckpointJournalSpec, JournalRecord, JournalSpec, StateJournal},
 };
 
 const SUPERVISE_CHECKPOINT_VERSION: u32 = 1;
@@ -122,6 +122,11 @@ struct SchedulerClosedCheckpoint {
     budget: RunBudgetReport,
     pending_assignments: Vec<String>,
 }
+
+const _: () = assert!(
+    <CheckpointJournalSpec as JournalSpec>::MAX_RECORD_BYTES
+        >= 2 * MAX_SUPERVISOR_REPORT_BYTES as u64 + 1024 * 1024,
+);
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

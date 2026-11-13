@@ -3224,6 +3224,108 @@ fn resume_refuses_scheduler_closed_budget_that_differs_only_in_elapsed_seconds()
 }
 
 #[test]
+fn large_final_report_plan_fits_the_checkpoint_record_bound() {
+    let (_temp, repo) = injected_repository();
+    let run_id = RunId::new("large-final-report-plan").expect("valid large report run id");
+    let assignment = injected_assignment(false);
+    let plan = injected_plan(assignment.clone(), 0);
+    let ledger =
+        RunBudgetLedger::new(RunBudgetLimits::default()).expect("large report budget ledger");
+    let writer = ArtifactRunWriter::reserve(
+        &repo,
+        RunArtifactFamily::Supervise,
+        run_id.clone(),
+        "large-final-report-plan-test",
+    )
+    .expect("reserve large report artifact run");
+    let mut checkpoint = SupervisorCheckpointWriter::create(
+        &repo,
+        SupervisorCheckpointPreparation::new(
+            &run_id,
+            &current_head_oid(&repo).expect("large report primary base"),
+            normalized_supervisor_plan_sha256(
+                &plan,
+                &SupervisorConsultantPlan::default(),
+                &AssignmentMetadata::new(),
+                &SupervisorPlanMetadata::default(),
+            )
+            .expect("large report normalized plan"),
+            1,
+            &plan,
+            writer
+                .resume_binding()
+                .expect("large report prepared binding"),
+            ledger.report().expect("large report initial budget"),
+        ),
+    )
+    .expect("create large report checkpoint");
+    checkpoint
+        .assignment_started(
+            &assignment,
+            0,
+            Some(
+                writer
+                    .resume_binding()
+                    .expect("large report assignment start binding"),
+            ),
+            ledger
+                .report()
+                .expect("large report assignment start budget"),
+        )
+        .expect("checkpoint assignment start");
+    let closed_budget = ledger.report().expect("scheduler-closed budget snapshot");
+    checkpoint
+        .scheduler_closed(
+            writer
+                .resume_binding()
+                .expect("large report scheduler close binding"),
+            closed_budget.clone(),
+        )
+        .expect("checkpoint scheduler closure");
+    let mut report = artifact_test_final_report(&run_id);
+    report.run_budget = Some(closed_budget);
+    let quote_finding = Finding {
+        severity: FindingSeverity::Info,
+        message: format!(
+            "large report quote payload {}",
+            char::from(34).to_string().repeat(64 * 1024)
+        ),
+        paths: Vec::new(),
+    };
+    while encode_final_report(&report)
+        .expect("encode growing final report")
+        .len()
+        < 5 * 1024 * 1024
+    {
+        report.findings.push(quote_finding.clone());
+    }
+    let report_bytes = encode_final_report(&report).expect("encode large final report");
+    assert!(
+        report_bytes.len() >= 4718592 && report_bytes.len() <= 7864320,
+        "large final report must stay between 4.5 MiB and 7.5 MiB, got {}",
+        report_bytes.len()
+    );
+    checkpoint
+        .final_report_planned(
+            &report,
+            &report_bytes,
+            writer
+                .resume_binding()
+                .expect("large report final report plan binding"),
+        )
+        .expect("plan large final report");
+    drop(checkpoint);
+    drop(writer);
+
+    let (_opened, snapshot) =
+        open_supervisor_checkpoint(&repo, &run_id).expect("reopen large report checkpoint");
+    let planned = snapshot
+        .final_report
+        .expect("reopened checkpoint exposes the planned large report");
+    assert_eq!(planned.report_bytes, report_bytes);
+}
+
+#[test]
 fn scheduler_crash_after_authenticated_report_plan_resumes_without_redispatch() {
     skip_without_containment!();
     let (temp, repo) = injected_repository();
