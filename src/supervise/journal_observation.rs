@@ -374,12 +374,21 @@ fn run_worker_execution_journal_command_with_environment_and_clock(
                 bail!("worker journal has no room for command start and terminal failure");
             }
             append_locked_worker_journal(path, expected, file, &encoded)?;
-            Some(
-                std::process::Command::new(&entry.command[0])
-                    .args(&entry.command[1..])
-                    .current_dir(&entry.cwd)
-                    .status(),
-            )
+            Some({
+                use std::os::unix::process::CommandExt;
+                let mut command = std::process::Command::new(&entry.command[0]);
+                command.args(&entry.command[1..]).current_dir(&entry.cwd);
+                // SAFETY: pre_exec runs in the forked child. umask is async-signal-safe.
+                // Git creates the index as 0666 masked by the inherited umask, so the
+                // wrapped command must not keep a looser supervisor mask.
+                unsafe {
+                    command.pre_exec(|| {
+                        libc::umask(0o077);
+                        Ok(())
+                    });
+                }
+                command.status()
+            })
         };
         // Capture the end after execution (or at observation time for a native
         // edit). A failed clock read is a terminal observation failure too.

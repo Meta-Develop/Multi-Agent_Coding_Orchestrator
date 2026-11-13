@@ -1575,7 +1575,89 @@ fn require_git_success(output: GitCommandOutput, label: &str) -> Result<()> {
     Ok(())
 }
 
+/// Clear group and other permission bits on an index Git created under a
+/// looser umask. Only an owned, single-link, regular file is changed, and
+/// only through the descriptor opened with `O_NOFOLLOW`. Symlinks, hard
+/// links, foreign owners, special mode bits, and oversized files are left
+/// untouched so the existing refusal still fails closed.
+#[cfg(unix)]
+fn tighten_owned_repository_index_mode(path: &Path) -> Result<()> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("failed to inspect {}", path.display()))
+        }
+    };
+    // SAFETY: geteuid has no arguments and returns the effective numeric uid.
+    let uid = unsafe { libc::geteuid() };
+    let mode = metadata.permissions().mode();
+    if metadata.file_type().is_symlink()
+        || !metadata.file_type().is_file()
+        || metadata.nlink() != 1
+        || metadata.uid() != uid
+        || metadata.len() > REPOSITORY_INDEX_MAX_BYTES
+        || mode & 0o7000 != 0
+        || mode & 0o077 == 0
+    {
+        return Ok(());
+    }
+    let mut options = OpenOptions::new();
+    options.read(true).custom_flags(libc::O_NOFOLLOW);
+    let file = options
+        .open(path)
+        .with_context(|| format!("failed to open repository index {}", path.display()))?;
+    let opened = file.metadata().with_context(|| {
+        format!(
+            "failed to inspect opened repository index {}",
+            path.display()
+        )
+    })?;
+    if !same_filesystem_identity(&metadata, &opened)
+        || !opened.file_type().is_file()
+        || opened.nlink() != 1
+        || opened.uid() != uid
+        || opened.len() > REPOSITORY_INDEX_MAX_BYTES
+        || opened.permissions().mode() & 0o7000 != 0
+    {
+        bail!(
+            "repository index {} changed before its mode could be tightened",
+            path.display()
+        );
+    }
+    let mut permissions = opened.permissions();
+    permissions.set_mode((opened.permissions().mode() & 0o777) & !0o077);
+    file.set_permissions(permissions).with_context(|| {
+        format!(
+            "failed to tighten repository index permissions {}",
+            path.display()
+        )
+    })?;
+    let after = file.metadata().with_context(|| {
+        format!(
+            "failed to recheck repository index permissions {}",
+            path.display()
+        )
+    })?;
+    if !same_filesystem_identity(&opened, &after)
+        || after.nlink() != 1
+        || after.uid() != uid
+        || after.len() != opened.len()
+        || after.permissions().mode() & 0o077 != 0
+        || after.permissions().mode() & 0o7000 != 0
+    {
+        bail!(
+            "repository index {} mode could not be tightened to owner-only",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
 fn hash_optional_file(path: &Path) -> Result<Option<Oid>> {
+    #[cfg(unix)]
+    tighten_owned_repository_index_mode(path)?;
     #[cfg(windows)]
     let path_snapshot = match crate::file_identity::open_windows_path_identity(path) {
         Ok(snapshot) => snapshot,
@@ -1683,6 +1765,8 @@ fn validate_repository_index_metadata(
         use std::os::unix::fs::{MetadataExt, PermissionsExt};
         // SAFETY: geteuid has no arguments and returns the effective numeric uid.
         let uid = unsafe { libc::geteuid() };
+        // Group and other write bits stay refused. An owned single-link index
+        // is tightened before this check; hard links and foreign owners are not.
         if metadata.uid() != uid
             || metadata.nlink() != 1
             || metadata.permissions().mode() & 0o022 != 0
