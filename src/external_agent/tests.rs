@@ -2999,7 +2999,7 @@ fn worker_memory_max_bytes_unset_and_empty_preserve_default_argv_and_profile() -
     )?;
     for configured in [None, Some(OsStr::new(""))] {
         let controls =
-            protected_worktree_controls_with_worker_settings(&command, None, configured)?;
+            protected_worktree_controls_with_worker_settings(&command, None, configured, None)?;
         assert_eq!(controls, baseline);
         assert_eq!(controls.worker_memory_max_bytes, None);
         assert_eq!(
@@ -3063,6 +3063,7 @@ fn worker_memory_max_bytes_valid_values_reach_launch_resource_limits() -> Result
                 &command,
                 worker_roots,
                 Some(OsStr::new(&configured)),
+                None,
             )?;
             assert_eq!(controls.worker_memory_max_bytes, Some(bytes));
             let profile = external_side_effect_profile(
@@ -3129,10 +3130,161 @@ fn worker_memory_max_bytes_reject_invalid_values_before_launch() -> Result<()> {
     .to_vec();
     invalid.push(OsString::from_vec(vec![0xff]));
     for configured in invalid {
-        let error =
-            protected_worktree_controls_with_worker_settings(&command, None, Some(&configured))
-                .expect_err("invalid Worker memory limit must refuse launch");
+        let error = protected_worktree_controls_with_worker_settings(
+            &command,
+            None,
+            Some(&configured),
+            None,
+        )
+        .expect_err("invalid Worker memory limit must refuse launch");
         assert!(error.to_string().contains("MACO_WORKER_MEMORY_MAX_BYTES"));
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_tasks_max_unset_and_empty_preserve_default_argv_and_profile() -> Result<()> {
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    let baseline = protected_worktree_controls_with_worker_roots(&command, None)?;
+    let expected_profile = external_side_effect_profile(
+        &command,
+        &command.program,
+        ExternalProgramTrust::TrustedSystemCodex,
+        &baseline,
+    )?;
+    for configured in [None, Some(OsStr::new(""))] {
+        let controls =
+            protected_worktree_controls_with_worker_settings(&command, None, None, configured)?;
+        assert_eq!(controls, baseline);
+        assert_eq!(controls.worker_tasks_max, None);
+        assert_eq!(
+            command_argv_with_controls_and_service_tier_input(&command, &controls, None)?,
+            command_argv_with_controls_and_service_tier_input(&command, &baseline, None)?
+        );
+        assert_eq!(
+            codex_app_server_argv(&command, &controls),
+            codex_app_server_argv(&command, &baseline)
+        );
+        assert_eq!(
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &controls,
+            )?,
+            expected_profile
+        );
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let SideEffectConfinementProfile::ExternalCodex(profile) = expected_profile else {
+            bail!("expected Codex profile");
+        };
+        let properties = crate::process_runner::external_codex_systemd_properties_for_test(
+            profile,
+            &command.program,
+            &command.cwd,
+        )?;
+        assert!(properties.contains(&"--property=TasksMax=256".to_string()));
+        assert!(properties.contains(&"--property=MemoryMax=4294967296".to_string()));
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn worker_tasks_max_valid_values_reach_launch_resource_limits() -> Result<()> {
+    let (temp, command) = worker_read_only_roots_fixture()?;
+    let root = temp.path().join("toolchain");
+    fs::create_dir(&root)?;
+    for worker_roots in [None, Some(root.as_os_str())] {
+        let baseline = protected_worktree_controls_with_worker_roots(&command, worker_roots)?;
+        let SideEffectConfinementProfile::ExternalCodex(baseline_profile) =
+            external_side_effect_profile(
+                &command,
+                &command.program,
+                ExternalProgramTrust::TrustedSystemCodex,
+                &baseline,
+            )?
+        else {
+            bail!("expected Codex profile");
+        };
+        for tasks_max in [1, 1024, 4096] {
+            let configured = tasks_max.to_string();
+            for memory in [None, Some(OsStr::new("8589934592"))] {
+                let controls = protected_worktree_controls_with_worker_settings(
+                    &command,
+                    worker_roots,
+                    memory,
+                    Some(OsStr::new(&configured)),
+                )?;
+                assert_eq!(controls.worker_tasks_max, Some(tasks_max));
+                assert_eq!(
+                    controls.worker_memory_max_bytes,
+                    memory.map(|_| 8 * 1024 * 1024 * 1024)
+                );
+                let memory_max_bytes = if memory.is_some() {
+                    8 * 1024 * 1024 * 1024
+                } else {
+                    4 * 1024 * 1024 * 1024
+                };
+                let profile = external_side_effect_profile(
+                    &command,
+                    &command.program,
+                    ExternalProgramTrust::TrustedSystemCodex,
+                    &controls,
+                )?;
+                assert_eq!(
+                    profile,
+                    SideEffectConfinementProfile::ExternalCodex(
+                        baseline_profile.clone().with_resource_limits(
+                            crate::process_runner::ProcessResourceLimits {
+                                memory_max_bytes,
+                                tasks_max,
+                                ..Default::default()
+                            }
+                        )
+                    )
+                );
+                let SideEffectConfinementProfile::ExternalCodex(profile) = profile else {
+                    bail!("expected Codex profile");
+                };
+                let properties = crate::process_runner::external_codex_systemd_properties_for_test(
+                    profile,
+                    &command.program,
+                    &command.cwd,
+                )?;
+                for expected in [
+                    format!("--property=TasksMax={tasks_max}"),
+                    format!("--property=MemoryMax={memory_max_bytes}"),
+                    "--property=CPUQuota=400%".to_string(),
+                    "--property=LimitNOFILE=8192".to_string(),
+                    "--property=LimitFSIZE=2147483648".to_string(),
+                    "--property=MemorySwapMax=0".to_string(),
+                    "--property=OOMPolicy=kill".to_string(),
+                ] {
+                    assert!(properties.contains(&expected), "missing {expected}");
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+#[test]
+fn worker_tasks_max_reject_invalid_values_before_launch() -> Result<()> {
+    let (_temp, command) = worker_read_only_roots_fixture()?;
+    for configured in ["0", "4097", "-1", "+5", " 8", "1e3", "abc"] {
+        let error = protected_worktree_controls_with_worker_settings(
+            &command,
+            None,
+            None,
+            Some(OsStr::new(configured)),
+        )
+        .expect_err("invalid Worker task limit must refuse launch");
+        assert!(error.to_string().contains("MACO_WORKER_TASKS_MAX"));
     }
     Ok(())
 }
@@ -3400,6 +3552,7 @@ fn worker_read_only_roots_exclude_other_roles_read_only_primary_and_consultants(
                 &excluded,
                 None,
                 Some(configured),
+                None,
             )?;
             assert_eq!(controls.worker_memory_max_bytes, None);
             assert_eq!(controls, baseline);

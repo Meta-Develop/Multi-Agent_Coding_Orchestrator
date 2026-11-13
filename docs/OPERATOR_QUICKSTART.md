@@ -115,6 +115,15 @@ values refuse launch; unset or empty keeps the 4 GiB default. A Worker compiling
 a large crate can exceed that default and be killed. Other roles and read-only
 launches keep their default limits; swap remains disabled.
 
+Set `MACO_WORKER_TASKS_MAX` in the supervising `maco` process environment to a
+decimal task count from 1 through 4096 to change the task limit (`TasksMax`) for
+the same writable Worker launches. Invalid values refuse launch; unset or empty
+keeps the default of 256. A Worker whose runtime already uses many threads, such
+as a Codex Worker, can reach that default while `cargo` runs parallel compilers
+and linkers, and the build then aborts with `thread constructor failed`. The
+memory and task controls are independent: setting one keeps the other's value or
+default.
+
 ## Codex runtime
 
 Prerequisites:

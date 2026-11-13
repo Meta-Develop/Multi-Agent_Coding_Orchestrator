@@ -1944,6 +1944,7 @@ struct ProtectedWorktreeControls {
     writable_artifact_root: Option<PathBuf>,
     worker_read_only_roots: Vec<PathBuf>,
     worker_memory_max_bytes: Option<u64>,
+    worker_tasks_max: Option<u32>,
 }
 
 #[derive(Clone)]
@@ -3238,6 +3239,7 @@ fn protected_worktree_controls(spec: &ExternalAgentCommand) -> Result<ProtectedW
         spec,
         std::env::var_os("MACO_WORKER_READ_ONLY_ROOTS").as_deref(),
         std::env::var_os("MACO_WORKER_MEMORY_MAX_BYTES").as_deref(),
+        std::env::var_os("MACO_WORKER_TASKS_MAX").as_deref(),
     )
 }
 
@@ -3246,13 +3248,14 @@ fn protected_worktree_controls_with_worker_roots(
     spec: &ExternalAgentCommand,
     worker_roots: Option<&OsStr>,
 ) -> Result<ProtectedWorktreeControls> {
-    protected_worktree_controls_with_worker_settings(spec, worker_roots, None)
+    protected_worktree_controls_with_worker_settings(spec, worker_roots, None, None)
 }
 
 fn protected_worktree_controls_with_worker_settings(
     spec: &ExternalAgentCommand,
     worker_roots: Option<&OsStr>,
     worker_memory_max_bytes: Option<&OsStr>,
+    worker_tasks_max: Option<&OsStr>,
 ) -> Result<ProtectedWorktreeControls> {
     let mut controls =
         protected_worktree_controls_for(&spec.cwd, &spec.worktree_control_exceptions)?;
@@ -3289,6 +3292,7 @@ fn protected_worktree_controls_with_worker_settings(
     controls.writable_artifact_root = Some(validate_artifact_parent_disjoint(spec, &controls)?);
     controls.worker_read_only_roots = validate_worker_read_only_roots(spec, &controls, worker_roots)?;
     controls.worker_memory_max_bytes = validate_worker_memory_max_bytes(spec, worker_memory_max_bytes)?;
+    controls.worker_tasks_max = validate_worker_tasks_max(spec, worker_tasks_max)?;
     Ok(controls)
 }
 
@@ -3322,6 +3326,25 @@ fn validate_worker_memory_max_bytes(
         .filter(|value| (16 * 1024 * 1024..=16 * 1024 * 1024 * 1024).contains(value))
         .context("MACO_WORKER_MEMORY_MAX_BYTES must be a decimal byte count from 16777216 through 17179869184 (16 MiB through 16 GiB)")?;
     Ok(Some(memory_max_bytes))
+}
+
+fn validate_worker_tasks_max(
+    spec: &ExternalAgentCommand,
+    configured: Option<&OsStr>,
+) -> Result<Option<u32>> {
+    if !receives_worker_launch_settings(spec) {
+        return Ok(None);
+    }
+    let Some(configured) = configured.filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let tasks_max = configured
+        .to_str()
+        .filter(|value| value.bytes().all(|byte| byte.is_ascii_digit()))
+        .and_then(|value| value.parse::<u32>().ok())
+        .filter(|value| (1..=4096).contains(value))
+        .context("MACO_WORKER_TASKS_MAX must be a decimal task count from 1 through 4096")?;
+    Ok(Some(tasks_max))
 }
 
 fn validate_worker_read_only_roots(
@@ -6111,11 +6134,17 @@ fn external_side_effect_profile_with_claude_relay(
         | ExternalAgentInvocation::DeepSeek
         | ExternalAgentInvocation::Vibe => {
             let mut profile = ExternalProviderProfile::for_command(spec, claude)?;
-            if let Some(memory_max_bytes) = protected_controls.worker_memory_max_bytes {
-                profile = profile.with_resource_limits(crate::process_runner::ProcessResourceLimits {
-                    memory_max_bytes,
-                    ..Default::default()
-                });
+            if protected_controls.worker_memory_max_bytes.is_some()
+                || protected_controls.worker_tasks_max.is_some()
+            {
+                let mut limits = crate::process_runner::ProcessResourceLimits::default();
+                if let Some(memory_max_bytes) = protected_controls.worker_memory_max_bytes {
+                    limits.memory_max_bytes = memory_max_bytes;
+                }
+                if let Some(tasks_max) = protected_controls.worker_tasks_max {
+                    limits.tasks_max = tasks_max;
+                }
+                profile = profile.with_resource_limits(limits);
             }
             for root in &protected_controls.worker_read_only_roots {
                 // Output staging replaces the declared artifact root after the
