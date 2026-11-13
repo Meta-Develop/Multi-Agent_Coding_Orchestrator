@@ -219,7 +219,12 @@ fn run_evidence_rejected_source_with_assignment(
     assignment: OrchestratorAssignment,
 ) -> (SupervisorFinalReport, OrchestratorAssignment, PathBuf) {
     let mut plan = injected_plan(assignment.clone(), 0);
-    plan.max_gate_corrections = 1;
+    // Keep every existing re-audit test's source outcome unchanged: an
+    // ImplementationDefect source keeps its correction budget, while an
+    // EvidenceQuality source gets a zero budget so the gate still escalates
+    // to the evidence-only re-audit instead of dispatching a correction.
+    plan.max_gate_corrections =
+        u8::from(rejection_kind == AuditorRejectionKind::ImplementationDefect);
     let budget = injected_run_budget(None, None, None, None, 100, 100);
     let options = injected_options(repo, temp.path(), run_id);
     let mut preserved_worktree = None;
@@ -549,6 +554,118 @@ fn assert_evidence_reaudit_preserves_candidate(generated_direct: bool) {
         source_id.as_str()
     );
     assert_eq!(plan_snapshot["evidence_only_reaudit"]["attempt"], 1);
+}
+
+#[test]
+fn reaudit_source_evidence_rejection_gets_one_worker_turn_then_accepts() {
+    skip_without_containment!();
+    let (temp, repo) = injected_repository();
+    let assignment = injected_assignment(true);
+    let run_id = RunId::new("reaudit-evidence-correction-turn").expect("valid run id");
+    let mut plan = injected_plan(assignment.clone(), 0);
+    plan.max_gate_corrections = 1;
+    let budget = injected_run_budget(None, None, None, None, 100, 100);
+    let options = injected_options(&repo, temp.path(), run_id.as_str());
+    let mut worker_dispatches = 0usize;
+    let mut second_prompt = String::new();
+    let mut runner = |command: &ExternalAgentCommand, _pre_action_review: bool| {
+        let name = command
+            .output_last_message
+            .file_name()
+            .and_then(OsStr::to_str)
+            .unwrap_or_default();
+        if name.contains("review-auditor") {
+            let mut child = reaudit_source_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            child.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
+            let mut auditor = injected_auditor_report(&assignment, &child);
+            let reject = worker_dispatches < 2;
+            auditor.accepted = !reject;
+            auditor.rejected = reject;
+            auditor.status = if reject {
+                ReviewStatus::Rejected
+            } else {
+                ReviewStatus::Succeeded
+            };
+            auditor.rejection_kind = reject.then_some(AuditorRejectionKind::EvidenceQuality);
+            if reject {
+                auditor.findings.push(Finding {
+                    severity: FindingSeverity::Error,
+                    message: "implementation is sound but validation evidence is insufficient"
+                        .to_string(),
+                    paths: vec![PathBuf::from("README.md")],
+                });
+            }
+            write_injected_json(&command.output_last_message, &auditor);
+            write_injected_usage(command, 11, 9);
+        } else {
+            worker_dispatches = worker_dispatches.saturating_add(1);
+            if worker_dispatches == 2 {
+                second_prompt =
+                    fs::read_to_string(&command.prompt).expect("read correction child prompt");
+            }
+            fs::write(command.cwd.join("README.md"), "preserved implementation\n")
+                .expect("write preserved implementation diff");
+            let mut child = reaudit_source_child_report(&assignment);
+            child.files_changed = vec![PathBuf::from("README.md")];
+            child.worker_reports[0].files_changed = vec![PathBuf::from("README.md")];
+            if assignment.role == AgentRole::Worker {
+                let worker = &child.worker_reports[0];
+                let journal = command
+                    .worker_journal_artifacts
+                    .iter()
+                    .find(|artifact| artifact.worker_id == assignment.id)
+                    .expect("direct journal capture");
+                let mut file = fs::OpenOptions::new()
+                    .append(true)
+                    .open(&journal.path)
+                    .expect("precreated journal");
+                for entry in injected_worker_journal_entries(worker) {
+                    append_worker_execution_journal_record(&mut file, &entry)
+                        .expect("append worker journal");
+                }
+                write_injected_json(&command.output_last_message, worker);
+            } else {
+                write_injected_json(&command.output_last_message, &child);
+            }
+            write_injected_usage(command, 13, 7);
+        }
+        injected_verified_run(command)
+    };
+    let loaded = LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata: SupervisorPlanMetadata {
+            assignment_schedule: vec![AssignmentScheduleEntry {
+                assignment_id: assignment.id.clone(),
+                parent_assignment_id: None,
+                depth: MIN_SUPERVISOR_DEPTH,
+                flattened_index: 0,
+            }],
+            run_budget: budget,
+            ..SupervisorPlanMetadata::default()
+        },
+    };
+    let report =
+        run_loaded_reaudit_source_with_selected_fixture(loaded, options, &temp, &mut runner)
+            .expect("run budgeted evidence correction");
+    assert!(report.success);
+    assert_eq!(worker_dispatches, 2);
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("corrected child report");
+    assert_eq!(child.gate_correction_outcomes.len(), 1);
+    assert_eq!(child.gate_correction_outcomes[0].correction_attempts, 1);
+    assert_eq!(
+        child.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::SelfCorrected
+    );
+    assert!(second_prompt.contains("EVIDENCE CORRECTION:"));
+    assert!(
+        second_prompt.contains("implementation is sound but validation evidence is insufficient")
+    );
 }
 
 #[test]

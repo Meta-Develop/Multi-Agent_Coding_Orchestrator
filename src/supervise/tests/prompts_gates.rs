@@ -247,6 +247,57 @@ fn auditor_repair_findings_truncate_multibyte_messages_on_character_boundary() {
 }
 
 #[test]
+fn evidence_correction_prompt_appends_block_only_for_evidence_quality() {
+    let paths = &[PathBuf::from("README.md")];
+    let findings = [Finding {
+        severity: FindingSeverity::Error,
+        message: "evidence mismatch".to_string(),
+        paths: Vec::new(),
+    }];
+    let evidence_denial = GateDenial::new(
+        "auditor-repair",
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::EvidenceQuality,
+        },
+        VerifiedGateContext::new("worker-a", GateCheckSource::Auditor, paths).expect("context"),
+    )
+    .expect("denial");
+    let defect_denial = GateDenial::new(
+        "auditor-repair",
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::ImplementationDefect,
+        },
+        VerifiedGateContext::new("worker-a", GateCheckSource::Auditor, paths).expect("context"),
+    )
+    .expect("denial");
+    let evidence_prompt =
+        prompt_with_gate_correction("assigned task", &evidence_denial, &findings).expect("prompt");
+    assert_eq!(
+        evidence_prompt.matches("AUDITOR REPAIR FINDINGS:").count(),
+        1
+    );
+    assert_eq!(evidence_prompt.matches("EVIDENCE CORRECTION:").count(), 1);
+    assert!(
+        evidence_prompt
+            .find("AUDITOR REPAIR FINDINGS:")
+            .expect("findings header")
+            < evidence_prompt
+                .find("EVIDENCE CORRECTION:")
+                .expect("evidence correction header")
+    );
+    assert!(evidence_prompt.contains("evidence mismatch"));
+    let defect_prompt =
+        prompt_with_gate_correction("assigned task", &defect_denial, &findings).expect("prompt");
+    assert!(!defect_prompt.contains("EVIDENCE CORRECTION:"));
+    let corrective = defect_denial.corrective_prompt().expect("corrective");
+    let findings_block = auditor_repair_findings_block(&findings).expect("findings block");
+    assert_eq!(
+        defect_prompt,
+        format!("assigned task\n\n{corrective}\n{findings_block}")
+    );
+}
+
+#[test]
 fn auditor_repair_findings_state_when_no_error_or_warning_remains() {
     for findings in [
         Vec::new(),
