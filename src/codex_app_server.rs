@@ -3236,6 +3236,37 @@ where
                                 .to_string(),
                     });
                 }
+                if message
+                    .pointer("/params/turn/status")
+                    .and_then(Value::as_str)
+                    == Some("completed")
+                {
+                    if let Some(turn_items) = message
+                        .pointer("/params/turn/items")
+                        .and_then(Value::as_array)
+                    {
+                        let listed_item_ids = turn_items
+                            .iter()
+                            .filter_map(|item| item.get("id").and_then(Value::as_str))
+                            .collect::<BTreeSet<_>>();
+                        let abandoned_item_ids = active_items
+                            .iter()
+                            .filter(|(item_id, item)| {
+                                matches!(item.item_type.as_str(), "agentMessage" | "reasoning")
+                                    && !listed_item_ids.contains(item_id.as_str())
+                            })
+                            .map(|(item_id, _)| item_id.clone())
+                            .collect::<Vec<_>>();
+                        for item_id in abandoned_item_ids {
+                            let item_type = active_items.remove(&item_id).unwrap().item_type;
+                            tracing::warn!(
+                                item_id = %item_id,
+                                item_type = %item_type,
+                                "app-server turn completed with an abandoned text item"
+                            );
+                        }
+                    }
+                }
                 if !active_items.is_empty() || !active_reviews.is_empty() {
                     return Err(AppServerError::Unexpected {
                         phase: "turn/completed",
@@ -7705,6 +7736,94 @@ mod tests {
         assert_eq!(outcome.status, TurnTerminalStatus::Completed);
         assert_eq!(outcome.completed_items, 1);
         assert_eq!(outcome.item_outcomes[0].item_type, "contextCompaction");
+    }
+
+    #[test]
+    fn turn_completed_drops_abandoned_agent_message_absent_from_turn_items() {
+        let mut messages = base_messages();
+        for (item_id, text) in [("msg-abandoned", ""), ("msg-final", "")] {
+            messages.push(json!({"method":"item/started","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":item_id,"type":"agentMessage","phase":"final_answer","text":text}
+            }}));
+        }
+        messages.push(json!({"method":"item/completed","params":{
+            "threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":"msg-final","type":"agentMessage","text":"final report"}
+        }}));
+        messages.push(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1",
+            "turn":{"id":"turn-1","status":"completed","items":[
+                {"id":"msg-final","type":"agentMessage","text":"final report"}
+            ]}
+        }}));
+        let outcome = run_command_observation_messages(messages).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        assert_eq!(outcome.final_message, Some("final report".to_string()));
+        assert_eq!(outcome.completed_items, 1);
+    }
+
+    #[test]
+    fn turn_completed_keeps_unfinished_command_execution_fatal() {
+        let mut messages = base_messages();
+        messages.push(json!({"method":"item/started","params":{
+            "threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":"cmd-unfinished","type":"commandExecution",
+                "command":"printf 'unfinished\\n'\n","cwd":"/workspace",
+                "status":"inProgress","exitCode":null}
+        }}));
+        messages.push(json!({"method":"item/started","params":{
+            "threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":"msg-final","type":"agentMessage","phase":"final_answer","text":""}
+        }}));
+        messages.push(json!({"method":"item/completed","params":{
+            "threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":"msg-final","type":"agentMessage","text":"final report"}
+        }}));
+        messages.push(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1",
+            "turn":{"id":"turn-1","status":"completed","items":[
+                {"id":"msg-final","type":"agentMessage","text":"final report"}
+            ]}
+        }}));
+        let error = run_command_observation_messages(messages).unwrap_err();
+        match error {
+            AppServerError::Unexpected { phase, message } => {
+                assert_eq!(phase, "turn/completed");
+                assert!(message.contains("active item or review lifecycles"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn turn_completed_keeps_listed_unfinished_agent_message_fatal() {
+        let mut messages = base_messages();
+        for (item_id, text) in [("msg-abandoned", ""), ("msg-final", "")] {
+            messages.push(json!({"method":"item/started","params":{
+                "threadId":"thread-1","turnId":"turn-1",
+                "item":{"id":item_id,"type":"agentMessage","phase":"final_answer","text":text}
+            }}));
+        }
+        messages.push(json!({"method":"item/completed","params":{
+            "threadId":"thread-1","turnId":"turn-1",
+            "item":{"id":"msg-final","type":"agentMessage","text":"final report"}
+        }}));
+        messages.push(json!({"method":"turn/completed","params":{
+            "threadId":"thread-1",
+            "turn":{"id":"turn-1","status":"completed","items":[
+                {"id":"msg-abandoned","type":"agentMessage","text":""},
+                {"id":"msg-final","type":"agentMessage","text":"final report"}
+            ]}
+        }}));
+        let error = run_command_observation_messages(messages).unwrap_err();
+        match error {
+            AppServerError::Unexpected { phase, message } => {
+                assert_eq!(phase, "turn/completed");
+                assert!(message.contains("active item or review lifecycles"));
+            }
+            other => panic!("unexpected error: {other:?}"),
+        }
     }
 
     fn assert_mid_turn_fault_sends_interrupt(
