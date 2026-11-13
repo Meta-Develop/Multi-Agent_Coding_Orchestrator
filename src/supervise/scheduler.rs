@@ -11599,7 +11599,10 @@ mod selection_policy_tests {
                 }
             }
 
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = tempfile::Builder::new()
+                .prefix("maco-t")
+                .tempdir_in("/tmp")
+                .expect("tempdir");
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
             let root = fs::canonicalize(dir.path()).expect("canonical");
             let data = root.join("data");
@@ -11728,7 +11731,10 @@ mod selection_policy_tests {
             }
 
             let _freeze = FrozenGrokSelectionGuard::pin(None);
-            let dir = tempfile::tempdir().expect("tempdir");
+            let dir = tempfile::Builder::new()
+                .prefix("maco-t")
+                .tempdir_in("/tmp")
+                .expect("tempdir");
             fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).expect("chmod");
             let root = fs::canonicalize(dir.path()).expect("canonical");
             let data = root.join("data");
