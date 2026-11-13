@@ -738,13 +738,61 @@ fn assert_combined_review_handoff(
     Ok(())
 }
 
+/// The final-mode fixture peer compiles and runs its combined check with the
+/// projected sysroot rustc inside the contained process, which hides /home,
+/// /root and /run/user. rustc therefore needs its default linker `cc` to be an
+/// executable file in an absolute PATH entry outside those roots.
+fn contained_default_linker_available() -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path;
+
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|entry| {
+        if !entry.is_absolute() {
+            return false;
+        }
+        let entry = Path::new(&entry);
+        if entry.starts_with("/home")
+            || entry.starts_with("/root")
+            || entry.starts_with("/run/user")
+        {
+            return false;
+        }
+        let Ok(metadata) = std::fs::metadata(entry.join("cc")) else {
+            return false;
+        };
+        metadata.is_file() && metadata.permissions().mode() & 0o111 != 0
+    })
+}
+
+macro_rules! skip_without_contained_default_linker {
+    ($name:literal) => {
+        if !contained_default_linker_available() {
+            eprintln!(
+                "SKIP {}::{}: no executable `cc` in an absolute PATH entry outside /home, /root and /run/user; the final-mode fixture links its combined check with the contained default linker",
+                module_path!(),
+                $name
+            );
+            return Ok(());
+        }
+    };
+}
+
 #[test]
 fn managed_parent_process_two_workers_edit_and_bind_observed_journals() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_two_workers_edit_and_bind_observed_journals"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-happy")
 }
 
 #[test]
 fn managed_parent_process_duplicate_receipt_executes_each_worker_once() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_duplicate_receipt_executes_each_worker_once"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-lost-response")
 }
 
@@ -768,6 +816,9 @@ fn managed_parent_process_cancellation_drains_active_worker_and_descendant() -> 
 
 #[test]
 fn managed_parent_process_refuses_substituted_worker_report() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_refuses_substituted_worker_report"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-forged-report")
 }
 
@@ -778,22 +829,34 @@ fn managed_parent_process_refuses_worker_edits_outside_authored_scope() -> Resul
 
 #[test]
 fn managed_parent_process_rejected_parent_review_cannot_accept_workers() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_rejected_parent_review_cannot_accept_workers"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-rejected-review")
 }
 
 #[test]
 fn managed_parent_process_isolated_final_sees_combined_candidate_and_complete_diagnostics(
 ) -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_final_sees_combined_candidate_and_complete_diagnostics"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-happy")
 }
 
 #[test]
 fn managed_parent_process_isolated_observed_journals_reach_all_review_scopes() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_observed_journals_reach_all_review_scopes"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-observed-journals")
 }
 
 #[test]
 fn managed_parent_process_isolated_refuses_journal_bound_to_sibling_or_parent() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_refuses_journal_bound_to_sibling_or_parent"
+    );
     for binding in ["sibling", "parent"] {
         super::nested_driver_tests::driver_fixture(&format!(
             "managed-cycle-process-isolated-journal-{binding}"
@@ -804,6 +867,9 @@ fn managed_parent_process_isolated_refuses_journal_bound_to_sibling_or_parent() 
 
 #[test]
 fn managed_parent_process_isolated_refuses_wrong_journal_identity_or_base() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_refuses_wrong_journal_identity_or_base"
+    );
     for binding in ["identity", "base"] {
         super::nested_driver_tests::driver_fixture(&format!(
             "managed-cycle-process-isolated-journal-{binding}"
@@ -814,22 +880,34 @@ fn managed_parent_process_isolated_refuses_wrong_journal_identity_or_base() -> R
 
 #[test]
 fn managed_parent_process_isolated_combined_check_survives_masked_rustup_shim() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_combined_check_survives_masked_rustup_shim"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-masked-rustup")
 }
 
 #[test]
 fn managed_parent_process_isolated_rejection_discards_tentative_candidate() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_rejection_discards_tentative_candidate"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-rejected-review")
 }
 
 #[test]
 fn managed_parent_process_isolated_collector_rejection_discards_without_worker_commits(
 ) -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_collector_rejection_discards_without_worker_commits"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-collector-rejected")
 }
 
 #[test]
 fn managed_parent_process_isolated_refuses_post_capture_tampering() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_refuses_post_capture_tampering"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-tampered")
 }
 
@@ -840,11 +918,17 @@ fn managed_parent_process_isolated_refuses_overlapping_candidate_paths() -> Resu
 
 #[test]
 fn managed_parent_process_isolated_uses_corrected_final_report_paths() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_uses_corrected_final_report_paths"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-misreported-paths")
 }
 
 #[test]
 fn managed_parent_process_isolated_worker_import_failure_retains_recovery() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_worker_import_failure_retains_recovery"
+    );
     super::nested_driver_tests::driver_fixture(
         "managed-cycle-process-isolated-worker-import-failure",
     )
@@ -852,6 +936,9 @@ fn managed_parent_process_isolated_worker_import_failure_retains_recovery() -> R
 
 #[test]
 fn managed_parent_process_isolated_parent_import_rejection_retains_recovery() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_parent_import_rejection_retains_recovery"
+    );
     super::nested_driver_tests::driver_fixture(
         "managed-cycle-process-isolated-parent-import-failure",
     )
@@ -867,12 +954,18 @@ fn managed_parent_process_isolated_initial_evidence_refusal_precedes_worker_disp
 
 #[test]
 fn managed_parent_process_isolated_long_worker_output_reaches_acceptance_intact() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_long_worker_output_reaches_acceptance_intact"
+    );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-long-output")
 }
 
 #[test]
 fn managed_parent_process_isolated_refuses_invalid_capture_references_and_parent_payloads(
 ) -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_refuses_invalid_capture_references_and_parent_payloads"
+    );
     for case in [
         "wrong-digest",
         "swapped-references",
