@@ -2799,7 +2799,6 @@ fn toml_test_string(path: &Path) -> String {
 #[cfg(target_os = "linux")]
 #[test]
 fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
-    skip_without_containment!();
     const CHILD_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_WRITE_BOUNDARY_CHILD";
     const ASSIGNED_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_ASSIGNED_PATH";
     const REPORT_PATH_ENV: &str = "MACO_TEST_EXTERNAL_CODEX_REPORT_PATH";
@@ -2833,6 +2832,7 @@ fn external_codex_outer_sandbox_enforces_control_and_report_write_boundaries() {
         fs::write(report, b"incoming writable\n").expect("write designated incoming report");
         return;
     }
+    skip_without_containment!();
 
     if !strict_backend_available_for_tests() {
         return;

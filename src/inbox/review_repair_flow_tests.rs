@@ -173,8 +173,17 @@ fn assert_validation_refused_cause(store: RepairValidationEvidenceStore, cause: 
     );
 }
 
+fn skip_without_host_ownership(name: &str) -> bool {
+    crate::containment_probe::skip_if_host_ownership_unavailable(name).unwrap()
+}
+
 #[test]
 fn validation_bundle_refuses_empty_or_incomplete_reports_and_retains_all_passed() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::validation_bundle_refuses_empty_or_incomplete_reports_and_retains_all_passed",
+    ) {
+        return;
+    }
     let (_temp, _a, prior_head, candidate, binding, _branch) = init_git_abc_candidate();
     assert_ne!(prior_head, candidate);
     assert_validation_refused_cause(
@@ -226,6 +235,11 @@ fn validation_bundle_refuses_empty_or_incomplete_reports_and_retains_all_passed(
 
 #[test]
 fn repair_producer_fingerprint_matches_authenticated_execution_record() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::repair_producer_fingerprint_matches_authenticated_execution_record",
+    ) {
+        return;
+    }
     let (temp, _a, prior_head, candidate, binding, _branch) = init_git_abc_candidate();
     let execution = RepairProducerExecutionRecord {
         agent_id: "repair-agent".to_string(),
@@ -295,6 +309,11 @@ fn test_update_receipt(
 
 #[test]
 fn pending_admission_journal_append_is_idempotent_for_same_digest() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::pending_admission_journal_append_is_idempotent_for_same_digest",
+    ) {
+        return;
+    }
     let (temp, pr_base, prior_head, candidate, binding, branch) = init_git_abc_candidate();
     let repo = temp.path().join("repo");
     let execution = RepairProducerExecutionRecord {
@@ -352,6 +371,11 @@ fn pending_admission_journal_append_is_idempotent_for_same_digest() {
 
 #[test]
 fn resume_replays_completed_transition_without_second_update() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::resume_replays_completed_transition_without_second_update",
+    ) {
+        return;
+    }
     let (temp, pr_base, prior_head, candidate, binding, branch) = init_git_abc_candidate();
     let repo = temp.path().join("repo");
     let run_id = RunId::new("repair-replay-complete").expect("run id");
@@ -1149,6 +1173,11 @@ fn clone_authenticated_run_with_mixed_validation(
 #[cfg(unix)]
 #[test]
 fn production_phase1_then_resume_advances_authenticated_c() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::production_phase1_then_resume_advances_authenticated_c",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     assert_ne!(
         fixture.item.source_snapshot.base_oid().unwrap(),
@@ -1231,6 +1260,11 @@ fn production_phase1_then_resume_advances_authenticated_c() {
 #[cfg(unix)]
 #[test]
 fn phase1_is_idempotent_and_does_not_rerun_repair() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::phase1_is_idempotent_and_does_not_rerun_repair",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     let run_id = RunId::new("repair-idempotent-phase1").expect("run");
     let first = run_phase1(&fixture, &run_id);
@@ -1273,6 +1307,11 @@ fn phase1_is_idempotent_and_does_not_rerun_repair() {
 #[cfg(unix)]
 #[test]
 fn phase1_passed_overall_with_skipped_report_refuses_before_auditor() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::phase1_passed_overall_with_skipped_report_refuses_before_auditor",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     let mut mixed = fixture.report.clone();
     assert_eq!(mixed.validation.status, AutopilotValidationStatus::Passed);
@@ -1337,6 +1376,11 @@ fn phase1_passed_overall_with_skipped_report_refuses_before_auditor() {
 #[cfg(unix)]
 #[test]
 fn phase2_loaded_mixed_validation_store_refuses_before_update() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::phase2_loaded_mixed_validation_store_refuses_before_update",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     let source_run = RunId::new("repair-mixed-phase2-source").expect("source run");
     assert!(matches!(
@@ -1376,6 +1420,11 @@ fn phase2_loaded_mixed_validation_store_refuses_before_update() {
 #[cfg(unix)]
 #[test]
 fn resume_interruption_after_update_replays_receipt_then_advances() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::resume_interruption_after_update_replays_receipt_then_advances",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     let run_id = RunId::new("repair-interrupt-update").expect("run");
     assert!(matches!(
@@ -1409,6 +1458,11 @@ fn resume_interruption_after_update_replays_receipt_then_advances() {
 #[cfg(unix)]
 #[test]
 fn resume_interruption_after_advance_replays_exact_watermark() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::resume_interruption_after_advance_replays_exact_watermark",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
     let run_id = RunId::new("repair-interrupt-advance").expect("run");
     assert!(matches!(
@@ -1456,6 +1510,11 @@ fn resume_interruption_after_advance_replays_exact_watermark() {
 #[cfg(unix)]
 #[test]
 fn parameterized_refusals_do_not_fabricate_passed_evidence_or_identities() {
+    if skip_without_host_ownership(
+        "inbox::review_repair_flow::review_repair_flow_tests::parameterized_refusals_do_not_fabricate_passed_evidence_or_identities",
+    ) {
+        return;
+    }
     let fixture = complete_abc_fixture();
 
     let mut wrong_producer_report = fixture.report.clone();
