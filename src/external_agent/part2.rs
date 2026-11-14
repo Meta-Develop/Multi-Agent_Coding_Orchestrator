@@ -8053,6 +8053,95 @@ fn allowed_env_with_selected_codex(
     environment
 }
 
+const WORKER_PATH_APPEND_ENV: &str = "MACO_WORKER_PATH_APPEND";
+
+fn worker_path_append_from(raw: Option<&str>) -> Result<Vec<PathBuf>> {
+    let raw = match raw {
+        None | Some("") => return Ok(Vec::new()),
+        Some(raw) => raw,
+    };
+    #[cfg(not(unix))]
+    {
+        let _ = raw;
+        bail!("MACO_WORKER_PATH_APPEND is supported only on Unix");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let entries: Vec<&str> = raw.split(':').collect();
+        let trusted: Vec<&str> = TRUSTED_PATH.split(':').collect();
+        for (index, entry) in entries.iter().enumerate() {
+            if entry.is_empty() {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is empty");
+            }
+            if !Path::new(entry).is_absolute() {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is not absolute");
+            }
+            if trusted.contains(entry) {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is already on the trusted PATH");
+            }
+            if entries[..index].contains(entry) {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is listed more than once");
+            }
+        }
+        for entry in &entries {
+            let canonical = match fs::canonicalize(entry) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    bail!("MACO_WORKER_PATH_APPEND entry {entry:?} cannot be resolved: {error}");
+                }
+            };
+            if canonical.as_os_str() != OsStr::new(*entry) {
+                bail!(
+                    "MACO_WORKER_PATH_APPEND entry {entry:?} is not canonical (resolves to {canonical:?})"
+                );
+            }
+            let metadata = match fs::metadata(entry) {
+                Ok(metadata) => metadata,
+                Err(error) => {
+                    bail!("MACO_WORKER_PATH_APPEND entry {entry:?} cannot be resolved: {error}");
+                }
+            };
+            if !metadata.is_dir() {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is not a directory");
+            }
+            if metadata.mode() & 0o022 != 0 {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is group- or world-writable");
+            }
+            if metadata.uid() != 0 {
+                bail!("MACO_WORKER_PATH_APPEND entry {entry:?} is not owned by root");
+            }
+        }
+        Ok(entries.into_iter().map(PathBuf::from).collect())
+    }
+}
+
+fn worker_path_append_setting() -> Result<Vec<PathBuf>> {
+    match std::env::var(WORKER_PATH_APPEND_ENV) {
+        Ok(value) => worker_path_append_from(Some(&value)),
+        Err(std::env::VarError::NotPresent) => worker_path_append_from(None),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("MACO_WORKER_PATH_APPEND is not valid UTF-8")
+        }
+    }
+}
+
+fn append_worker_path(environment: &mut BTreeMap<String, String>, directories: &[PathBuf]) {
+    if directories.is_empty() {
+        return;
+    }
+    let current = environment
+        .get("PATH")
+        .cloned()
+        .unwrap_or_else(|| TRUSTED_PATH.to_string());
+    let appended = directories
+        .iter()
+        .map(|directory| directory.display().to_string())
+        .collect::<Vec<_>>()
+        .join(":");
+    environment.insert("PATH".to_string(), format!("{current}:{appended}"));
+}
+
 fn command_display(program: &Path, argv: &[OsString]) -> Vec<String> {
     let mut command = Vec::with_capacity(argv.len() + 1);
     command.push(display_os_argument(program.as_os_str()));
