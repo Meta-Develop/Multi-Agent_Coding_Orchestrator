@@ -17,6 +17,7 @@ pub mod consult;
 #[doc(hidden)]
 pub mod containment_probe;
 pub mod decision_claim;
+pub mod decision_provider;
 pub mod decision_ref;
 pub mod decision_store;
 pub(crate) mod doctor;
