@@ -1454,6 +1454,36 @@ fn current_codex_input(authority: AuthorityRole) -> SelectionInput {
 }
 
 #[test]
+fn prior_dataset_rejects_non_adjacent_duplicate_runtime_model_pairs() {
+    let priors = built_in_prior_dataset().expect("built-in priors");
+    validate_prior_dataset(&priors).expect("valid built-in priors");
+    assert!(priors.models.len() >= 2);
+    let mut keys = BTreeSet::new();
+    for prior in &priors.models {
+        assert!(keys.insert((prior.runtime.clone(), prior.model.clone())));
+    }
+    let mut invalid = priors.clone();
+    invalid.models.push(invalid.models[0].clone());
+    let err = validate_prior_dataset(&invalid).expect_err("non-adjacent duplicate rejected");
+    match err {
+        SelectionError::InvalidInput(message) => {
+            assert!(message.contains("duplicate runtime/model entry"))
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+    invalid
+        .models
+        .sort_by(|a, b| (&a.runtime, &a.model).cmp(&(&b.runtime, &b.model)));
+    let err = validate_prior_dataset(&invalid).expect_err("adjacent duplicate rejected");
+    match err {
+        SelectionError::InvalidInput(message) => {
+            assert!(message.contains("duplicate runtime/model entry"))
+        }
+        other => panic!("unexpected error: {other:?}"),
+    }
+}
+
+#[test]
 fn current_codex_priors_keep_owner_policy_distinct_from_measured_evidence() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     validate_prior_dataset(&priors).expect("valid built-in priors");
