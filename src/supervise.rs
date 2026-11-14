@@ -300,6 +300,7 @@ pub(crate) use follow_up_lease::{
 mod repository;
 use repository::*;
 
+mod decision_shadow;
 mod scheduler;
 pub use scheduler::*;
 
