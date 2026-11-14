@@ -5,6 +5,7 @@
 //! the returned decision contains the normalized-input digests and every
 //! candidate considered.
 
+pub mod decision_proposal;
 mod public_benchmark;
 mod quota_input;
 pub mod routing_policy;
