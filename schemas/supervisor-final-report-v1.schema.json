@@ -2476,6 +2476,31 @@
               }
             ]
           },
+          "journal_record": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "additionalProperties": false,
+                "properties": {
+                  "line": {
+                    "minimum": 1,
+                    "type": "integer"
+                  },
+                  "start_timestamp": {
+                    "minLength": 1,
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "line",
+                  "start_timestamp"
+                ],
+                "type": "object"
+              }
+            ]
+          },
           "runtime_identity": {
             "oneOf": [
               {
@@ -7834,6 +7859,31 @@
                           }
                         ]
                       },
+                      "journal_record": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "start_timestamp": {
+                                "minLength": 1,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "line",
+                              "start_timestamp"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
                       "runtime_identity": {
                         "oneOf": [
                           {
@@ -9722,6 +9772,31 @@
                         "status",
                         "input_tokens",
                         "output_tokens"
+                      ],
+                      "type": "object"
+                    }
+                  ]
+                },
+                "journal_record": {
+                  "oneOf": [
+                    {
+                      "type": "null"
+                    },
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "line": {
+                          "minimum": 1,
+                          "type": "integer"
+                        },
+                        "start_timestamp": {
+                          "minLength": 1,
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "line",
+                        "start_timestamp"
                       ],
                       "type": "object"
                     }
@@ -15308,6 +15383,31 @@
                               "status",
                               "input_tokens",
                               "output_tokens"
+                            ],
+                            "type": "object"
+                          }
+                        ]
+                      },
+                      "journal_record": {
+                        "oneOf": [
+                          {
+                            "type": "null"
+                          },
+                          {
+                            "additionalProperties": false,
+                            "properties": {
+                              "line": {
+                                "minimum": 1,
+                                "type": "integer"
+                              },
+                              "start_timestamp": {
+                                "minLength": 1,
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "line",
+                              "start_timestamp"
                             ],
                             "type": "object"
                           }

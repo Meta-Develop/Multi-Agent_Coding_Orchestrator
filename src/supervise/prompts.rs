@@ -253,6 +253,7 @@ fn worker_execution_journal_prompt_contract() -> Result<String> {
 - Cargo build-script race (#939), not an append/observation error: hard links are denied in this sandbox, so Cargo copies build scripts, and a cargo command can fail with `Text file busy (os error 26)` for a just-built `build-script-build` that it reports as `(never executed)`. Only for a failed command whose output shows both texts, run the identical journal-append invocation once more as a new invocation and report both runs in commands_run, the first with its real exit status. If that rerun fails with the same two texts, stop and report it in environment_failures as sandbox_unavailable with the observed error; status=failed, accepted=false, rejected=true.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Empty command/payload/cwd/timestamps or invalid paths: WorkerExecutionJournalRecordError; stop.
 - WorkerReport.commands_run cwd is the exact absolute worktree from the journal, not a repository-relative path or a redacted placeholder. WorkerReport.commands_run may be a subset of real journal records; each command array element and cwd must be copied byte-for-byte, failed commands included. Never paraphrase, summarize, normalize environment assignments, drop shell wrappers, or invent command identities.
+- For a long, multi-line or quoted command you may report a reference instead of retyping it: set that commands_run entry's command to [] and its journal_record to {{"line": N, "start_timestamp": "T"}}, where N is the 1-based line of the command's completed or failed record in the journal (cat -n shows line numbers) and T is that record's start_timestamp; keep cwd exact. MACO fills command from that record. A reference to any other record, a different timestamp or a non-empty command fails the report.
 - Report the inner argv after --: direct prefix ... -- bash -lc 'true' or /bin/bash -lc 'prefix ...' reports ["bash","-lc","true"]; the inner bash -lc array stays intact, with a matching finished journal record.
 - Replace /worktree with your assigned worktree.
 - Only a payload-bearing post-edit observation produces an apply_patch journal record with the following command shape. The wrapper generates JSON and timestamps; never write this JSON yourself or copy this command into commands_run after a -- true observation:
@@ -1278,7 +1279,7 @@ Vibe direct-worker guidance:
 Prefer a bare final JSON WorkerReport object. A structurally recovered final JSON retains the recovery warning and all semantic evidence checks. Before writing it, read the generated WorkerReport schema at the WorkerReport schema path below with read_file.
 Item key sets from that schema (optional keys may be omitted):
 findings required keys: severity, message, paths; optional keys: (none)
-commands_run required keys: command, cwd, status, timeout_seconds, duration_ms, timed_out, stdout, stderr, environment_preflight_results, environment_failures; optional keys: codex_parent_evidence, error, exit_code, fixed_version_probe_evidence, grok_acp_parent_evidence, grok_stream_usage_evidence, runtime_identity, sandbox_denials
+commands_run required keys: command, cwd, status, timeout_seconds, duration_ms, timed_out, stdout, stderr, environment_preflight_results, environment_failures; optional keys: codex_parent_evidence, error, exit_code, fixed_version_probe_evidence, grok_acp_parent_evidence, grok_stream_usage_evidence, journal_record, runtime_identity, sandbox_denials
 validation_results required keys: name, status, command; optional keys: message
 Every findings item uses message, never summary.
 Use plain bash for all commands and edits: the configured shell journals automatically. Never manually nest journal-append or use native write/edit. Files may also be read with read_file.
@@ -2175,12 +2176,13 @@ pub(super) fn apply_canonical_environment_requirements(
 mod regression_tests {
     use super::*;
 
-    // Cost decision: allow at most 3 KiB per worker template for the integrated
+    // Cost decision: allow at most 4 KiB per worker template for the integrated
     // native-edit identity, automatic timestamp, serial journal and explicit
-    // recovery contracts, including the Cargo build-script race (#939). The child fixture
+    // recovery contracts, including the Cargo build-script race (#939)
+    // and journal record references (#966). The child fixture
     // embeds the worker contract once and gets the same allowance. This is test-only: production
     // measurement fields and trusted launch/acceptance limits remain unchanged.
-    const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 3 * 1024;
+    const JOURNAL_CONTRACT_FIXTURE_ALLOWANCE_BYTES: usize = 4 * 1024;
 
     fn fixed_prompt_fixture() -> Result<(String, String, String, String)> {
         fixed_prompt_fixture_with_ids("child-a", "worker-a", "src/supervise/prompts.rs")

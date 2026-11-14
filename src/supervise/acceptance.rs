@@ -3112,18 +3112,34 @@ pub(super) fn validate_worker_execution_journal_evidence(
             blocking_messages.push((message, finding_paths));
         }
 
-        canonicalize_journal_command_references(
+        for message in canonicalize_journal_command_references(
+            &worker_report.id,
             &mut worker_report.commands_run,
             &mut worker_report.validation_results,
             journal,
             entries,
-        );
-        canonicalize_journal_command_references(
+        ) {
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                vec![journal.evidence_relative_path.clone()],
+            );
+            blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
+        }
+        for message in canonicalize_journal_command_references(
+            &worker_report.id,
             &mut report.commands_run,
             &mut report.validation_results,
             journal,
             entries,
-        );
+        ) {
+            mark_worker_report_structural_inconsistency(
+                worker_report,
+                message.clone(),
+                vec![journal.evidence_relative_path.clone()],
+            );
+            blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
+        }
         let journal_commands = entries
             .iter()
             .filter(|entry| {
@@ -3280,12 +3296,56 @@ pub(super) fn validate_worker_execution_journal_evidence(
 }
 
 fn canonicalize_journal_command_references(
+    worker_id: &str,
     commands: &mut [CommandRunRecord],
     validations: &mut [ValidationResult],
     journal: &WorkerExecutionJournalEvidence,
     entries: &[WorkerExecutionJournalEntry],
-) {
+) -> Vec<String> {
+    let mut problems = Vec::new();
+    for (index, record) in commands.iter_mut().enumerate() {
+        let Some(reference) = record.journal_record.clone() else {
+            continue;
+        };
+        let problem = |condition: &str, problems: &mut Vec<String>| {
+            problems.push(format!(
+                "worker '{}' commands_run[{}] journal_record line {} is invalid: {}",
+                worker_id, index, reference.line, condition
+            ));
+        };
+        let Some(entry) = usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1))
+            .and_then(|position| entries.get(position))
+        else {
+            problem("line is outside the journal", &mut problems);
+            continue;
+        };
+        let finished = entry.observation.as_ref().is_none_or(|observation| {
+            matches!(
+                observation.phase,
+                WorkerJournalObservationPhase::Completed | WorkerJournalObservationPhase::Failed
+            )
+        });
+        if !finished {
+            problem("record is not completed or failed", &mut problems);
+        } else if entry.start_timestamp != reference.start_timestamp {
+            problem(
+                "start_timestamp does not match the journal record",
+                &mut problems,
+            );
+        } else if !record.command.is_empty() {
+            problem("command is not empty", &mut problems);
+        } else if record.cwd != entry.cwd {
+            problem("cwd does not match the journal record", &mut problems);
+        } else {
+            record.command = entry.command.clone();
+        }
+    }
     for record in commands {
+        if record.journal_record.is_some() {
+            continue;
+        }
         if let Some(command) = journal_command::canonicalize_wrapper(record, journal, entries) {
             record.command = command;
         }
@@ -3303,6 +3363,7 @@ fn canonicalize_journal_command_references(
             }
         }
     }
+    problems
 }
 
 fn mark_worker_report_structural_inconsistency(

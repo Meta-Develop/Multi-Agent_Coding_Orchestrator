@@ -2119,6 +2119,7 @@ fn worker_journal_native_and_wrapped_edit_reports_require_exact_observed_command
             .map(|command| CommandRunRecord {
                 command,
                 cwd: worktree.clone(),
+                journal_record: None,
                 ..injected_command_record()
             })
             .collect();
@@ -2652,6 +2653,140 @@ fn worker_journal_wrapper_started_only_is_rejected_by_canonicalizer_phase_filter
     );
     // Bypass observation validation so only the canonicalizer can reject this.
     assert!(journal_command::canonicalize_wrapper(&record, journal, &entries[..1]).is_none());
+}
+
+#[cfg(target_os = "linux")]
+fn journal_record_reference_fixture(
+    script: &str,
+) -> (tempfile::TempDir, WorkerExecutionJournalEvidenceSet) {
+    use std::os::unix::fs::MetadataExt;
+    let (temp, cwd, _, entries) = observed_parent_journal(script);
+    let journal = temp.path().canonicalize().unwrap().join("worker.jsonl");
+    let metadata = fs::metadata(&journal).unwrap();
+    let mut journals =
+        injected_worker_journal_evidence(WorkerExecutionJournalStatus::Loaded(entries));
+    journals.get_mut("worker-a").unwrap().command_binding = Some(WorkerJournalCommandBinding {
+        executable: PathBuf::from("/run/provided MACO/maco"),
+        journal,
+        device: metadata.dev(),
+        inode: metadata.ino(),
+        cwd,
+    });
+    (temp, journals)
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn journal_record_reference_resolves_multiline_command() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let script = "printf 'a\\n'\n\nprintf 'b\\n'";
+    let (_temp, journals) = journal_record_reference_fixture(script);
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let line = entries.len() as u64;
+    let entry = entries.last().unwrap();
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.command = Vec::new();
+    record.cwd = entry.cwd.clone();
+    record.journal_record = Some(JournalRecordReference {
+        line,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
+    report.worker_reports[0].commands_run = vec![record];
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("journal-record-reference.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(report.accepted, "{}", finding_messages(&report));
+    assert_eq!(
+        &report.worker_reports[0].commands_run[0].command,
+        &entry.command
+    );
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn journal_record_reference_rejects_invalid_references() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'\n\nprintf 'b\\n'");
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let finished = entries.last().unwrap();
+    let valid_line = entries.len() as u64;
+    for (line, start_timestamp, command) in [
+        (0, finished.start_timestamp.clone(), Vec::new()),
+        (valid_line + 1, finished.start_timestamp.clone(), Vec::new()),
+        (1, entries[0].start_timestamp.clone(), Vec::new()),
+        (valid_line, "1970-01-01T00:00:00Z".to_string(), Vec::new()),
+        (
+            valid_line,
+            finished.start_timestamp.clone(),
+            vec!["retyped".to_string()],
+        ),
+    ] {
+        let assignment = injected_assignment(true);
+        let mut report = injected_child_report(&assignment);
+        let mut record = injected_command_record();
+        record.command = command;
+        record.cwd = finished.cwd.clone();
+        record.journal_record = Some(JournalRecordReference {
+            line,
+            start_timestamp,
+        });
+        report.worker_reports[0].commands_run = vec![record];
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("journal-record-reference.json"),
+            &journals,
+            &mut report,
+        );
+        assert!(!report.accepted, "line={line}");
+        assert!(
+            finding_messages(&report).contains("journal_record"),
+            "line={line}"
+        );
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn journal_record_reference_invalid_wrapper_command_stays_unchanged() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals, wrapper) = wrapper_journal_fixture(false);
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let entry = entries.last().unwrap();
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.command = wrapper.clone();
+    record.cwd = journals["worker-a"]
+        .command_binding
+        .as_ref()
+        .unwrap()
+        .cwd
+        .clone();
+    record.journal_record = Some(JournalRecordReference {
+        line: entries.len() as u64,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
+    report.worker_reports[0].commands_run = vec![record];
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("journal-record-reference.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(!report.accepted);
+    assert!(finding_messages(&report).contains("journal_record"));
+    assert_eq!(report.worker_reports[0].commands_run[0].command, wrapper);
 }
 
 #[cfg(target_os = "linux")]
@@ -3845,6 +3980,7 @@ fn supervisor_required_optional_and_vector_paths_share_reversible_serialization(
         codex_parent_evidence: None,
         runtime_identity: None,
         fixed_version_probe_evidence: None,
+        journal_record: None,
     };
     let value = serde_json::to_value(record).expect("serialize command cwd");
     assert_eq!(value["cwd"], encoded);

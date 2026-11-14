@@ -362,6 +362,7 @@ fn synthetic_lens_dispatch_evidence(
         codex_parent_evidence: None,
         runtime_identity: None,
         fixed_version_probe_evidence: None,
+        journal_record: None,
     };
     review_lens_dispatch_evidence_from_records(
         [("agent-a-review-auditor-lens-0", Some(&command))],

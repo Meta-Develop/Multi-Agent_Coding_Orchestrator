@@ -2965,6 +2965,7 @@ pub(super) fn command_record_from_external_for_runtime(
             run, command, runtime,
         )),
         fixed_version_probe_evidence: run.fixed_version_probe_evidence().cloned(),
+        journal_record: None,
     }
 }
 

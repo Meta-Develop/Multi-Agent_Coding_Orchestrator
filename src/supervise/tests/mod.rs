@@ -1864,6 +1864,7 @@ fn injected_command_record() -> CommandRunRecord {
         codex_parent_evidence: None,
         runtime_identity: None,
         fixed_version_probe_evidence: None,
+        journal_record: None,
     }
 }
 
