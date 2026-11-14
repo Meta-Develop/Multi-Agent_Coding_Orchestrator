@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import importlib.util
+import re
 import unittest
 from pathlib import Path
 
@@ -200,6 +201,23 @@ class LinuxCiLibraryShardTests(unittest.TestCase):
             ),
         )
         self.assertNotIn("supervise", self.shards.SAFETY_PREFLIGHTS)
+
+    def test_testing_doc_rows_name_every_fixture_module(self) -> None:
+        testing = Path(__file__).resolve().parents[2] / "docs" / "TESTING.md"
+        rows = {}
+        for line in testing.read_text(encoding="utf-8").splitlines():
+            cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+            if len(cells) != 2 or not cells[1].startswith("`lib "):
+                continue
+            shard = cells[1].strip("`")[len("lib "):]
+            modules = {
+                token.rsplit("::", 1)[-1] for token in re.findall(r"`([^`]+)`", cells[0])
+            }
+            rows.setdefault(shard, set()).update(modules)
+        for module, shard in self.shards.FIXTURE_MODULE_SHARDS.items():
+            with self.subTest(module=module, shard=shard):
+                self.assertIn(shard, rows)
+                self.assertIn(module, rows[shard])
 
 
 if __name__ == "__main__":

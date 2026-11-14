@@ -33,7 +33,7 @@ lane-check s2 1200 'cargo test --locked --lib supervise::tests::budget::'
 | Other `supervise`, including attached parent capture | `lib supervise-core` |
 | `supervise::tests::budget`, `prompts_gates` | `lib supervise-fixtures-budget` |
 | `supervise::tests::licensed_breakage` | `lib supervise-fixtures-licensed` |
-| `supervise::tests::plan_runtime`, `run_artifacts`, `qualification_handoff`, `reaudit` | `lib supervise-fixtures-runtime` |
+| `supervise::tests::plan_runtime`, `mixed_runtime`, `run_artifacts`, `qualification_handoff`, `reaudit` | `lib supervise-fixtures-runtime` |
 | Other `supervise::tests`, including new fixture modules | `lib supervise-fixtures` |
 | `external_agent::vibe_tests`, `grok_worker_journal_binding_tests`, `worker_journal_append_binding_tests` | `lib external-agent-journal` |
 | Other `external_agent` | `lib external-agent` |
