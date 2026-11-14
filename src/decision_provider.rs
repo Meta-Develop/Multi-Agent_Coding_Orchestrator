@@ -31,6 +31,10 @@ pub struct DecisionProviderConfig {
     pub model: String,
     pub threshold_basis_points: u16,
     pub timeout_ms: u64,
+    /// Optional cap on the task-text characters sent as `state.task`. The
+    /// retained question keeps the full text; absent sends the full text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_task_text_chars: Option<usize>,
 }
 
 pub fn systemone_request(question: &DecisionQuestion, model: &str) -> serde_json::Value {
@@ -59,6 +63,19 @@ pub fn systemone_request(question: &DecisionQuestion, model: &str) -> serde_json
             },
         },
     })
+}
+
+/// The task text sent as `state.task`: the first `max_chars` characters and a
+/// marker when the text is longer, otherwise the full text.
+pub fn bounded_task_text(task_text: &str, max_chars: Option<usize>) -> String {
+    let total = task_text.chars().count();
+    match max_chars {
+        Some(limit) if total > limit => {
+            let head: String = task_text.chars().take(limit).collect();
+            format!("{head}\n[task text truncated: first {limit} of {total} characters]")
+        }
+        _ => task_text.to_string(),
+    }
 }
 
 pub fn parse_systemone_response(
@@ -353,7 +370,26 @@ pub fn consult_decision_provider(
             ),
         );
     }
-    let request = serde_json::to_vec(&systemone_request(question, &config.model))
+    if config.max_task_text_chars == Some(0) {
+        return fallback(
+            DecisionAdoptionOutcome::NotConsulted,
+            "max_task_text_chars 0 out of range; the provider was not consulted".to_string(),
+        );
+    }
+    let mut sent = question.clone();
+    sent.task_text = bounded_task_text(&question.task_text, config.max_task_text_chars);
+    let total = question.task_text.chars().count();
+    let note = config
+        .max_task_text_chars
+        .filter(|limit| total > *limit)
+        .map(|limit| format!("; task text sent as the first {limit} of {total} characters"));
+    let noted = |mut adoption: DecisionAdoption| {
+        if let Some(note) = &note {
+            adoption.reason.push_str(note);
+        }
+        adoption
+    };
+    let request = serde_json::to_vec(&systemone_request(&sent, &config.model))
         .map_err(|error| error.to_string())
         .and_then(|body| {
             post_systemone(
@@ -365,22 +401,26 @@ pub fn consult_decision_provider(
     let body = match request {
         Ok(body) => body,
         Err(error) => {
-            return fallback(
+            return noted(fallback(
                 DecisionAdoptionOutcome::ProviderError,
                 format!("provider request failed: {error}"),
-            )
+            ))
         }
     };
     let proposal = match parse_systemone_response(question, &config.model, &body) {
         Ok(proposal) => proposal,
         Err(error) => {
-            return fallback(
+            return noted(fallback(
                 DecisionAdoptionOutcome::ProviderError,
                 format!("provider response rejected: {error}"),
-            )
+            ))
         }
     };
-    adopt_decision_proposal(question, &proposal, config.threshold_basis_points)
+    noted(adopt_decision_proposal(
+        question,
+        &proposal,
+        config.threshold_basis_points,
+    ))
 }
 
 #[cfg(test)]
@@ -418,6 +458,7 @@ mod tests {
             model: "model-a".to_string(),
             threshold_basis_points: 6000,
             timeout_ms,
+            max_task_text_chars: None,
         }
     }
 
@@ -535,6 +576,51 @@ mod tests {
     }
 
     #[test]
+    fn bounded_task_text_keeps_short_text_and_marks_truncation() {
+        assert_eq!(bounded_task_text("abcdefgh", None), "abcdefgh");
+        assert_eq!(bounded_task_text("abcdefgh", Some(8)), "abcdefgh");
+        assert_eq!(
+            bounded_task_text("abcdefgh", Some(5)),
+            "abcde\n[task text truncated: first 5 of 8 characters]"
+        );
+        assert_eq!(
+            bounded_task_text("ああああ", Some(2)),
+            "ああ\n[task text truncated: first 2 of 4 characters]"
+        );
+    }
+
+    #[test]
+    fn consult_sends_bounded_task_text_and_notes_it() {
+        let question = question();
+        let body = answer_body("{\"option-1\":0.2,\"option-2\":0.8}");
+        let (endpoint, handle) = fake_endpoint(response_with_body(&body), 0);
+        let mut bounded = config(endpoint, 5000);
+        bounded.max_task_text_chars = Some(6);
+        let adoption = consult_decision_provider(&bounded, &question);
+        assert_eq!(adoption.outcome, DecisionAdoptionOutcome::Adopted);
+        assert!(adoption
+            .reason
+            .ends_with("; task text sent as the first 6 of 11 characters"));
+        let captured = handle.join().expect("join fake endpoint");
+        let text = String::from_utf8(captured).expect("captured request is utf-8");
+        let body_start = text.find("\r\n\r\n").expect("header end") + 4;
+        let parsed: serde_json::Value =
+            serde_json::from_str(&text[body_start..]).expect("request body is JSON");
+        assert_eq!(
+            parsed["state"]["task"],
+            "sample\n[task text truncated: first 6 of 11 characters]"
+        );
+        let mut zero = config("http://127.0.0.1:1".to_string(), 5000);
+        zero.max_task_text_chars = Some(0);
+        let adoption = consult_decision_provider(&zero, &question);
+        assert_eq!(adoption.outcome, DecisionAdoptionOutcome::NotConsulted);
+        assert_eq!(
+            adoption.reason,
+            "max_task_text_chars 0 out of range; the provider was not consulted"
+        );
+    }
+
+    #[test]
     fn consult_adopts_through_a_fake_endpoint() {
         let question = question();
         let body = answer_body("{\"option-1\":0.2,\"option-2\":0.8}");
@@ -636,6 +722,7 @@ mod tests {
                 model: "model-a".to_string(),
                 threshold_basis_points: 0,
                 timeout_ms: 5000,
+                max_task_text_chars: None,
             },
             &question,
         );
@@ -646,6 +733,7 @@ mod tests {
                 model: "model-a".to_string(),
                 threshold_basis_points: 6000,
                 timeout_ms: 0,
+                max_task_text_chars: None,
             },
             &question,
         );
