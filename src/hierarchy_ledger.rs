@@ -458,6 +458,7 @@ pub struct ObservedHierarchyNode<'a> {
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct ObservedHierarchy {
     pub depths: BTreeMap<String, u32>,
+    pub cyclic_nodes: BTreeSet<String>,
     pub coordination_depth: u32,
 }
 
@@ -484,6 +485,11 @@ pub fn orchestration_role_is_coordinator(role: OrchestrationRole) -> bool {
 /// (`max(coordinator depth) + 1`). If the graph has no coordinators, the same
 /// layer-count rule is applied to every node so a flat worker list still
 /// reports its observed shape instead of a fixed two-tier label.
+///
+/// A node that lies on a parent cycle (including a self-parent), or whose
+/// parent chain reaches one, has no finite depth: it is recorded in
+/// `cyclic_nodes` instead of `depths`, and when `cyclic_nodes` is non-empty
+/// `coordination_depth` is 0, so a cycle never surfaces as a layer count.
 pub fn observe_hierarchy<'a, I>(nodes: I) -> ObservedHierarchy
 where
     I: IntoIterator<Item = ObservedHierarchyNode<'a>>,
@@ -503,8 +509,16 @@ where
         .map(|(id, parent, _)| (id.clone(), parent.clone()))
         .collect::<BTreeMap<_, _>>();
     let mut depths = BTreeMap::new();
+    let mut cyclic_nodes = BTreeSet::new();
     for id in parents.keys() {
-        let _ = depth_of(id, &parents, &mut depths, &mut BTreeSet::new());
+        let _ = depth_of(
+            id,
+            &parents,
+            &mut depths,
+            &mut cyclic_nodes,
+            &mut BTreeSet::new(),
+            &mut Vec::new(),
+        );
     }
     let coordinator_ids = entries
         .iter()
@@ -516,9 +530,15 @@ where
         .filter(|(id, _)| coordinator_ids.is_empty() || coordinator_ids.contains(id.as_str()))
         .map(|(_, depth)| *depth)
         .max();
+    let coordination_depth = if cyclic_nodes.is_empty() {
+        max.map(|depth| depth.saturating_add(1)).unwrap_or(0)
+    } else {
+        0
+    };
     ObservedHierarchy {
         depths,
-        coordination_depth: max.map(|depth| depth.saturating_add(1)).unwrap_or(0),
+        cyclic_nodes,
+        coordination_depth,
     }
 }
 
@@ -526,21 +546,44 @@ fn depth_of(
     id: &str,
     parents: &BTreeMap<String, Option<String>>,
     depths: &mut BTreeMap<String, u32>,
+    cyclic_nodes: &mut BTreeSet<String>,
     visiting: &mut BTreeSet<String>,
+    path: &mut Vec<String>,
 ) -> u32 {
     if let Some(depth) = depths.get(id) {
         return *depth;
     }
-    if !visiting.insert(id.to_string()) {
-        depths.insert(id.to_string(), 0);
+    if cyclic_nodes.contains(id) {
         return 0;
     }
+    if !visiting.insert(id.to_string()) {
+        if let Some(pos) = path.iter().position(|node| node == id) {
+            for node in &path[pos..] {
+                cyclic_nodes.insert(node.clone());
+            }
+        }
+        return 0;
+    }
+    path.push(id.to_string());
     let depth = match parents.get(id).and_then(Option::as_deref) {
         None => 0,
         Some(parent) if !parents.contains_key(parent) => 1,
-        Some(parent) => depth_of(parent, parents, depths, visiting).saturating_add(1),
+        Some(parent) => {
+            let parent_depth = depth_of(parent, parents, depths, cyclic_nodes, visiting, path);
+            if cyclic_nodes.contains(parent) {
+                cyclic_nodes.insert(id.to_string());
+                path.pop();
+                visiting.remove(id);
+                return 0;
+            }
+            parent_depth.saturating_add(1)
+        }
     };
+    path.pop();
     visiting.remove(id);
+    if cyclic_nodes.contains(id) {
+        return 0;
+    }
     depths.insert(id.to_string(), depth);
     depth
 }
@@ -796,6 +839,77 @@ mod tests {
         }]);
         assert_eq!(orphan_worker.depths.get("worker-a").copied(), Some(1));
         assert_eq!(orphan_worker.coordination_depth, 2);
+    }
+
+    #[test]
+    fn observed_hierarchy_refuses_a_finite_depth_for_parent_cycles() {
+        let two_cycle = observe_hierarchy([
+            ObservedHierarchyNode {
+                id: "A",
+                parent: Some("B"),
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "B",
+                parent: Some("A"),
+                coordinator: true,
+            },
+        ]);
+        assert_eq!(
+            two_cycle.cyclic_nodes,
+            BTreeSet::from(["A".to_string(), "B".to_string()])
+        );
+        assert!(!two_cycle.depths.contains_key("A"));
+        assert!(!two_cycle.depths.contains_key("B"));
+        assert_eq!(two_cycle.coordination_depth, 0);
+
+        let self_parent = observe_hierarchy([ObservedHierarchyNode {
+            id: "S",
+            parent: Some("S"),
+            coordinator: true,
+        }]);
+        assert_eq!(self_parent.cyclic_nodes, BTreeSet::from(["S".to_string()]));
+        assert!(!self_parent.depths.contains_key("S"));
+        assert_eq!(self_parent.coordination_depth, 0);
+
+        let cycle_with_tail = observe_hierarchy([
+            ObservedHierarchyNode {
+                id: "A",
+                parent: Some("B"),
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "B",
+                parent: Some("A"),
+                coordinator: true,
+            },
+            ObservedHierarchyNode {
+                id: "W",
+                parent: Some("A"),
+                coordinator: false,
+            },
+            ObservedHierarchyNode {
+                id: "R",
+                parent: None,
+                coordinator: true,
+            },
+        ]);
+        assert_eq!(
+            cycle_with_tail.cyclic_nodes,
+            BTreeSet::from(["A".to_string(), "B".to_string(), "W".to_string()])
+        );
+        assert_eq!(
+            cycle_with_tail.depths,
+            BTreeMap::from([("R".to_string(), 0)])
+        );
+        assert_eq!(cycle_with_tail.coordination_depth, 0);
+
+        let flat = observe_hierarchy([ObservedHierarchyNode {
+            id: "run-1",
+            parent: None,
+            coordinator: true,
+        }]);
+        assert!(flat.cyclic_nodes.is_empty());
     }
 
     #[test]
