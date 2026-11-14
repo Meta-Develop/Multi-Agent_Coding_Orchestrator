@@ -1234,7 +1234,7 @@ fn issue33_sha256sum(path: &Path) -> Result<String> {
 
 #[cfg(unix)]
 fn issue33_git_stdout(checkout: &Path, args: &[&str]) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("-C")
         .arg(checkout)
         .args(args)

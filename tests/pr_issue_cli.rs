@@ -1953,7 +1953,7 @@ fn create_unreferenced_readme_commit(
 
 fn init_bare_origin(root: &Path) -> Result<PathBuf> {
     let origin_path = root.join("origin.git");
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .args(["init", "--bare"])
         .arg(&origin_path)
         .output()
@@ -2087,7 +2087,10 @@ fn path_with_prefix(prefix: &Path) -> Result<std::ffi::OsString> {
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).output().context("run git")?;
+    let output = support::fixture_git::fixture_git()
+        .args(args)
+        .output()
+        .context("run git")?;
     if !output.status.success() {
         anyhow::bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
     }
@@ -2095,7 +2098,7 @@ fn run_git(args: &[&str]) -> Result<()> {
 }
 
 fn git_rev_parse(bare_repo: &Path, ref_name: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("--git-dir")
         .arg(bare_repo)
         .args(["rev-parse", ref_name])
@@ -2111,7 +2114,7 @@ fn git_rev_parse(bare_repo: &Path, ref_name: &str) -> Result<String> {
 }
 
 fn git_ref_exists(bare_repo: &Path, ref_name: &str) -> Result<bool> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("--git-dir")
         .arg(bare_repo)
         .args(["show-ref", "--verify", "--quiet", ref_name])
@@ -2150,7 +2153,7 @@ fn path_str(path: &Path) -> Result<&str> {
 }
 
 fn git_status_porcelain(worktree_path: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("-C")
         .arg(worktree_path)
         .args(["status", "--porcelain"])
@@ -2166,7 +2169,7 @@ fn git_status_porcelain(worktree_path: &Path) -> Result<String> {
 }
 
 fn git_show_file(worktree_path: &Path, revision: &str) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("-C")
         .arg(worktree_path)
         .args(["show", revision])

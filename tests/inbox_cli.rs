@@ -3134,7 +3134,10 @@ fn add_https_origin(repo: &Path, repository_name: &str) -> Result<()> {
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).output().context("run git")?;
+    let output = support::fixture_git::fixture_git()
+        .args(args)
+        .output()
+        .context("run git")?;
     if !output.status.success() {
         anyhow::bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
     }

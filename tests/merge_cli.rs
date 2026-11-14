@@ -3190,7 +3190,7 @@ fn read_optional_bytes(path: &Path) -> Result<Option<Vec<u8>>> {
 }
 
 fn git_output_bytes(repo: &Path, args: &[&str]) -> Result<Vec<u8>> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .env("GIT_OPTIONAL_LOCKS", "0")
         .arg("-C")
         .arg(repo)
@@ -3287,7 +3287,7 @@ fn commit_all(repo: &Repository, message: &str) -> Result<Oid> {
 }
 
 fn git_count_objects(repo: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("-C")
         .arg(repo)
         .args(["count-objects", "-v"])
@@ -3303,7 +3303,7 @@ fn git_count_objects(repo: &Path) -> Result<String> {
 }
 
 fn git_status_porcelain(repo: &Path) -> Result<String> {
-    let output = Command::new("git")
+    let output = support::fixture_git::fixture_git()
         .arg("-C")
         .arg(repo)
         .args(["status", "--porcelain"])
@@ -3319,7 +3319,10 @@ fn git_status_porcelain(repo: &Path) -> Result<String> {
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).output().context("run git")?;
+    let output = support::fixture_git::fixture_git()
+        .args(args)
+        .output()
+        .context("run git")?;
     if !output.status.success() {
         anyhow::bail!("git failed: {}", String::from_utf8_lossy(&output.stderr));
     }
