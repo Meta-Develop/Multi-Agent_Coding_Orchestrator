@@ -1192,6 +1192,88 @@ fn worker_report_identity_rejects_declared_assignment_scope_mismatches() {
 }
 
 #[test]
+fn worker_report_identity_restores_declared_order_for_reordered_fields() {
+    let mut assignment = injected_assignment(true);
+    assignment.worker_assignments[0].semantic_symbols =
+        vec!["crate::alpha".to_string(), "crate::beta".to_string()];
+    assignment.worker_assignments[0].semantic_modules =
+        vec!["crate::one".to_string(), "crate::two".to_string()];
+    assignment
+        .assigned_paths
+        .push(PathBuf::from("src/extra.rs"));
+    assignment.worker_assignments[0]
+        .assigned_paths
+        .push(PathBuf::from("src/extra.rs"));
+    let worker = assignment.worker_assignments[0].clone();
+
+    let mut report = injected_child_report(&assignment);
+    report.worker_reports[0].assigned_paths.reverse();
+    report.worker_reports[0].semantic_symbols.reverse();
+    report.worker_reports[0].semantic_modules.reverse();
+    assert_ne!(
+        report.worker_reports[0].assigned_paths,
+        worker.assigned_paths
+    );
+    assert_ne!(
+        report.worker_reports[0].semantic_symbols,
+        worker.semantic_symbols
+    );
+    assert_ne!(
+        report.worker_reports[0].semantic_modules,
+        worker.semantic_modules
+    );
+
+    validate_worker_report_evidence(
+        &assignment,
+        &AssignmentMetadata::new(),
+        Path::new("worker-assignment-identity.json"),
+        &mut report,
+    );
+
+    assert!(
+        !finding_messages(&report).contains("do not exactly match the declared"),
+        "unexpected identity finding: {}",
+        finding_messages(&report)
+    );
+    assert_eq!(
+        report.worker_reports[0].assigned_paths,
+        worker.assigned_paths
+    );
+    assert_eq!(
+        report.worker_reports[0].semantic_symbols,
+        worker.semantic_symbols
+    );
+    assert_eq!(
+        report.worker_reports[0].semantic_modules,
+        worker.semantic_modules
+    );
+}
+
+#[test]
+fn restore_declared_order_rejects_different_sets() {
+    let declared = vec!["a".to_string(), "b".to_string()];
+
+    let mut reported = declared.clone();
+    assert!(restore_declared_order(&mut reported, &declared));
+    assert_eq!(reported, declared);
+
+    let mut reported = vec!["b".to_string(), "a".to_string()];
+    assert!(restore_declared_order(&mut reported, &declared));
+    assert_eq!(reported, declared);
+
+    for mut reported in [
+        vec!["a".to_string(), "b".to_string(), "c".to_string()],
+        vec!["a".to_string()],
+        vec!["a".to_string(), "c".to_string()],
+        vec!["a".to_string(), "a".to_string()],
+    ] {
+        let unchanged = reported.clone();
+        assert!(!restore_declared_order(&mut reported, &declared));
+        assert_eq!(reported, unchanged);
+    }
+}
+
+#[test]
 fn typed_decomposition_prompt_report_and_final_evidence_remain_gated() {
     let mut assignment = injected_assignment(true);
     assignment
