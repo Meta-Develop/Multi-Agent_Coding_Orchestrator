@@ -7,7 +7,7 @@ export function parseHash(hash) {
   const raw = String(hash || "");
   const trimmed = raw.startsWith("#") ? raw.slice(1) : raw;
   const [pathPart, queryPart] = trimmed.split("?");
-  const path = pathPart.replace(/^\/+/, "");
+  const path = pathPart.replace(/^\/+/, "").replace(/\/$/, "");
   const page = PAGES.includes(path) ? path : "live";
   const params = new URLSearchParams(queryPart || "");
   return { page, params };
