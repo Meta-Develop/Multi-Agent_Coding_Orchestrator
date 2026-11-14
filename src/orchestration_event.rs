@@ -632,16 +632,47 @@ fn validate_external_event_journal(
 
 fn is_canonical_event_timestamp(timestamp: &str) -> bool {
     let bytes = timestamp.as_bytes();
-    bytes.len() == 20
-        && bytes.get(4) == Some(&b'-')
-        && bytes.get(7) == Some(&b'-')
-        && bytes.get(10) == Some(&b'T')
-        && bytes.get(13) == Some(&b':')
-        && bytes.get(16) == Some(&b':')
-        && bytes.get(19) == Some(&b'Z')
-        && bytes.iter().enumerate().all(|(index, byte)| {
+    if bytes.len() != 20
+        || bytes.get(4) != Some(&b'-')
+        || bytes.get(7) != Some(&b'-')
+        || bytes.get(10) != Some(&b'T')
+        || bytes.get(13) != Some(&b':')
+        || bytes.get(16) != Some(&b':')
+        || bytes.get(19) != Some(&b'Z')
+        || !bytes.iter().enumerate().all(|(index, byte)| {
             matches!(index, 4 | 7 | 10 | 13 | 16 | 19) || byte.is_ascii_digit()
         })
+    {
+        return false;
+    }
+    let digits = |start: usize, end: usize| -> u32 {
+        bytes[start..end]
+            .iter()
+            .fold(0, |acc, byte| acc * 10 + u32::from(byte - b'0'))
+    };
+    let year = digits(0, 4);
+    let month = digits(5, 7);
+    let day = digits(8, 10);
+    let hour = digits(11, 13);
+    let minute = digits(14, 16);
+    let second = digits(17, 19);
+    if !(1..=9_999).contains(&year) || !(1..=12).contains(&month) {
+        return false;
+    }
+    let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
+    let days_in_month = match month {
+        1 | 3 | 5 | 7 | 8 | 10 | 12 => 31,
+        4 | 6 | 9 | 11 => 30,
+        2 => {
+            if leap {
+                29
+            } else {
+                28
+            }
+        }
+        _ => return false,
+    };
+    (1..=days_in_month).contains(&day) && hour <= 23 && minute <= 59 && second <= 59
 }
 
 pub fn encode_event_line(event: &OrchestrationEvent) -> Result<Vec<u8>, serde_json::Error> {
@@ -731,6 +762,76 @@ mod tests {
                 .expect("format leap day"),
             "2000-02-29T00:00:00Z"
         );
+    }
+
+    #[test]
+    fn event_timestamp_requires_a_real_civil_time() {
+        for stamp in [
+            "2023-02-30T00:00:00Z",
+            "2023-13-01T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "2023-01-01T24:00:00Z",
+            "2023-01-01T00:00:60Z",
+            "9999-99-99T99:99:99Z",
+            "2023-02-29T00:00:00Z",
+            "1900-02-29T00:00:00Z",
+            "2023-00-10T00:00:00Z",
+            "2023-01-00T00:00:00Z",
+            "2023-01-01T00:60:00Z",
+        ] {
+            assert!(
+                !is_canonical_event_timestamp(stamp),
+                "{stamp} must be invalid"
+            );
+        }
+        for stamp in [
+            "1970-01-01T00:00:00Z",
+            "2000-02-29T00:00:00Z",
+            "2023-02-28T23:59:59Z",
+            "2024-02-29T12:30:45Z",
+            "9999-12-31T23:59:59Z",
+        ] {
+            assert!(is_canonical_event_timestamp(stamp), "{stamp} must be valid");
+        }
+    }
+
+    #[test]
+    fn external_journal_rejects_impossible_calendar_timestamps() {
+        let journal = OrchestrationEventJournal::new("repo-id", "run-1");
+        let event = journal
+            .create_event_at(
+                UNIX_EPOCH,
+                "worker-1",
+                Some("orchestrator-1"),
+                OrchestrationRole::Worker,
+                OrchestrationEventKind::Spawn,
+                json!({"attempt": 1, "thread_id": "thread-1"}),
+            )
+            .expect("create event");
+        let line = encode_event_line(&event).expect("encode event line");
+        assert_eq!(
+            validate_external_event_journal(&line, "repo-id", "run-1").expect("valid journal"),
+            1
+        );
+        for stamp in [
+            "2023-02-30T00:00:00Z",
+            "2023-13-01T00:00:00Z",
+            "0000-01-01T00:00:00Z",
+            "2023-01-01T24:00:00Z",
+            "2023-01-01T00:00:60Z",
+            "9999-99-99T99:99:99Z",
+        ] {
+            let text = std::str::from_utf8(&line).expect("utf-8 journal line");
+            let bad_line = text.replace("1970-01-01T00:00:00Z", stamp).into_bytes();
+            let error = validate_external_event_journal(&bad_line, "repo-id", "run-1")
+                .expect_err("impossible timestamp must be rejected");
+            assert!(
+                error.to_string().contains(
+                    "external orchestration event journal record has an invalid timestamp"
+                ),
+                "unexpected error for {stamp}: {error}"
+            );
+        }
     }
 
     #[test]
