@@ -2712,7 +2712,7 @@ fn parse_claim_file(file: PathBuf, content: &str) -> ParsedClaim {
         if let Some(timestamp) = timestamp {
             if timestamp.len() > MAX_TIMESTAMP_BYTES
                 || timestamp.chars().any(char::is_control)
-                || parse_timestamp_seconds(&timestamp).is_err()
+                || parse_canonical_timestamp_seconds(&timestamp).is_err()
             {
                 push_parse_issue(
                     &mut claim,
@@ -2890,7 +2890,7 @@ fn summary_from_parsed(claim: &ParsedClaim, now: &LiveClock) -> LiveClaimSummary
         .stale_after_minutes
         .unwrap_or(DEFAULT_STALE_AFTER_MINUTES);
     let liveness = if let Some((field, timestamp)) = claim.reference_timestamp() {
-        match parse_timestamp_seconds(timestamp) {
+        match parse_canonical_timestamp_seconds(timestamp) {
             Ok(reference_seconds) => {
                 if reference_seconds
                     > now
@@ -3173,6 +3173,20 @@ fn parse_timestamp_seconds(value: &str) -> Result<i64> {
         .and_then(|value| value.checked_add(day_seconds))
         .and_then(|value| value.checked_sub(i64::from(offset_seconds)))
         .context("timestamp overflow")
+}
+
+fn parse_canonical_timestamp_seconds(value: &str) -> Result<i64> {
+    let cleaned = clean_scalar(value);
+    let seconds = parse_timestamp_seconds(&cleaned)?;
+    let canonical = format_epoch_seconds(seconds);
+    let canonical_date = canonical.len() >= 10;
+    if cleaned.starts_with("0000")
+        || (cleaned != canonical
+            && !(canonical_date && cleaned.len() == 10 && cleaned == canonical[..10]))
+    {
+        bail!("timestamp must be canonical UTC YYYY-MM-DD or YYYY-MM-DDTHH:MM:SSZ with a year of 0001 or later");
+    }
+    Ok(seconds)
 }
 
 fn parse_date(value: &str) -> Result<(i32, u32, u32)> {

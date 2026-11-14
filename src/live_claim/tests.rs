@@ -1891,3 +1891,72 @@ fn apply_rejects_writable_or_nonempty_claim_board_lock() -> Result<()> {
     assert!(!directory.join("lock-reject.md").exists());
     Ok(())
 }
+
+#[test]
+fn reader_requires_canonical_claim_timestamps() -> Result<()> {
+    let rejected = [
+        ("unpadded-date", "2026-1-1"),
+        ("unpadded-time", "2026-1-1T00:00:00Z"),
+        ("year-zero", "0000-02-29T00:00:00Z"),
+        ("leap-second", "2026-01-01T00:00:60Z"),
+    ];
+    for (id, timestamp) in rejected {
+        assert!(parse_canonical_timestamp_seconds(timestamp).is_err());
+        let parsed = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join(format!("{id}.md")),
+            &claim_text(id, id, "active", timestamp, "src/live_claim.rs"),
+        );
+        assert!(parsed.issues.iter().any(|issue| {
+            issue.field == "created"
+                && issue.message == "claim timestamp is malformed or out of bounds"
+        }));
+    }
+    for (id, timestamp) in &rejected[1..] {
+        let temp = tempfile::tempdir()?;
+        write_claim(temp.path(), id, id, "active", timestamp)?;
+        assert!(status(temp.path(), &LiveClock::parse("2026-01-02T00:00:00Z")?).is_err());
+        let now = LiveClock::parse("2026-01-02T00:00:00Z")?;
+        let parsed = parse_claim_file(
+            PathBuf::from(CLAIMS_DIR).join(format!("{id}.md")),
+            &claim_text(id, id, "active", timestamp, "src/live_claim.rs"),
+        );
+        let summary = summary_from_parsed(&parsed, &now);
+        assert_eq!(summary.liveness.state, "unknown");
+        assert_eq!(summary.liveness.age_minutes, None);
+    }
+    for timestamp in [
+        "2026-01-01",
+        "2026-01-01T00:00:00Z",
+        "`2026-01-01T00:00:00Z`",
+    ] {
+        let canonical = parse_canonical_timestamp_seconds(timestamp)?;
+        let seconds = parse_timestamp_seconds(timestamp)?;
+        assert_eq!(canonical, seconds);
+    }
+    let parsed = parse_claim_file(
+        PathBuf::from(CLAIMS_DIR).join("canonical.md"),
+        &claim_text(
+            "canonical",
+            "canonical",
+            "active",
+            "2026-01-01T00:00:00Z",
+            "src/live_claim.rs",
+        ),
+    );
+    assert!(!parsed
+        .issues
+        .iter()
+        .any(|issue| matches!(issue.field.as_str(), "created" | "updated" | "heartbeat")));
+    let temp = tempfile::tempdir()?;
+    write_claim(
+        temp.path(),
+        "canonical",
+        "canonical",
+        "active",
+        "2026-01-01T00:00:00Z",
+    )?;
+    let report = status(temp.path(), &LiveClock::parse("2026-01-01T00:30:00Z")?)?;
+    assert_eq!(report.claims[0].liveness.state, "fresh");
+    assert_eq!(report.claims[0].liveness.age_minutes, Some(30));
+    Ok(())
+}
