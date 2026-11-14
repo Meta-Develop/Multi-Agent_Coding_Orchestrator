@@ -1937,10 +1937,12 @@ Issue #28 production broker path.
 ### Operator objective profiles
 
 Supervisor routing accepts a named, versioned objective profile. The built-in
-`maco-default-objective-v1` profile preserves the existing quality weighting
-exactly: held-out validation 50%, breadth 25%, and anti-shortcut quality 25%.
-Its tradeoff weights preserve the current cost-first selector behavior. The
-profile contains no switch-cost term.
+`maco-default-objective-v2` profile (version 2) preserves the existing quality
+weighting exactly: held-out validation 50%, breadth 25%, and anti-shortcut
+quality 25%. Its tradeoff weights preserve the current cost-first selector
+behavior. It also sets the default same-run context-switch costs: 10,000
+microunits for a model change on the same runtime and 25,000 microunits for a
+runtime change, as described under Same-run context-switch cost below.
 
 Repository-specific profiles may be declared only in the fixed repository-root
 file `maco-objective-profiles.json`. MACO opens that file through its bounded,
@@ -2017,7 +2019,7 @@ recomputed from the stored preference-free Pareto evidence.
 ```bash
 cargo run -- evaluation rescore tests/fixtures/model_mix_evaluation/manifest-v1.json \
   --results tests/fixtures/model_mix_evaluation/runs-v1.json \
-  --family evaluation --objective-profile maco-default-objective-v1 --json
+  --family evaluation --objective-profile maco-default-objective-v2 --json
 ```
 
 ### Provisional named effort default

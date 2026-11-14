@@ -1043,4 +1043,18 @@ mod tests {
             assert!(ObjectiveProfile::from_json(json.as_bytes()).is_err());
         }
     }
+
+    #[test]
+    fn readme_names_the_built_in_objective_profile() {
+        let readme = include_str!("../README.md");
+        let id = DEFAULT_OBJECTIVE_PROFILE_ID;
+        let example = format!("--family evaluation --objective-profile {id} --json");
+        assert!(
+            readme.contains(&example),
+            "README rescore example must pass {example}"
+        );
+        let version = DEFAULT_OBJECTIVE_PROFILE_VERSION;
+        let section = format!("`{id}` profile (version {version})");
+        assert!(readme.contains(&section), "README must name {section}");
+    }
 }
