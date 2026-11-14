@@ -51,9 +51,45 @@ test("summary preview keeps the recorded default ranking when weights are unchan
   const preview = rescoreLoaded(loaded, DEFAULT_OBJECTIVE, document);
   const byId = Object.fromEntries(preview.rows.map((row) => [row.profile_id, row]));
   assert.equal(loaded.source, "summary");
-  assert.ok(Math.abs(byId["balanced-all-v1"].preview_overall - 25659 / 3) < 1);
+  assert.equal(byId["balanced-all-v1"].preview_overall, 8553);
+  assert.equal(byId["frontier-all-v1"].preview_overall, 8530);
+  assert.equal(byId["economy-all-v1"].preview_overall, 7003);
   assert.equal(preview.selection.profile_id, "balanced-all-v1");
   assert.equal(preview.labeled_preview, true);
+});
+
+test("summary rescore rounds component means before the weighted mix", () => {
+  const heldOut = cloneObjective(DEFAULT_OBJECTIVE);
+  heldOut.quality = { held_out: 100, breadth: 0, anti_shortcut: 0 };
+  const component = (total) => ({ total, count: 2 });
+  for (const [heldTotal, expected] of [[1, 1], [3, 2]]) {
+    const document = {
+      profile_summaries: [{
+        profile_id: "rounded",
+        repetitions: 2,
+        mean_cost_usd: 1,
+        mean_quality: {
+          held_out_basis_points: component(heldTotal),
+          breadth_basis_points: component(0),
+          anti_shortcut_basis_points: component(0),
+          overall_basis_points: component(heldTotal),
+        },
+      }],
+    };
+    const loaded = loadEvaluationDocument(document);
+    assert.equal(loaded.source, "summary");
+    const preview = rescoreLoaded(loaded, heldOut, document);
+    assert.equal(preview.rows[0].preview_overall, expected);
+  }
+});
+
+test("default preview id matches the Rust built-in objective profile", () => {
+  const rust = readFileSync(new URL("../../src/objective_profile.rs", import.meta.url), "utf8");
+  const match = rust.match(/pub const DEFAULT_OBJECTIVE_PROFILE_ID: &str = "([^"]+)";/);
+  assert.ok(match);
+  assert.equal(DEFAULT_OBJECTIVE.id, match[1]);
+  const view = readFileSync(new URL("../src/views/objective.html", import.meta.url), "utf8");
+  assert.ok(view.includes(`<input id="objectiveId" type="text" value="${DEFAULT_OBJECTIVE.id}"`));
 });
 
 test("raising the cost axis prefers the cheaper recorded profile", () => {
