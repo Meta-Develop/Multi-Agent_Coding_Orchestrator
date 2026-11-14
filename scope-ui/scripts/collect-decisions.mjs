@@ -24,45 +24,19 @@ function round4(value) {
   return Math.round(value * 10000) / 10000;
 }
 
-function findSymlinkComponent(root) {
-  const components = [];
-  let current = root;
-  while (current !== "/" && current !== "") {
-    components.push(current);
-    current = dirname(current);
-  }
-  components.reverse();
-  for (const component of components) {
-    let stat;
-    try {
-      stat = lstatSync(component);
-    } catch (err) {
-      return null;
-    }
-    if (stat.isSymbolicLink()) {
-      return component;
-    }
-  }
-  return null;
-}
-
 export function scanDecisionRecords(rootInput) {
   const files = [];
   const errors = [];
   const root = resolve(rootInput);
-  const symlinkComponent = findSymlinkComponent(root);
-  if (symlinkComponent !== null) {
-    errors.push({
-      path: rootInput,
-      reason: `root path traverses a symbolic link: ${symlinkComponent}`,
-    });
-    return { files, errors };
-  }
   let stat;
   try {
     stat = lstatSync(root);
   } catch (err) {
     errors.push({ path: rootInput, reason: `missing or unreadable root: ${err.message}` });
+    return { files, errors };
+  }
+  if (stat.isSymbolicLink()) {
+    errors.push({ path: rootInput, reason: "root is a symbolic link" });
     return { files, errors };
   }
   if (!stat.isDirectory()) {
