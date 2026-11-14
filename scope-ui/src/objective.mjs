@@ -2,7 +2,7 @@
 // it re-scores recorded evaluation documents under operator-proposed weights.
 
 export const DEFAULT_OBJECTIVE = {
-  id: "maco-default-v1",
+  id: "maco-default-objective-v2",
   version: 1,
   label: "MACO default (50/25/25 quality)",
   quality: {
@@ -292,19 +292,26 @@ export function rescoreFromRuns(document, profile) {
   }));
 }
 
+// Evaluation rounds each component mean as (total + count / 2) / count in
+// integer arithmetic before the weighted integer mix (src/evaluation.rs).
+function roundedMean(total, count) {
+  if (!count) return 0;
+  return Math.floor((total + Math.floor(count / 2)) / count);
+}
+
 export function rescoreRow(row, profile) {
   const count = row.count;
   const divisor = count || 1;
-  const preview_overall_total = rescoreQualityComponents(
+  const preview_overall = rescoreQualityComponents(
     {
-      held_out_basis_points: row.held_out_total,
-      breadth_basis_points: row.breadth_total,
-      anti_shortcut_basis_points: row.anti_shortcut_total,
+      held_out_basis_points: roundedMean(row.held_out_total, count),
+      breadth_basis_points: roundedMean(row.breadth_total, count),
+      anti_shortcut_basis_points: roundedMean(row.anti_shortcut_total, count),
     },
     profile.quality,
   );
+  const preview_overall_total = preview_overall * count;
   const recorded_overall = row.recorded_overall_total / divisor;
-  const preview_overall = preview_overall_total / divisor;
   const mean_wall = row.wall_count ? row.wall_total / row.wall_count : 0;
   const mean_churn = row.churn_count ? row.churn_total / row.churn_count : 0;
   return {
