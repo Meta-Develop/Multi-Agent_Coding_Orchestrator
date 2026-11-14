@@ -5156,6 +5156,10 @@ impl ExternalAgentRun {
         &self.stdout.run_metadata.gate_denials
     }
 
+    pub(crate) fn worker_path_append(&self) -> &[String] {
+        &self.stdout.run_metadata.worker_path_append
+    }
+
     pub(crate) fn worker_journal_artifacts(&self) -> &[WorkerJournalArtifactCapture] {
         &self.stdout.run_metadata.worker_journal_artifacts
     }
