@@ -3447,3 +3447,15 @@ fn worker_prompt_carries_cargo_build_script_race_rule() {
     let following_position = prefix.find(following_rule).expect("find following rule");
     assert!(following_position > race_position);
 }
+
+#[test]
+fn worker_prompt_offers_journal_record_references() {
+    let prefix = worker_cacheable_prefix().expect("render worker cacheable prefix");
+    let reference_rule = "- For a long, multi-line or quoted command you may report a reference instead of retyping it: set that commands_run entry's command to [] and its journal_record to {\"line\": N, \"start_timestamp\": \"T\"}, where N is the 1-based line of the command's completed or failed record in the journal (cat -n shows line numbers) and T is that record's start_timestamp; keep cwd exact. MACO fills command from that record. A reference to any other record, a different timestamp or a non-empty command fails the report.";
+    assert_eq!(prefix.matches(reference_rule).count(), 1);
+    let cwd_rule =
+        "- WorkerReport.commands_run cwd is the exact absolute worktree from the journal";
+    let cwd_position = prefix.find(cwd_rule).expect("find commands_run cwd rule");
+    let cwd_line_end = cwd_position + prefix[cwd_position..].find('\n').expect("cwd rule line");
+    assert!(prefix[cwd_line_end + 1..].starts_with(reference_rule));
+}

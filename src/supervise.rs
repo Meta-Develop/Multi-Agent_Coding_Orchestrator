@@ -3517,6 +3517,15 @@ pub struct SupervisorBreakerTrip {
     pub recovery_guidance: String,
 }
 
+/// Names a completed or failed record of the reporting Worker's bound execution
+/// journal by 1-based line and start_timestamp; MACO fills command from that record.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct JournalRecordReference {
+    pub line: u64,
+    pub start_timestamp: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct CommandRunRecord {
     pub command: Vec<String>,
@@ -3553,6 +3562,11 @@ pub struct CommandRunRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fixed_version_probe_evidence:
         Option<crate::external_agent::EnvironmentFixedVersionProbeEvidence>,
+    /// Names a completed or failed record of the reporting Worker's bound
+    /// execution journal by 1-based line and start_timestamp; MACO fills
+    /// command from that record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub journal_record: Option<JournalRecordReference>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
@@ -4024,6 +4038,7 @@ fn write_test_finalized_megafile_decomposition_evidence_with_binding(
         codex_parent_evidence: None,
         runtime_identity: None,
         fixed_version_probe_evidence: None,
+        journal_record: None,
     };
     let worker = WorkerReport {
         id: worker_id.to_string(),

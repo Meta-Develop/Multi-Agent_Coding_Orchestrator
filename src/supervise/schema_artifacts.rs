@@ -4335,7 +4335,21 @@ pub(super) fn command_run_record_schema_value() -> serde_json::Value {
             "grok_acp_parent_evidence": grok_acp_parent_evidence_schema_value(),
             "codex_parent_evidence": codex_parent_evidence_schema_value(),
             "runtime_identity": {"oneOf": [{"type": "null"}, runtime_identity_schema_value()]},
-            "fixed_version_probe_evidence": fixed_version_probe_evidence_schema_value()
+            "fixed_version_probe_evidence": fixed_version_probe_evidence_schema_value(),
+            "journal_record": {
+                "oneOf": [
+                    {"type": "null"},
+                    {
+                        "type": "object",
+                        "additionalProperties": false,
+                        "required": ["line", "start_timestamp"],
+                        "properties": {
+                            "line": {"type": "integer", "minimum": 1},
+                            "start_timestamp": {"type": "string", "minLength": 1}
+                        }
+                    }
+                ]
+            }
         },
         "allOf": [command_environment_failure_outcome_schema_value()]
     })
@@ -5559,6 +5573,10 @@ mod selection_schema_tests {
             codex_parent_evidence: None,
             runtime_identity: None,
             fixed_version_probe_evidence: None,
+            journal_record: Some(JournalRecordReference {
+                line: 2,
+                start_timestamp: "2026-01-01T00:00:00Z".to_string(),
+            }),
         };
         let validation_result = ValidationResult {
             name: "cargo check".to_string(),
@@ -5851,6 +5869,17 @@ mod selection_schema_tests {
             }
         }
         Ok(())
+    }
+
+    #[test]
+    fn command_run_record_schema_offers_optional_journal_record() {
+        let command_schema = command_run_record_schema_value();
+        assert!(command_schema["properties"].get("journal_record").is_some());
+        assert!(!command_schema["required"]
+            .as_array()
+            .expect("required fields")
+            .iter()
+            .any(|field| field == "journal_record"));
     }
 
     #[test]
@@ -6380,6 +6409,7 @@ mod selection_schema_tests {
                 candidate["claim_token"] = json!(null);
                 candidate["semantic_intent_token"] = json!(null);
                 candidate["commands_run"][0]["error"] = json!(null);
+                candidate["commands_run"][0]["journal_record"] = json!(null);
             }
             assert_eq!(
                 schemas.validate(&candidate, index).is_ok(),
