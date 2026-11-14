@@ -17,13 +17,16 @@ state from inside the unit namespace, and releases the target only after the hos
 report and the effective systemd properties. Workspace and artifact trees are bounded-scanned
 before setup and immediately before release. Sockets, FIFOs, device nodes, cross-filesystem
 subtrees, and hard-link aliases outside writable roots are rejected. Creation of sockets,
-hard-links, FIFOs/device nodes, mounts, namespaces, and privileged kernel interfaces is denied as
+FIFOs/device nodes, mounts, namespaces, and privileged kernel interfaces is denied as
 appropriate to the profile.
-Because hard-link creation is denied, Cargo copies build scripts into its target directory instead of
-hard-linking them. A child process forked while such a copy is still open can make Cargo's next exec
-of that build script fail with `Text file busy (os error 26)` (more likely under the unit's CPU
-quota; #939). Workers rerun that one invocation once through the journal wrapper and report both
-runs; a repeated failure is reported as a `sandbox_unavailable` environment failure.
+Hard-link creation (`link`/`linkat`) is allowed, so Cargo hard-links build scripts into its target
+directory instead of copying them. With copies, a child process forked while a copy was still open
+could make Cargo's next exec of that build script fail with `Text file busy (os error 26)` (#939).
+The kernel refuses a hard link across mount points, so a contained process can link only files
+within one writable mount, and the bounded scans above still reject hard-link aliases outside the
+writable roots. If a cargo command still fails with that error, Workers rerun that one invocation
+once through the journal wrapper and report both runs; a repeated failure is reported as a
+`sandbox_unavailable` environment failure.
 
 The verified profiles clear ambient environment variables, use fixed executable search paths,
 request private IPC/devices/temporary storage, mask user-systemd, D-Bus, credential, container,
