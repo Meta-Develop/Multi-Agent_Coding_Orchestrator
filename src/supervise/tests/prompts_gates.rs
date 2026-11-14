@@ -1,6 +1,7 @@
 use super::*;
 
 const EXPECTED_PARENT_DELEGATED_VALIDATION_RULE: &str = "- Validation the assignment objective explicitly delegates to the parent or hosted CI because it cannot run in the Worker sandbox is not missing Worker evidence: do not reject its absence; record it once in remaining_risk as a parent follow-up. Undelegated validation the Worker skipped, excluded or failed is still missing evidence.";
+const EXPECTED_ATTEMPT_SCOPED_EVIDENCE_RULE: &str = "- Worker command evidence is attempt-scoped: each WorkerReport covers the execution journal of its own attempt. Do not reject a correction attempt only because its commands_run omits commands recorded by an earlier attempt of the same assignment; MACO retains those journals. When the worktree of a correction attempt already holds the earlier candidate, empty git status or git diff --numstat output is expected: judge scope from the supplied diff and changed paths.";
 
 #[test]
 fn auditor_prefixes_include_parent_delegated_validation_exactly_once() {
@@ -24,6 +25,26 @@ fn auditor_prefixes_include_parent_delegated_validation_exactly_once() {
             Some(EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
         );
     }
+}
+
+#[test]
+fn parent_auditor_prefix_includes_attempt_scoped_evidence_exactly_once() {
+    let parent = parent_review_auditor_cacheable_prefix();
+    assert_eq!(
+        parent
+            .matches(EXPECTED_ATTEMPT_SCOPED_EVIDENCE_RULE)
+            .count(),
+        1
+    );
+    let delegated = parent
+        .lines()
+        .position(|line| line == EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
+        .expect("parent delegated validation rule");
+    assert_eq!(
+        parent.lines().nth(delegated + 1),
+        Some(EXPECTED_ATTEMPT_SCOPED_EVIDENCE_RULE)
+    );
+    assert!(!review_auditor_cacheable_prefix().contains(EXPECTED_ATTEMPT_SCOPED_EVIDENCE_RULE));
 }
 
 #[test]
@@ -66,6 +87,13 @@ fn review_lens_prompt_includes_parent_delegated_validation() -> Result<()> {
         rendered
             .prompt
             .matches(EXPECTED_PARENT_DELEGATED_VALIDATION_RULE)
+            .count(),
+        1
+    );
+    assert_eq!(
+        rendered
+            .prompt
+            .matches(EXPECTED_ATTEMPT_SCOPED_EVIDENCE_RULE)
             .count(),
         1
     );
@@ -295,6 +323,30 @@ fn evidence_correction_prompt_appends_block_only_for_evidence_quality() {
         defect_prompt,
         format!("assigned task\n\n{corrective}\n{findings_block}")
     );
+}
+
+#[test]
+fn evidence_correction_block_scopes_commands_to_the_current_attempt() {
+    let paths = &[PathBuf::from("README.md")];
+    let findings = [Finding {
+        severity: FindingSeverity::Error,
+        message: "evidence mismatch".to_string(),
+        paths: Vec::new(),
+    }];
+    let denial = GateDenial::new(
+        "auditor-repair",
+        GateDenialReason::AuditorRepair {
+            rejection: AuditorRejectionKind::EvidenceQuality,
+        },
+        VerifiedGateContext::new("worker-a", GateCheckSource::Auditor, paths).expect("context"),
+    )
+    .expect("denial");
+    let prompt = prompt_with_gate_correction("assigned task", &denial, &findings).expect("prompt");
+    assert!(prompt.contains("match this attempt's execution journal"));
+    assert!(prompt.contains(
+        "Commands of earlier attempts are retained by MACO and do not belong in this report."
+    ));
+    assert!(!prompt.contains("including each earlier failed run"));
 }
 
 #[test]

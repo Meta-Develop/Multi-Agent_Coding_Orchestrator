@@ -90,7 +90,7 @@ fn truncate_at_char_boundary(value: &str, max_bytes: usize) -> &str {
 const EVIDENCE_CORRECTION_BLOCK: &str = "EVIDENCE CORRECTION:\n\
 The reviewers rejected the evidence for this attempt, not the implementation. \
 Keep the implementation unless a finding names a defect in it. The re-audit on the \"Next safe operation\" line above is the parent's fallback if this correction does not resolve the findings. \
-Regenerate the evidence that the findings question: run each such listed validation command again exactly as listed, then return a WorkerReport whose commands_run and validation_results match the execution journal, with one commands_run entry for every run, including each earlier failed run.\n";
+Regenerate the evidence that the findings question: run each such listed validation command again exactly as listed, then return a WorkerReport whose commands_run and validation_results match this attempt's execution journal, with one commands_run entry for every run in this attempt, including each failed run. Commands of earlier attempts are retained by MACO and do not belong in this report. If the earlier candidate is already present in the worktree, empty git status or git diff --numstat output is expected; say so in validation_results.\n";
 
 pub(super) fn prompt_with_gate_correction(
     prompt: &str,
