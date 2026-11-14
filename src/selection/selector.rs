@@ -92,8 +92,8 @@ pub fn validate_prior_dataset(priors: &PriorDataset) -> Result<(), SelectionErro
     if priors.schema_version != PRIOR_DATASET_SCHEMA_VERSION {
         return invalid("operator prior dataset has an unsupported schema version");
     }
-    if duplicate_pair(&priors.models, |prior| {
-        (prior.runtime.as_str(), prior.model.as_str())
+    if duplicate_semantic_key(&priors.models, |prior| {
+        (prior.runtime.clone(), prior.model.clone())
     }) {
         return invalid("prior dataset contains a duplicate runtime/model entry");
     }
