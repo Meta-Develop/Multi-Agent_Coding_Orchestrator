@@ -5231,6 +5231,115 @@ fn system_call_filter_rejects_each_incomplete_group_and_allow_list() {
 }
 
 #[cfg(target_os = "linux")]
+#[test]
+fn hard_link_creation_is_allowed_by_every_profile_filter() {
+    for kind in [
+        SideEffectConfinementProfileKind::StrictOfflineWorkspace,
+        SideEffectConfinementProfileKind::GeminiOfflineBridge,
+        SideEffectConfinementProfileKind::GeminiOnlineBridge,
+        SideEffectConfinementProfileKind::CursorProviderlessOfflineUds,
+        SideEffectConfinementProfileKind::TrustedFixedNetwork,
+        SideEffectConfinementProfileKind::ExternalCodex,
+        SideEffectConfinementProfileKind::ExternalClaude,
+        SideEffectConfinementProfileKind::ExternalGrok,
+        SideEffectConfinementProfileKind::ExternalCursor,
+        SideEffectConfinementProfileKind::TrustedCompatibility,
+    ] {
+        let mut sandbox = program_visibility_sandbox(Path::new("/worktree"));
+        sandbox.kind = kind;
+        let mut command = Command::new("systemd-run");
+        apply_systemd_sandbox_properties(
+            &mut command,
+            &sandbox,
+            Path::new("/run/user/1000/maco-test-runtime"),
+        );
+        let filter = command
+            .get_args()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .find_map(|argument| {
+                argument
+                    .strip_prefix("--property=SystemCallFilter=")
+                    .map(str::to_string)
+            })
+            .unwrap_or_else(|| panic!("{kind:?} syscall filter"));
+        let denied = filter
+            .split_whitespace()
+            .map(|token| token.trim_start_matches('~'))
+            .collect::<Vec<_>>();
+        for syscall in ["link", "linkat"] {
+            assert!(
+                !denied.contains(&syscall),
+                "{kind:?} denies {syscall}: {filter}"
+            );
+        }
+        for syscall in ["mknod", "mknodat"] {
+            assert!(
+                denied.contains(&syscall),
+                "{kind:?} allows {syscall}: {filter}"
+            );
+        }
+        verify_effective_system_call_filter(kind, &filter)
+            .unwrap_or_else(|error| panic!("{kind:?} syscall filter rejected: {error}"));
+    }
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn hard_link_inside_strict_workspace_succeeds_but_cannot_cross_mounts() {
+    use std::os::unix::fs::MetadataExt;
+
+    skip_without_containment!();
+    if !strict_backend_available_for_tests() {
+        return;
+    }
+    let temp = tempfile::tempdir().expect("tempdir");
+    let workspace = temp.path().join("workspace");
+    let read_only = temp.path().join("read-only");
+    fs::create_dir(&workspace).expect("workspace");
+    fs::create_dir(&read_only).expect("read-only root");
+    let original = workspace.join("original");
+    let alias = workspace.join("alias");
+    let outside = read_only.join("outside");
+    let crossed = workspace.join("crossed");
+    fs::write(&original, "linked\n").expect("original");
+    fs::write(&outside, "outside\n").expect("outside");
+    let command = format!(
+        "ln '{}' '{}' && ! ln '{}' '{}'",
+        original.display(),
+        alias.display(),
+        outside.display(),
+        crossed.display()
+    );
+    let profile = StrictOfflineWorkspaceProfile::read_write(&workspace)
+        .with_visible_read_only_root(&read_only);
+    let output = run_process(
+        ProcessSpec::shell(
+            "hard links inside the writable workspace",
+            Shell::UnixSh,
+            command,
+            &workspace,
+            1024,
+        )
+        .with_side_effect_confinement(SideEffectConfinementProfile::StrictOfflineWorkspace(
+            profile,
+        ))
+        .with_timeout(Some(Duration::from_secs(10))),
+    )
+    .expect("run hard-link probe");
+    assert!(
+        output.status.is_some_and(|status| status.success()),
+        "{output:#?}"
+    );
+    assert!(output.safety_evidence_verified(), "{output:#?}");
+    let original_links = fs::metadata(&original).expect("original metadata").nlink();
+    assert_eq!(original_links, 2);
+    assert_eq!(fs::read_to_string(&alias).expect("alias"), "linked\n");
+    assert!(!crossed.exists(), "hard link crossed a mount");
+    let outside_links = fs::metadata(&outside).expect("outside metadata").nlink();
+    assert_eq!(outside_links, 1);
+}
+
+#[cfg(target_os = "linux")]
 fn retained_system_call_filter_fixture() -> String {
     let mut tokens = required_denied_group_representatives()
         .into_iter()
@@ -5938,7 +6047,7 @@ fn strict_target_cannot_launch_sibling_user_unit() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn strict_target_cannot_create_hardlinks_or_fifos_after_start_gate() {
+fn strict_target_can_create_hardlinks_but_not_fifos_after_start_gate() {
     skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
@@ -5959,7 +6068,7 @@ fn strict_target_cannot_create_hardlinks_or_fifos_after_start_gate() {
 
     assert!(output.status.is_some_and(|status| status.success()));
     assert!(output.safety_evidence_verified());
-    assert!(!temp.path().join("alias").exists());
+    assert!(temp.path().join("alias").exists());
     assert!(!temp.path().join("fifo").exists());
 }
 
