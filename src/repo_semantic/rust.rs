@@ -568,9 +568,10 @@ fn absolute_import_path(module_path: &[String], import_path: &str) -> Option<Vec
         "super" => {
             let mut absolute = module_path.to_vec();
             while segments.first().is_some_and(|segment| segment == "super") {
-                if absolute.len() > 1 {
-                    absolute.pop();
+                if absolute.len() <= 1 {
+                    return None;
                 }
+                absolute.pop();
                 segments.remove(0);
             }
             absolute.extend(segments);
@@ -712,5 +713,63 @@ fn visibility_text(visibility: &Visibility) -> String {
             }
         }
         Visibility::Inherited => "private".to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn segments(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn super_imports_that_escape_the_crate_root_do_not_resolve() {
+        let lib = Path::new("src/lib.rs");
+        let a = Path::new("src/a.rs");
+        let b = Path::new("src/a/b.rs");
+
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(lib), "super::foo"),
+            None
+        );
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(a), "super::super::foo"),
+            None
+        );
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(b), "super::c"),
+            Some(segments(&["crate", "a", "c"]))
+        );
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(a), "crate::x::y"),
+            Some(segments(&["crate", "x", "y"]))
+        );
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(a), "self::z"),
+            Some(segments(&["crate", "a", "z"]))
+        );
+        assert_eq!(
+            absolute_import_path(&module_path_for_file(a), "std::fs"),
+            None
+        );
+
+        let mut repository_files = vec![
+            PathBuf::from("src/a.rs"),
+            PathBuf::from("src/a/b.rs"),
+            PathBuf::from("src/a/c.rs"),
+            PathBuf::from("src/foo.rs"),
+            PathBuf::from("src/lib.rs"),
+        ];
+        repository_files.sort();
+        assert_eq!(
+            resolve_import_file(&repository_files, &module_path_for_file(b), "super::c"),
+            Some(PathBuf::from("src/a/c.rs"))
+        );
+        assert_eq!(
+            resolve_import_file(&repository_files, &module_path_for_file(lib), "super::foo"),
+            None
+        );
     }
 }
