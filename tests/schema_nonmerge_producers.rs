@@ -13,6 +13,9 @@ use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator");
 
+#[path = "support/fixture_git.rs"]
+mod fixture_git;
+
 struct Draft202012Schema {
     schemas: Schemas,
     index: SchemaIndex,
@@ -356,7 +359,7 @@ fn beta_feedback_cli_json_matches_the_published_schema() -> Result<()> {
         .context("repository config")?
         .set_str("user.email", "fixture@example.invalid")
         .context("set fixture email")?;
-    let add = Command::new("git")
+    let add = fixture_git::fixture_git()
         .current_dir(&repo)
         .args(["add", "README.md"])
         .status()
@@ -364,7 +367,7 @@ fn beta_feedback_cli_json_matches_the_published_schema() -> Result<()> {
     if !add.success() {
         bail!("git add failed: {add}");
     }
-    let commit = Command::new("git")
+    let commit = fixture_git::fixture_git()
         .current_dir(&repo)
         .args(["commit", "-m", "baseline"])
         .status()

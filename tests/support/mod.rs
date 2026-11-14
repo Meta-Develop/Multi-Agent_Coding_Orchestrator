@@ -1,4 +1,5 @@
 pub(crate) mod containment;
+pub(crate) mod fixture_git;
 
 macro_rules! require_containment {
     ($test_name:literal) => {

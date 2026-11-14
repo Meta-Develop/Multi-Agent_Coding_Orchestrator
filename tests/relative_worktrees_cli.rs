@@ -399,7 +399,10 @@ fn run_binary_success_json(binary: &str, args: &[&str]) -> Result<Value> {
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
-    let output = Command::new("git").args(args).output().context("run git")?;
+    let output = support::fixture_git::fixture_git()
+        .args(args)
+        .output()
+        .context("run git")?;
     if !output.status.success() {
         bail!(
             "git command failed: {}",
@@ -410,7 +413,10 @@ fn run_git(args: &[&str]) -> Result<()> {
 }
 
 fn run_git_stdout(args: &[&str]) -> Result<String> {
-    let output = Command::new("git").args(args).output().context("run git")?;
+    let output = support::fixture_git::fixture_git()
+        .args(args)
+        .output()
+        .context("run git")?;
     if !output.status.success() {
         bail!(
             "git command failed: {}",

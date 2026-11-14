@@ -11,6 +11,9 @@ use std::{
 use tempfile::TempDir;
 
 const BIN: &str = env!("CARGO_BIN_EXE_maco");
+
+#[path = "support/fixture_git.rs"]
+mod fixture_git;
 const WORKTREE_GUARD_ASSET: &[u8] = include_bytes!("../assets/maco-worktree-guard.sh");
 const WORKTREE_GUARD_ASSET_V3_LEGACY: &[u8] = include_bytes!("../assets/maco-worktree-guard-v3.sh");
 const HUMAN_AUTHORSHIP_PRE_PUSH_DISPATCHER_V5: &str = r#"#!/usr/bin/env bash
@@ -1025,13 +1028,13 @@ impl GuardFixture {
         let primary = temp.path().join("primary");
         let origin = temp.path().join("origin.git");
         command_success(
-            Command::new("git")
+            fixture_git::fixture_git()
                 .args(["init", "-q", "--initial-branch=main"])
                 .arg(&primary),
             "initialize primary repository",
         )?;
         command_success(
-            Command::new("git")
+            fixture_git::fixture_git()
                 .args(["init", "-q", "--bare"])
                 .arg(&origin),
             "initialize bare origin",
@@ -1183,14 +1186,10 @@ fn guard_staged_path(target: &Path) -> PathBuf {
 }
 
 fn git(repo: &Path, args: &[&str]) -> Result<Output> {
-    Command::new("git")
+    fixture_git::fixture_git()
         .args(["-C"])
         .arg(repo)
         .args(args)
-        .env_remove("GIT_DIR")
-        .env_remove("GIT_WORK_TREE")
-        .env_remove("GIT_COMMON_DIR")
-        .env_remove("GIT_INDEX_FILE")
         .output()
         .context("run Git command")
 }
@@ -1232,4 +1231,38 @@ fn assert_refusal(output: &Output, action: &str, branch: &str) {
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(stderr.contains(&format!("refusing {action}")), "{stderr}");
     assert!(stderr.contains(branch), "{stderr}");
+}
+
+#[test]
+fn fixture_git_removes_inherited_repository_selection() {
+    let command = fixture_git::fixture_git();
+    for key in fixture_git::INHERITED_GIT_REPOSITORY_VARIABLES {
+        assert!(
+            command
+                .get_envs()
+                .any(|(name, value)| name == std::ffi::OsStr::new(key) && value.is_none()),
+            "{key} must be removed"
+        );
+    }
+}
+
+#[test]
+fn fixture_git_opens_the_fixture_repository() -> Result<()> {
+    let temp = TempDir::new()?;
+    let init = fixture_git::fixture_git()
+        .arg("-C")
+        .arg(temp.path())
+        .args(["init", "-q"])
+        .status()
+        .context("git init")?;
+    assert!(init.success());
+    let output = fixture_git::fixture_git()
+        .arg("-C")
+        .arg(temp.path())
+        .args(["rev-parse", "--git-dir"])
+        .output()
+        .context("git rev-parse")?;
+    assert!(output.status.success());
+    assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), ".git");
+    Ok(())
 }
