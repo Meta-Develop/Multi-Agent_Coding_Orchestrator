@@ -1332,6 +1332,10 @@ fn is_intrinsically_sensitive(path: &Path) -> bool {
                 | "credentials.json"
                 | "id_rsa"
                 | "id_ed25519"
+                | "id_dsa"
+                | "id_ecdsa"
+                | "id_ecdsa_sk"
+                | "id_ed25519_sk"
                 | "private_key"
                 | "secrets"
                 | "secrets.json"
@@ -1629,6 +1633,45 @@ mod tests {
             );
         }
         assert_eq!(classifier.calls, 0);
+    }
+
+    #[test]
+    fn openssh_private_key_names_are_sensitive_reads() {
+        let context = context("run-openssh");
+        let mut classifier = FakeClassifier::new([response("allow", 1)]);
+        let mut reviewer = PreActionReviewer::default();
+        for (index, path) in [
+            "id_ecdsa",
+            "keys/ID_DSA",
+            "home/user/.ssh/Id_Ecdsa_Sk",
+            "nested/dir/id_ED25519_sk",
+            "id_rsa",
+            "deploy/ID_ED25519",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            assert!(is_intrinsically_sensitive(Path::new(path)));
+            let sensitive = command_request(
+                &format!("openssh-{index}"),
+                CommandClass::ReadOnly,
+                BlastRadius::WorkspaceWide,
+                vec![PathAccess::read(path).expect("read")],
+                true,
+                &["show", path],
+            );
+            assert_eq!(
+                denial_kind(
+                    &reviewer
+                        .review(&context, &sensitive, Some(&mut classifier))
+                        .expect("denied review")
+                ),
+                ApprovalReviewDenial::SensitiveRead
+            );
+        }
+        assert_eq!(classifier.calls, 0);
+        assert!(!is_intrinsically_sensitive(Path::new("README.md")));
+        assert!(!is_intrinsically_sensitive(Path::new("keys/id_ecdsa.pub")));
     }
 
     #[test]
