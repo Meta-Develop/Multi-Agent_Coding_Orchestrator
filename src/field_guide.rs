@@ -863,6 +863,9 @@ fn validate_date(date: &str) -> Result<()> {
         bail!("field-guide date must use YYYY-MM-DD");
     }
     let year = parse_decimal(&bytes[0..4]).context("field-guide date has an invalid year")?;
+    if year == 0 {
+        bail!("field-guide date has an invalid year");
+    }
     let month = parse_decimal(&bytes[5..7]).context("field-guide date has an invalid month")?;
     let day = parse_decimal(&bytes[8..10]).context("field-guide date has an invalid day")?;
     let leap = year % 4 == 0 && (year % 100 != 0 || year % 400 == 0);
@@ -1200,5 +1203,22 @@ mod tests {
         let error = FieldGuideStore::open_existing(&repo, limits)
             .expect_err("overbound authenticated state must fail closed");
         assert!(format!("{error:#}").contains("finding exceeds"));
+    }
+
+    #[test]
+    fn field_guide_dates_reject_year_zero_and_keep_the_leap_rule() {
+        for date in ["0000-01-01", "0000-02-29"] {
+            let error = validate_date(date).expect_err("year zero must be rejected");
+            assert!(
+                format!("{error:#}").contains("field-guide date has an invalid year"),
+                "unexpected error for {date}: {error:#}"
+            );
+        }
+        for date in ["1900-02-29", "2023-02-29"] {
+            validate_date(date).expect_err("non-leap February 29 must be rejected");
+        }
+        for date in ["0001-01-01", "2024-02-29"] {
+            validate_date(date).expect("valid date");
+        }
     }
 }
