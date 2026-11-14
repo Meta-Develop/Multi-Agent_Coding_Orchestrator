@@ -59,6 +59,8 @@ struct RetainedCommandSummary<'a> {
         Vec<crate::external_agent::researcher_inputs::ResearcherInputReceipt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     budget_interruption: Option<&'a crate::external_agent::codex_app_server::BudgetInterruption>,
+    #[serde(skip_serializing_if = "<[String]>::is_empty")]
+    worker_path_append: &'a [String],
 }
 
 fn receipt_path(summary: &Path) -> PathBuf {
@@ -134,6 +136,7 @@ pub(super) fn persist(
         command: &record,
         researcher_input_receipts: run.retained_researcher_input_receipts(),
         budget_interruption: run.budget_interruption(),
+        worker_path_append: run.worker_path_append(),
         command_seal_snapshot: command
             .live_budget_command_seal_snapshot()
             .map_err(|error| anyhow!(error))?,
@@ -920,5 +923,39 @@ mod tests {
             &run
         )
         .is_err());
+    }
+
+    #[test]
+    fn retained_summary_records_worker_path_append_only_when_applied() {
+        let fixture = fixture();
+        let run = deterministic_fake_run(&fixture.command, Vec::new());
+        assert!(run.worker_path_append().is_empty());
+        let record = command_record_from_external_for_runtime(
+            &run,
+            &fixture.command,
+            SupervisorRuntime::Codex,
+        );
+        let appended = vec!["/nix/store/example-node/bin".to_string()];
+        let applied = serde_json::to_value(RetainedCommandSummary {
+            command: &record,
+            command_seal_snapshot: None,
+            researcher_input_receipts: Vec::new(),
+            budget_interruption: None,
+            worker_path_append: &appended,
+        })
+        .unwrap();
+        assert_eq!(
+            applied["worker_path_append"],
+            serde_json::json!(["/nix/store/example-node/bin"])
+        );
+        let omitted = serde_json::to_value(RetainedCommandSummary {
+            command: &record,
+            command_seal_snapshot: None,
+            researcher_input_receipts: Vec::new(),
+            budget_interruption: None,
+            worker_path_append: &[],
+        })
+        .unwrap();
+        assert!(omitted.get("worker_path_append").is_none());
     }
 }
