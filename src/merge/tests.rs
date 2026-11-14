@@ -2991,9 +2991,7 @@ fn candidate_validation_sandbox_is_removed_when_patch_apply_fails() {
     );
 
     assert!(result.is_err());
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
+    let output = crate::test_git::fixture_git_command(&repo_path)
         .args(["worktree", "list", "--porcelain"])
         .output()
         .expect("list worktrees");
@@ -4224,9 +4222,8 @@ mod required_network_direct_cancellation_tests {
     #[test]
     fn required_direct_cancellable_honours_pre_spawn_cancellation() {
         let temp = tempfile::tempdir().expect("tempdir");
-        std::process::Command::new("git")
+        crate::test_git::fixture_git_command(temp.path())
             .args(["init"])
-            .current_dir(temp.path())
             .status()
             .expect("git init");
         let profile = StrictOfflineWorkspaceProfile::read_write(temp.path());
@@ -4418,9 +4415,8 @@ mod required_network_direct_cancellation_tests {
             let mut emergency_guard =
                 EmergencyReleaseGuard::new(emergency_file.clone(), liveness_file.clone());
 
-            std::process::Command::new("git")
+            crate::test_git::fixture_git_command(temp.path())
                 .args(["init"])
-                .current_dir(temp.path())
                 .status()
                 .expect("git init");
             let global_config = temp.path().join("global-config");
