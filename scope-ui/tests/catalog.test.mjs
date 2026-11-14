@@ -97,6 +97,16 @@ test("hash router does not collide with graph view query values", () => {
   assert.equal(hrefFor("catalog"), "#/catalog");
 });
 
+test("hash router treats one trailing slash as the same page", () => {
+  assert.equal(parseHash("#/catalog/").page, "catalog");
+  assert.equal(parseHash("#/objective/").page, "objective");
+  assert.equal(parseHash("#/unknown/").page, "live");
+  const withQuery = parseHash("#/catalog/?repo=a");
+  assert.equal(withQuery.page, "catalog");
+  assert.equal(withQuery.params.get("repo"), "a");
+  assert.equal(hrefFor("catalog"), "#/catalog");
+});
+
 // --- Local switch-cost evidence import -------------------------------------
 
 function invocation(overrides) {
