@@ -27,6 +27,7 @@ Tool-call batching:
 - Batch independent, side-effect-free inspections in one tool call when the runtime supports it.
 - Keep dependent steps, approval-sensitive actions, and mutations ordered. Batching never relaxes ownership, journaling, validation, or audit requirements.";
 const PARENT_DELEGATED_VALIDATION_RULE: &str = "- Validation the assignment objective explicitly delegates to the parent or hosted CI because it cannot run in the Worker sandbox is not missing Worker evidence: do not reject its absence; record it once in remaining_risk as a parent follow-up. Undelegated validation the Worker skipped, excluded or failed is still missing evidence.";
+const ATTEMPT_SCOPED_EVIDENCE_RULE: &str = "- Worker command evidence is attempt-scoped: each WorkerReport covers the execution journal of its own attempt. Do not reject a correction attempt only because its commands_run omits commands recorded by an earlier attempt of the same assignment; MACO retains those journals. When the worktree of a correction attempt already holds the earlier candidate, empty git status or git diff --numstat output is expected: judge scope from the supplied diff and changed paths.";
 
 #[cfg(test)]
 fn enforce_rendered_prompt_ceiling(role: &str, rendered: &str, ceiling: usize) -> Result<()> {
@@ -431,13 +432,15 @@ Review requirements:
 - Set role="auditor", no_further_delegation=true, read_only=true.
 - Set rejection_kind=null for acceptance. For every rejection, set rejection_kind="implementation_defect" when the preserved implementation must change, or rejection_kind="evidence_quality" only when the implementation is sound and validation/report evidence alone must be corrected.
 {parent_delegated_validation_rule}
+{attempt_scoped_evidence_rule}
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - If the child report contains licensed_breakage_review, verify that every failed validation is attributable to its exact named dependent, path, and interface scope and that the migration rationale is adequate. Accepting that license requires one succeeded validation_results entry whose name is "licensed_breakage_declaration" and whose message is the exact declaration_sha256. Omitting or changing that marker refuses the license and must reject the report.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
-        parent_delegated_validation_rule = PARENT_DELEGATED_VALIDATION_RULE
+        parent_delegated_validation_rule = PARENT_DELEGATED_VALIDATION_RULE,
+        attempt_scoped_evidence_rule = ATTEMPT_SCOPED_EVIDENCE_RULE
     )
 }
 
