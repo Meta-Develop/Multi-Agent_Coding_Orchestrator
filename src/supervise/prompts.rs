@@ -1275,6 +1275,7 @@ const VIBE_AUTOMATIC_JOURNAL_CONTRACT: &str = r#"- Use plain bash for every comm
 - Journal errors: stop without repair or retry. No hand JSON, identity discovery, PATH change or alternative appender. For observed environment errors include environment_failures (sandbox_unavailable for sandbox/syscall failures; missing_executable for missing commands); status=failed, accepted=false, rejected=true.
 - The exact precreated journal is the only non-source write; its parent is nonwritable. Never create, replace, rename, link, truncate, or swap it. Do not modify the held shim/config/helper. Invalid journal bindings fail before launch.
 - WorkerReport.commands_run may be a subset of real journal records. It should hold the final run of each validation command plus any earlier failed run of it; inspection and edit commands may be omitted. Copy each command array element and exact absolute cwd byte-for-byte from the execution journal records read with read_file, never retyped from memory. Preserve the inner argv: ["/bin/bash","-c","<complete original script>"], with a matching finished journal record. Never split scripts, drop wrappers, paraphrase commands or invent command identities.
+- For a long, multi-line or quoted command you may report a reference instead of retyping it: set that commands_run entry's command to [] and its journal_record to {"line": N, "start_timestamp": "T"}, where N is the 1-based line of the command's completed or failed record (never its started record, which has the same start_timestamp) in the journal read with read_file and T is that record's start_timestamp; keep cwd exact. MACO fills command from that record. A reference to any other record, a different timestamp or a non-empty command fails the report.
 - Preserve actual command outcomes, including failed/repaired calls. stdout and stderr default to empty, with results summarized in validation_results messages; a nonempty stream must still be copied exactly from the corresponding observed stream, never excerpted, shortened, reworded or synthesized."#;
 
 const VIBE_DIRECT_WORKER_GUIDANCE: &str = r#"
@@ -2361,6 +2362,23 @@ mod regression_tests {
         ));
         assert!(primary_prefix.contains("The assigned worktree is the existing primary checkout"));
         assert!(!primary_prefix.contains("Do not mutate the primary worktree."));
+        Ok(())
+    }
+
+    #[test]
+    fn vibe_direct_worker_prefix_offers_journal_record_references() -> Result<()> {
+        let prefix = direct_terminal_worker_cacheable_prefix(None)?;
+        let vibe = vibe_direct_worker_prefix(&prefix)?;
+        let offer = "- For a long, multi-line or quoted command you may report a reference instead of retyping it: set that commands_run entry's command to [] and its journal_record to {\"line\": N, \"start_timestamp\": \"T\"}, where N is the 1-based line of the command's completed or failed record (never its started record, which has the same start_timestamp) in the journal read with read_file and T is that record's start_timestamp; keep cwd exact. MACO fills command from that record. A reference to any other record, a different timestamp or a non-empty command fails the report.";
+        assert_eq!(vibe.matches(offer).count(), 1);
+        let subset = "- WorkerReport.commands_run may be a subset of real journal records.";
+        let after = vibe
+            .lines()
+            .skip_while(|line| !line.starts_with(subset))
+            .nth(1)
+            .expect("line after commands_run subset line");
+        assert_eq!(after, offer);
+        assert!(!vibe.contains("(cat -n shows line numbers)"));
         Ok(())
     }
 
