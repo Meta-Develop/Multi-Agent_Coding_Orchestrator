@@ -174,6 +174,7 @@ mod tests {
             model: "decider-v1".to_string(),
             threshold_basis_points: 6000,
             timeout_ms: 5000,
+            max_task_text_chars: None,
         }
     }
 
@@ -248,6 +249,7 @@ mod tests {
             model: "m".to_string(),
             threshold_basis_points: 100,
             timeout_ms: 1000,
+            max_task_text_chars: None,
         };
         let valid = serde_json::to_string(&expected).expect("serialize config");
         std::fs::write(&file, valid).expect("write valid config");
