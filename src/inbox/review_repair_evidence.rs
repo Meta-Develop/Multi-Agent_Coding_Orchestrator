@@ -784,7 +784,6 @@ mod tests {
     use git2::{Repository, Signature};
     use std::fs;
     use std::path::Path;
-    use std::process::Command;
     use tempfile::TempDir;
 
     fn object(kind: ProviderObjectKind, stable_id: &str) -> ProviderObjectId {
@@ -1271,8 +1270,8 @@ mod tests {
         )
         .is_err());
         fs::write(temp.path().join("base.txt"), "mutated after binding\n").expect("mutate");
-        Command::new("git")
-            .args(["-C", temp.path().to_str().unwrap(), "add", "base.txt"])
+        crate::test_git::fixture_git_command(temp.path())
+            .args(["add", "base.txt"])
             .status()
             .expect("git add");
     }

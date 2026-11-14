@@ -492,9 +492,7 @@ fn default_exclude_managed_creation_is_invisible_to_plain_git_and_index_add_all(
         .create(options("default-b", None))
         .expect("second default creation");
     assert_eq!(fs::read(&exclude).unwrap(), once);
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
+    let status = crate::test_git::fixture_git_command(&repo_path)
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
         .unwrap();
@@ -534,9 +532,7 @@ fn default_exclude_managed_creation_is_invisible_to_plain_git_and_index_add_all(
         "untracked operator edit\n",
     )
     .unwrap();
-    let status = std::process::Command::new("git")
-        .arg("-C")
-        .arg(&repo_path)
+    let status = crate::test_git::fixture_git_command(&repo_path)
         .args(["status", "--porcelain=v1", "--untracked-files=all"])
         .output()
         .unwrap();

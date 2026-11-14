@@ -1265,13 +1265,11 @@ mod tests {
             .expect("config")
             .set_str("user.email", "fixture@example.invalid")
             .expect("email");
-        Command::new("git")
-            .current_dir(&repo)
+        crate::test_git::fixture_git_command(&repo)
             .args(["add", "README.md"])
             .status()
             .expect("git add");
-        Command::new("git")
-            .current_dir(&repo)
+        crate::test_git::fixture_git_command(&repo)
             .args(["commit", "-m", "baseline"])
             .status()
             .expect("git commit");

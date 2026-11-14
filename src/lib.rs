@@ -3,6 +3,8 @@
 #[cfg(test)]
 #[macro_use]
 mod test_containment;
+#[cfg(test)]
+mod test_git;
 #[cfg(all(test, unix))]
 mod test_support;
 

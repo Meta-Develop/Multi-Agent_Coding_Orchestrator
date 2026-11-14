@@ -352,8 +352,7 @@ fn commit_injected_repository(path: &Path, message: &str) {
 }
 
 fn run_injected_git(repo: &Path, args: &[&str]) {
-    let output = std::process::Command::new("git")
-        .current_dir(repo)
+    let output = crate::test_git::fixture_git_command(repo)
         .args(args)
         .output()
         .expect("run injected Git command");
