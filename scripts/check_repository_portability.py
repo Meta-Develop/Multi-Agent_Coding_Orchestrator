@@ -21,7 +21,7 @@ MAX_WINDOWS_PATH_UNITS = 180
 
 _INVALID_FILENAME_CHARACTERS = frozenset('<>:"\\|?*')
 _RESERVED_DEVICE_NAMES = frozenset({"con", "prn", "aux", "nul"})
-_RESERVED_DEVICE_SUFFIXES = frozenset("123456789¹²³")
+_RESERVED_DEVICE_SUFFIXES = frozenset("0123456789¹²³")
 
 
 @dataclass(frozen=True)

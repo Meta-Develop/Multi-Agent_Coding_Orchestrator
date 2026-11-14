@@ -56,8 +56,9 @@ class Win32NameTests(unittest.TestCase):
 
     def test_reserved_device_name_families_and_extensions(self) -> None:
         names = ["CON", "prn.log", "Aux.tar.gz", "NUL"]
-        names += [f"COM{suffix}.txt" for suffix in "123456789¹²³"]
-        names += [f"lpt{suffix}" for suffix in "123456789¹²³"]
+        names += [f"COM{suffix}.txt" for suffix in "0123456789¹²³"]
+        names += [f"lpt{suffix}" for suffix in "0123456789¹²³"]
+        names += ["COM0", "LPT0", "com0.txt", "lpt0"]
 
         for name in names:
             with self.subTest(name=name):
@@ -68,9 +69,8 @@ class Win32NameTests(unittest.TestCase):
             b".gitignore",
             b".env.local",
             b"directory/.CON",
-            b"COM0",
             b"COM10.txt",
-            b"LPT0",
+            "COM⁰".encode(),
             b"conifer.txt",
         ]
 
