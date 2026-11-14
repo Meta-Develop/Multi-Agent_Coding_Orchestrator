@@ -2340,6 +2340,23 @@ fn field_guide_suggestion_bytes(entries: &[FieldGuideEntrySuggestion]) -> Result
     })
 }
 
+/// Restore the declared order when a report lists exactly the declared items in another order (#975).
+pub(super) fn restore_declared_order<T: Ord + Clone>(
+    reported: &mut Vec<T>,
+    declared: &[T],
+) -> bool {
+    if reported.as_slice() == declared {
+        return true;
+    }
+    let reported_set = reported.iter().collect::<BTreeSet<_>>();
+    let declared_set = declared.iter().collect::<BTreeSet<_>>();
+    if reported.len() != declared.len() || reported_set != declared_set {
+        return false;
+    }
+    *reported = declared.to_vec();
+    true
+}
+
 fn normalize_worker_report_plumbing(
     assignment: &OrchestratorAssignment,
     assignment_metadata: &AssignmentMetadata,
@@ -2353,13 +2370,13 @@ fn normalize_worker_report_plumbing(
         && assignment.role_category == Some(RoleCategory::NonDelegatingTerminalWorker)
         && report.id == assignment.id
     {
-        if report.assigned_paths != assignment.assigned_paths {
+        if !restore_declared_order(&mut report.assigned_paths, &assignment.assigned_paths) {
             bail!("assigned_paths do not exactly match the declared direct worker assignment");
         }
-        if report.semantic_symbols != assignment.semantic_symbols {
+        if !restore_declared_order(&mut report.semantic_symbols, &assignment.semantic_symbols) {
             bail!("semantic_symbols do not exactly match the declared direct worker assignment");
         }
-        if report.semantic_modules != assignment.semantic_modules {
+        if !restore_declared_order(&mut report.semantic_modules, &assignment.semantic_modules) {
             bail!("semantic_modules do not exactly match the declared direct worker assignment");
         }
         if report.assignment_kind != AssignmentKind::Ordinary {
@@ -2378,13 +2395,13 @@ fn normalize_worker_report_plumbing(
     let worker = workers_by_id
         .get(report.id.as_str())
         .context("worker is not declared in the assignment")?;
-    if report.assigned_paths != worker.assigned_paths {
+    if !restore_declared_order(&mut report.assigned_paths, &worker.assigned_paths) {
         bail!("assigned_paths do not exactly match the declared worker assignment");
     }
-    if report.semantic_symbols != worker.semantic_symbols {
+    if !restore_declared_order(&mut report.semantic_symbols, &worker.semantic_symbols) {
         bail!("semantic_symbols do not exactly match the declared worker assignment");
     }
-    if report.semantic_modules != worker.semantic_modules {
+    if !restore_declared_order(&mut report.semantic_modules, &worker.semantic_modules) {
         bail!("semantic_modules do not exactly match the declared worker assignment");
     }
     let metadata = worker_assignment_metadata(assignment_metadata, assignment, worker);
