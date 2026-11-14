@@ -4105,6 +4105,21 @@ fn prepare_supervisor_run(
             },
         )?
     };
+    if selection.selection_preflight_failure.is_none() {
+        if let Some(config) = super::decision_shadow::decision_provider_from_env()? {
+            for record in super::decision_shadow::shadow_decision_records(
+                &config,
+                &plan.task,
+                &selection.decisions,
+            ) {
+                artifact_writer.write_json(
+                    super::decision_shadow::shadow_record_path(&record),
+                    &record,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )?;
+            }
+        }
+    }
     if selection.selection_preflight_failure.is_none() && !selector_plan.assignments.is_empty() {
         plan.role_models = selector_plan.role_models;
         plan.review_lenses = selector_plan.review_lenses;
