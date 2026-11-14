@@ -3304,11 +3304,23 @@ fn looks_like_repo_relative_path(token: &str) -> bool {
     if path.is_absolute() {
         return false;
     }
-    token.contains('/')
-        || token.starts_with('.')
-        || path
-            .extension()
-            .is_some_and(|extension| !extension.is_empty())
+    if token.contains('/') || token.starts_with('.') {
+        return true;
+    }
+    let extension = path.extension();
+    let Some(extension) = extension.filter(|extension| !extension.is_empty()) else {
+        return false;
+    };
+    if extension
+        .to_string_lossy()
+        .chars()
+        .all(|c| c.is_ascii_digit())
+    {
+        return false;
+    }
+    let stem = path.file_stem().unwrap_or_default();
+    !(stem.to_string_lossy().chars().count() == 1
+        && extension.to_string_lossy().chars().count() == 1)
 }
 
 fn propose_non_rust_identifier_paths(
@@ -5333,6 +5345,46 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
         assert!(looks_like_repo_relative_path(
             ".agents/scripts/o2-autopilot"
         ));
+    }
+
+    #[test]
+    fn version_numbers_and_dotted_abbreviations_are_not_paths() {
+        assert!(!looks_like_repo_relative_path("1.2"));
+        assert!(!looks_like_repo_relative_path("v1.2"));
+        assert!(!looks_like_repo_relative_path("e.g"));
+        assert!(!looks_like_repo_relative_path("i.e"));
+        assert!(!looks_like_repo_relative_path("frobnicator."));
+        assert!(!looks_like_repo_relative_path("frobnicator"));
+        assert!(looks_like_repo_relative_path("README.md"));
+        assert!(looks_like_repo_relative_path("src/main.rs"));
+        assert!(looks_like_repo_relative_path(
+            ".agents/scripts/o2-autopilot"
+        ));
+        assert!(looks_like_repo_relative_path("Cargo.toml"));
+        assert!(looks_like_repo_relative_path("foo.custom"));
+        assert!(looks_like_repo_relative_path("docs/foo.custom"));
+        assert!(looks_like_repo_relative_path(".foo.custom"));
+    }
+
+    #[test]
+    fn propose_task_decomposition_treats_version_numbers_as_unmatched_scope() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "README.md", "# Project\n");
+
+        let proposal =
+            propose_task_decomposition(repo, "", "- Bump the release to 1.2, e.g. v1.2.")
+                .expect("version numbers");
+
+        assert!(proposal.assignments.is_empty());
+        let fragment_ids: Vec<_> = proposal.fragments.iter().map(|f| f.id.clone()).collect();
+        let gap_ids: Vec<_> = proposal
+            .coverage_gaps
+            .iter()
+            .map(|gap| gap.fragment_id.clone())
+            .collect();
+        assert_eq!(fragment_ids, gap_ids);
     }
 
     #[test]
