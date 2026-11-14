@@ -1023,7 +1023,7 @@ fn normalize_agent_id(agent_id: &str) -> Result<String> {
         bail!("agent id cannot be empty");
     }
     if matches!(trimmed, "." | "..") {
-        bail!("agent id may only contain ASCII letters, digits, '.', '_' and '-'");
+        bail!("agent id cannot be '.' or '..'");
     }
     if !trimmed
         .chars()
@@ -1883,5 +1883,35 @@ pub mod api;
         fn from(builder: RequestBuilder) -> Self {
             builder.inner
         }
+    }
+
+    #[test]
+    fn agent_id_dot_segments_have_their_own_error() {
+        for agent_id in [".", "..", " .. "] {
+            let error = normalize_agent_id(agent_id).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("agent id cannot be '.' or '..'"),
+                "unexpected message for {agent_id:?}: {message}"
+            );
+        }
+        for agent_id in ["", "   "] {
+            let error = normalize_agent_id(agent_id).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message.contains("agent id cannot be empty"),
+                "unexpected message for {agent_id:?}: {message}"
+            );
+        }
+        for agent_id in ["a/b", "a b"] {
+            let error = normalize_agent_id(agent_id).unwrap_err();
+            let message = format!("{error:#}");
+            assert!(
+                message
+                    .contains("agent id may only contain ASCII letters, digits, '.', '_' and '-'"),
+                "unexpected message for {agent_id:?}: {message}"
+            );
+        }
+        assert_eq!(normalize_agent_id("a.b").unwrap(), "a.b");
     }
 }
