@@ -200,6 +200,21 @@ gate is bypassed. Omit `--only-runtime` for the mixed plan below.
 The durable report is
 `<repo>/.maco/o2/runs/<run-id>/reports/supervisor-final.json`.
 
+## Worker tool PATH
+
+MACO sets `PATH` for every external agent process to the fixed trusted path
+`/run/current-system/sw/bin:/usr/bin:/bin`. To make a tool installed elsewhere
+resolvable by name, for example a Node.js runtime in a Nix store path on a host
+that is not NixOS, set `MACO_WORKER_PATH_APPEND` for the `maco` process to a
+colon-separated list of directories. MACO appends them, in order, after the
+trusted path. Each entry must be an absolute, canonical path (no symlink, `.`
+or `..` component and no trailing slash) to an existing directory that is owned
+by root and is not group- or world-writable. Entries may not repeat each other
+or a trusted-path directory. An invalid entry refuses the launch with an
+environment failure that names the entry. The command report records the
+applied directories as `worker_path_append`. Each listed directory is a trust
+decision: every executable in it becomes resolvable by name inside the Worker.
+
 ## Grok runtime
 
 The bundled priors support Grok for bounded terminal Worker implementation,

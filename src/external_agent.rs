@@ -5758,6 +5758,8 @@ struct ExternalAgentRunWireRef<'a> {
     #[serde(skip_serializing_if = "Vec::is_empty")]
     gate_denials: &'a Vec<GateDenial>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
+    worker_path_append: &'a Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     machine_global_bypasses: &'a Vec<MachineGlobalBypassAttribution>,
     #[serde(skip_serializing_if = "Option::is_none")]
     machine_global_retention_operation_id: &'a Option<RetentionOperationId>,
@@ -5815,6 +5817,8 @@ struct ExternalAgentRunWireOwned {
     sandbox_denials: Vec<SandboxDenialEvidence>,
     #[serde(default)]
     gate_denials: Vec<GateDenial>,
+    #[serde(default)]
+    worker_path_append: Vec<String>,
     #[serde(default)]
     machine_global_bypasses: Vec<MachineGlobalBypassAttribution>,
     #[serde(default)]
@@ -5874,6 +5878,7 @@ impl Serialize for ExternalAgentRun {
                 .environment_preflight_process_started,
             sandbox_denials,
             gate_denials: &self.stdout.run_metadata.gate_denials,
+            worker_path_append: &self.stdout.run_metadata.worker_path_append,
             machine_global_bypasses: &self.stdout.run_metadata.machine_global_bypasses,
             machine_global_retention_operation_id: &self
                 .stdout
@@ -5914,6 +5919,7 @@ impl<'de> Deserialize<'de> for ExternalAgentRun {
             wire.environment_preflight_process_started;
         stdout.run_metadata.sandbox_denials = sandbox_denials;
         stdout.run_metadata.gate_denials = wire.gate_denials;
+        stdout.run_metadata.worker_path_append = wire.worker_path_append;
         stdout.run_metadata.machine_global_bypasses = wire.machine_global_bypasses;
         stdout.run_metadata.machine_global_retention_operation_id =
             wire.machine_global_retention_operation_id;
@@ -5978,6 +5984,8 @@ struct ExternalAgentRunMetadata {
     environment_preflight_quiescence_verified: bool,
     sandbox_denials: Vec<SandboxDenialEvidence>,
     gate_denials: Vec<GateDenial>,
+    /// Operator-appended trusted tool directories applied to PATH (MACO_WORKER_PATH_APPEND, #989).
+    worker_path_append: Vec<String>,
     machine_global_bypasses: Vec<MachineGlobalBypassAttribution>,
     machine_global_retention_operation_id: Option<RetentionOperationId>,
     pre_action_review_metrics: Option<ReviewMetricSnapshot>,
@@ -8842,6 +8850,25 @@ fn run_external_agent_runtime_inner(
     };
     let mut external_environment =
         external_environment_for_command(spec, target_spec.runtime_adapter.as_ref(), program_trust);
+    match worker_path_append_setting() {
+        Ok(directories) => {
+            append_worker_path(&mut external_environment, &directories);
+            report.stdout.run_metadata.worker_path_append = directories
+                .iter()
+                .map(|directory| directory.display().to_string())
+                .collect();
+        }
+        Err(error) => {
+            report.duration_ms = duration_millis(started.elapsed());
+            record_environment_failure(
+                &mut report,
+                EnvironmentFailureCategory::ProbeFailed,
+                None,
+                format!("MACO_WORKER_PATH_APPEND refused: {error:#}"),
+            );
+            return report;
+        }
+    }
     if spec.invocation == ExternalAgentInvocation::DeepSeek {
         match crate::runtime_adapter::deepseek::privacy_environment(|key| std::env::var(key).ok()) {
             Ok(pairs) => {
@@ -14367,6 +14394,8 @@ mod managed_readonly_route_tests;
 mod tests;
 #[cfg(all(test, unix))]
 pub(crate) mod vibe_tests;
+#[cfg(all(test, unix))]
+mod worker_path_tests;
 
 #[cfg(all(test, target_os = "linux"))]
 pub(crate) mod managed_parent_fixture;
