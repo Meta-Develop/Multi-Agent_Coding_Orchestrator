@@ -124,6 +124,8 @@ comes from the recorded `resolved_model` (or `requested_model` when that
 grouping is selected); a requested name is never presented as a provider
 identity. No economic, pricing, quota or model-credit claims are made.
 
+`node scope-ui/scripts/collect-decisions.mjs [--threshold BP]... [--out FILE] [--summary] ROOT...` replays the decision-model calibration evidence retained by MACO runs. It reads the shadow decision records written under `decision-proposals/` (#970) together with each run's native final result, and reports the recorded threshold, the adoption rate, the would-adopt rate per threshold, accepted runs when the proposal agrees or disagrees with the deterministic choice with 95% Wilson intervals and their difference, and a calibration status that keeps the threshold until at least 30 consulted decisions have a known outcome; shadow records cannot show outcomes of disagreeing proposals.
+
 ## Commands
 
 No npm dependencies. Node's built-in test runner is enough:
