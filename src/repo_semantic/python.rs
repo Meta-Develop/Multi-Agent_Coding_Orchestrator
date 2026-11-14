@@ -391,10 +391,21 @@ fn resolve_python_import(
             .map(str::to_string)
             .collect::<Vec<_>>()
     } else {
+        let is_package_file = file
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name == "__init__.py" || name == "__init__.pyi")
+            .unwrap_or(false);
         let mut package = module_path.to_vec();
+        if !is_package_file {
+            package.pop();
+        }
         let climb = dots.saturating_sub(1);
         for _ in 0..climb {
             package.pop();
+        }
+        if package.is_empty() {
+            return None;
         }
         if !remainder.is_empty() {
             package.extend(
@@ -588,4 +599,52 @@ fn take_string(source: &str, start: usize) -> Option<(&str, usize)> {
             .unwrap_or(1);
     }
     Some((&source[start..], source.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_imports_climb_from_the_containing_package() {
+        let mut files = vec![
+            PathBuf::from("api.py"),
+            PathBuf::from("pkg/__init__.py"),
+            PathBuf::from("pkg/api.py"),
+            PathBuf::from("pkg/mod.py"),
+            PathBuf::from("pkg/sub/__init__.py"),
+            PathBuf::from("pkg/sub/mod.py"),
+        ];
+        files.sort();
+
+        let file = Path::new("pkg/mod.py");
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), ".api.endpoint"),
+            Some(PathBuf::from("pkg/api.py"))
+        );
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), "..api.endpoint"),
+            None
+        );
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), "pkg.api"),
+            Some(PathBuf::from("pkg/api.py"))
+        );
+
+        let file = Path::new("pkg/sub/mod.py");
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), "..api.endpoint"),
+            Some(PathBuf::from("pkg/api.py"))
+        );
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), "...api.endpoint"),
+            None
+        );
+
+        let file = Path::new("pkg/__init__.py");
+        assert_eq!(
+            resolve_python_import(&files, file, &python_module_path(file), ".api.endpoint"),
+            Some(PathBuf::from("pkg/api.py"))
+        );
+    }
 }
