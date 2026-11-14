@@ -48,6 +48,8 @@ pub enum DecisionAdoptionOutcome {
     BelowThreshold,
     Malformed,
     NoOptions,
+    ProviderError,
+    NotConsulted,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
