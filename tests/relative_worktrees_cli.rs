@@ -15,6 +15,11 @@ const ALTERNATE_BIN: &str = env!("CARGO_BIN_EXE_multi-agent-coding-orchestrator"
 
 #[test]
 fn supervise_plan_entrypoint_accepts_relative_linked_worktree() -> Result<()> {
+    if skip_without_relative_worktrees(
+        "supervise_plan_entrypoint_accepts_relative_linked_worktree",
+    )? {
+        return Ok(());
+    }
     let fixture = RelativeWorktreeFixture::new()?;
     let plan_path = fixture
         .primary
@@ -57,6 +62,9 @@ fn supervise_plan_entrypoint_accepts_relative_linked_worktree() -> Result<()> {
 
 #[test]
 fn direct_sync_store_open_accepts_relative_linked_worktree() -> Result<()> {
+    if skip_without_relative_worktrees("direct_sync_store_open_accepts_relative_linked_worktree")? {
+        return Ok(());
+    }
     let fixture = RelativeWorktreeFixture::new()?;
 
     let store = SyncStore::open(&fixture.linked)?;
@@ -74,6 +82,11 @@ fn relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree() ->
     support::require_containment!(
         "relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree"
     );
+    if skip_without_relative_worktrees(
+        "relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree",
+    )? {
+        return Ok(());
+    }
     let fixture = RelativeWorktreeFixture::new()?;
 
     let primary_status = run_maco_success_json(&[
@@ -202,6 +215,11 @@ fn relative_worktrees_share_exact_claim_state_and_map_the_selected_worktree() ->
 
 #[test]
 fn relative_worktree_support_does_not_accept_an_unrelated_extension() -> Result<()> {
+    if skip_without_relative_worktrees(
+        "relative_worktree_support_does_not_accept_an_unrelated_extension",
+    )? {
+        return Ok(());
+    }
     let fixture = RelativeWorktreeFixture::new()?;
     run_git(&[
         "-C",
@@ -396,6 +414,28 @@ fn run_binary_success_json(binary: &str, args: &[&str]) -> Result<Value> {
         );
     }
     serde_json::from_slice(&output.stdout).context("parse maco JSON")
+}
+
+fn skip_without_relative_worktrees(test_name: &str) -> Result<bool> {
+    let output = support::fixture_git::fixture_git()
+        .args(["worktree", "add", "-h"])
+        .output()
+        .context("probe git worktree add options")?;
+    let usage = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    if usage.contains("relative-paths") {
+        return Ok(false);
+    }
+    if std::env::var("GITHUB_ACTIONS").as_deref() == Ok("true") {
+        return Ok(false);
+    }
+    eprintln!(
+        "skipping {test_name}: git worktree add has no --relative-paths option (Git 2.48 or later is required)"
+    );
+    Ok(true)
 }
 
 fn run_git(args: &[&str]) -> Result<()> {
