@@ -706,11 +706,12 @@ fn deterministic_verification_path(
     if !risk_is_bound_to_assignment(risk_report, &assignment.assigned_paths) {
         return ViabilityFinding::Unknown;
     }
-    // An assigned Rust file's own test module (inline or declared) is a verification path for a Worker edit (#1019).
+    // An assigned Rust file's own test module (inline or declared, named `tests` or ending in
+    // `_tests`) is a verification path for a Worker edit (#1019, #1033).
     if assignment.role == AgentRole::Worker
         && risk_report.touched_symbols.iter().any(|symbol| {
             symbol.kind == SemanticSymbolKind::Module
-                && symbol.name == "tests"
+                && (symbol.name == "tests" || symbol.name.ends_with("_tests"))
                 && assignment.assigned_paths.contains(&symbol.file)
                 && symbol
                     .file
@@ -4481,6 +4482,39 @@ mod tests {
             decision.dimensions.clear_verification_path,
             ViabilityFinding::Unknown
         );
+    }
+
+    #[test]
+    fn assigned_rust_topic_tests_module_is_a_verification_path() {
+        let mut candidate = assignment();
+        candidate.role = AgentRole::Worker;
+        candidate.assigned_paths = vec![PathBuf::from("src/lib.rs")];
+        let requested = [candidate.clone()];
+        let verify = |name: &str| {
+            let mut risk = risk_for_path("src/lib.rs");
+            risk.touched_symbols = vec![symbol("src/lib.rs", name, SemanticSymbolKind::Module)];
+            evaluate_preclaim_viability(
+                &candidate,
+                &requested,
+                Some(&present_map()),
+                Some(&risk),
+                Some(SupervisorRuntime::Fake),
+                SupervisorExecutionRuntime::Verified,
+            )
+        };
+        let decision = verify("selected_codex_auth_tests");
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+        for name in ["contests", "tests_helpers", "helpers"] {
+            assert_eq!(
+                verify(name).dimensions.clear_verification_path,
+                ViabilityFinding::Unknown,
+                "{name}"
+            );
+        }
     }
 
     #[test]
