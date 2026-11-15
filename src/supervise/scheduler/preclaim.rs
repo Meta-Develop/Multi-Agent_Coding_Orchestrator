@@ -10,7 +10,9 @@
 
 use super::*;
 use crate::repo_map::{RepoEntryKind, RepoGitStatus, RepoMap};
-use crate::repo_semantic::{risk_report_for_paths, SemanticRepoMap, SemanticRiskReport};
+use crate::repo_semantic::{
+    risk_report_for_paths, SemanticRepoMap, SemanticRiskReport, SemanticSymbolKind,
+};
 use crate::safe_state::BoundedRegularReader;
 use serde::{Deserialize, Serialize};
 
@@ -703,6 +705,22 @@ fn deterministic_verification_path(
     };
     if !risk_is_bound_to_assignment(risk_report, &assignment.assigned_paths) {
         return ViabilityFinding::Unknown;
+    }
+    // An assigned Rust file's own test module (inline or declared) is a verification path for a Worker edit (#1019).
+    if assignment.role == AgentRole::Worker
+        && risk_report.touched_symbols.iter().any(|symbol| {
+            symbol.kind == SemanticSymbolKind::Module
+                && symbol.name == "tests"
+                && assignment.assigned_paths.contains(&symbol.file)
+                && symbol
+                    .file
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    == Some("rs")
+                && mapped_regular_file(repo_map, &symbol.file)
+        })
+    {
+        return ViabilityFinding::Yes;
     }
 
     let related_test_target = risk_report.dependency_impacts.iter().any(|impact| {
@@ -2178,7 +2196,7 @@ mod tests {
     use crate::repo_map::{RepoGitStatus, RepoMapEntry};
     use crate::repo_semantic::{
         SemanticDependency, SemanticDependencyDirection, SemanticDependencyImpact,
-        SemanticDependencyKind, SourceSpan,
+        SemanticDependencyKind, SemanticSymbol, SemanticSymbolKind, SourceSpan,
     };
 
     fn assignment() -> OrchestratorAssignment {
@@ -2264,6 +2282,27 @@ mod tests {
             dependency_impacts: Vec::new(),
             impacted_files: Vec::new(),
             errors: Vec::new(),
+        }
+    }
+
+    fn symbol(file: &str, name: &str, kind: SemanticSymbolKind) -> SemanticSymbol {
+        SemanticSymbol {
+            id: format!("{file}::{name}"),
+            file: PathBuf::from(file),
+            name: name.to_string(),
+            qualified_path: vec!["crate".to_string(), name.to_string()],
+            kind,
+            visibility: "private".to_string(),
+            parent_symbol: None,
+            impl_target: None,
+            impl_trait: None,
+            span: SourceSpan {
+                start_byte: 0,
+                end_byte: 1,
+                start_line: 1,
+                end_line: 1,
+                signature_end_line: 1,
+            },
         }
     }
 
@@ -4405,6 +4444,114 @@ mod tests {
             ViabilityFinding::Yes
         );
         assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+    }
+
+    #[test]
+    fn assigned_rust_tests_module_is_a_verification_path() {
+        let mut candidate = assignment();
+        candidate.role = AgentRole::Worker;
+        candidate.assigned_paths = vec![PathBuf::from("src/lib.rs")];
+        let mut risk = risk_for_path("src/lib.rs");
+        risk.touched_symbols = vec![symbol("src/lib.rs", "tests", SemanticSymbolKind::Module)];
+        let requested = [candidate.clone()];
+        let decision = evaluate_preclaim_viability(
+            &candidate,
+            &requested,
+            Some(&present_map()),
+            Some(&risk),
+            Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+
+        let plain_risk = risk_for_path("src/lib.rs");
+        let decision = evaluate_preclaim_viability(
+            &candidate,
+            &requested,
+            Some(&present_map()),
+            Some(&plain_risk),
+            Some(SupervisorRuntime::Fake),
+            SupervisorExecutionRuntime::Verified,
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+    }
+
+    #[test]
+    fn only_an_assigned_mapped_rust_tests_module_is_a_verification_path() {
+        let worker_for = |paths: &[&str]| {
+            let mut candidate = assignment();
+            candidate.role = AgentRole::Worker;
+            candidate.assigned_paths = paths.iter().map(PathBuf::from).collect();
+            candidate
+        };
+        let verify = |candidate: &OrchestratorAssignment, risk: &SemanticRiskReport| {
+            let requested = [candidate.clone()];
+            let decision = evaluate_preclaim_viability(
+                candidate,
+                &requested,
+                Some(&present_map()),
+                Some(risk),
+                Some(SupervisorRuntime::Fake),
+                SupervisorExecutionRuntime::Verified,
+            );
+            decision.dimensions.clear_verification_path
+        };
+
+        let mut wrong_name = risk_for_path("src/lib.rs");
+        wrong_name.touched_symbols =
+            vec![symbol("src/lib.rs", "helpers", SemanticSymbolKind::Module)];
+        assert_eq!(
+            verify(&worker_for(&["src/lib.rs"]), &wrong_name),
+            ViabilityFinding::Unknown
+        );
+
+        let mut wrong_kind = risk_for_path("src/lib.rs");
+        wrong_kind.touched_symbols =
+            vec![symbol("src/lib.rs", "tests", SemanticSymbolKind::Function)];
+        assert_eq!(
+            verify(&worker_for(&["src/lib.rs"]), &wrong_kind),
+            ViabilityFinding::Unknown
+        );
+
+        let mut wrong_file = risk_for_path("src/lib.rs");
+        wrong_file.touched_symbols =
+            vec![symbol("src/other.rs", "tests", SemanticSymbolKind::Module)];
+        assert_eq!(
+            verify(&worker_for(&["src/lib.rs"]), &wrong_file),
+            ViabilityFinding::Unknown
+        );
+
+        let mut wrong_extension = risk_for_path("README.md");
+        wrong_extension.touched_symbols =
+            vec![symbol("README.md", "tests", SemanticSymbolKind::Module)];
+        assert_eq!(
+            verify(&worker_for(&["README.md"]), &wrong_extension),
+            ViabilityFinding::Unknown
+        );
+
+        let mut unmapped = risk_for_path("src/unmapped.rs");
+        unmapped.touched_symbols = vec![symbol(
+            "src/unmapped.rs",
+            "tests",
+            SemanticSymbolKind::Module,
+        )];
+        assert_eq!(
+            verify(&worker_for(&["src/unmapped.rs"]), &unmapped),
+            ViabilityFinding::Unknown
+        );
+
+        let mut orchestrator = assignment();
+        orchestrator.assigned_paths = vec![PathBuf::from("src/lib.rs")];
+        let mut risk = risk_for_path("src/lib.rs");
+        risk.touched_symbols = vec![symbol("src/lib.rs", "tests", SemanticSymbolKind::Module)];
+        assert_eq!(verify(&orchestrator, &risk), ViabilityFinding::Unknown);
     }
 
     #[test]
