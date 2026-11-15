@@ -10,7 +10,9 @@
 //! ([`DepthCostModel`]) that every record carries, so later calibration can
 //! replace it. Selection is the #157 evaluation function: quality is a hard
 //! floor, then minimum cost. Wiring the decision into planning and autopilot
-//! is a later #830 slice.
+//! is a later #830 slice. `split_budget` turns a selected decision into
+//! per-level token shares (second #830 slice) so that each additional level
+//! splits the parent budget and every coordinator level keeps its auditors.
 
 use serde::{Deserialize, Serialize};
 
@@ -351,6 +353,158 @@ fn reason_for(candidate: &DepthCandidate, outcome: &EvaluationOutcome) -> String
     )
 }
 
+/// Role of one level in a depth budget split.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DepthLevelRole {
+    /// A delegating coordinator level.
+    Coordinator,
+    /// The terminal Worker level.
+    Worker,
+}
+
+/// Token budget for one level of the selected depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepthLevelBudget {
+    /// 1-based level index, counted top-down.
+    pub level: u8,
+    /// Whether this level coordinates or executes.
+    pub role: DepthLevelRole,
+    /// Nodes at this level.
+    pub nodes: u64,
+    /// Auditors at this level, one per coordinator.
+    pub auditors: u64,
+    /// Tokens per node at this level.
+    pub tokens_per_node: u64,
+    /// Tokens per auditor at this level.
+    pub tokens_per_auditor: u64,
+    /// Total tokens for this level.
+    pub level_tokens: u64,
+}
+
+/// A parent token budget split across the levels of a selected depth.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DepthBudgetSplit {
+    /// The selected depth.
+    pub depth: u8,
+    /// The parent budget that was split.
+    pub parent_budget_tokens: u64,
+    /// Tokens the selected depth requires.
+    pub required_tokens: u64,
+    /// One entry per level, counted top-down.
+    pub levels: Vec<DepthLevelBudget>,
+    /// Tokens left after the per-worker bonus was spread.
+    pub reserve_tokens: u64,
+}
+
+/// Errors for splitting a parent budget across depth levels.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum DepthBudgetError {
+    /// The depth decision was refused.
+    #[error("depth decision was refused; no budget split is possible")]
+    DecisionRefused,
+    /// The selected depth has no matching candidate.
+    #[error("selected depth {depth} has no matching candidate")]
+    MissingCandidate {
+        /// The selected depth.
+        depth: u8,
+    },
+    /// The parent budget is below the required tokens.
+    #[error("parent budget {available} tokens is below the required {required} tokens")]
+    InsufficientBudget {
+        /// Tokens the selected depth requires.
+        required: u64,
+        /// Tokens the parent budget provides.
+        available: u64,
+    },
+}
+
+/// Split a parent token budget across the levels of a selected depth.
+///
+/// The surplus above the required tokens is spread evenly over the terminal
+/// Workers; the remainder is kept as the reserve. Every coordinator level
+/// keeps one auditor per coordinator.
+pub fn split_budget(
+    record: &DepthDecisionRecord,
+    parent_budget_tokens: u64,
+) -> Result<DepthBudgetSplit, DepthBudgetError> {
+    let depth = match &record.decision {
+        DepthDecision::Selected { depth, .. } => *depth,
+        DepthDecision::Refused { .. } => return Err(DepthBudgetError::DecisionRefused),
+    };
+    let candidate = record
+        .candidates
+        .iter()
+        .find(|candidate| candidate.depth == depth)
+        .ok_or(DepthBudgetError::MissingCandidate { depth })?;
+
+    let fan_out = (record.input.max_child_assignments as u64).max(1);
+    let workers = candidate.workers.max(1);
+    let model = &record.model;
+    let worker_tokens = candidate
+        .per_worker_load_tokens
+        .saturating_add(model.per_worker_overhead_tokens);
+    let required_tokens = workers.saturating_mul(worker_tokens).saturating_add(
+        candidate.coordinators.saturating_mul(
+            model
+                .per_coordinator_overhead_tokens
+                .saturating_add(model.per_auditor_overhead_tokens),
+        ),
+    );
+    if parent_budget_tokens < required_tokens {
+        return Err(DepthBudgetError::InsufficientBudget {
+            required: required_tokens,
+            available: parent_budget_tokens,
+        });
+    }
+
+    let surplus = parent_budget_tokens - required_tokens;
+    let bonus = surplus / workers;
+    let reserve_tokens = surplus - bonus * workers;
+
+    let mut coordinator_counts = Vec::new();
+    let mut nodes = workers;
+    for _ in 0..depth.saturating_sub(1) {
+        nodes = nodes.div_ceil(fan_out);
+        coordinator_counts.push(nodes);
+    }
+    coordinator_counts.reverse();
+
+    let mut levels = Vec::new();
+    for (index, nodes) in coordinator_counts.iter().enumerate() {
+        let level_tokens = nodes
+            .saturating_mul(model.per_coordinator_overhead_tokens)
+            .saturating_add(nodes.saturating_mul(model.per_auditor_overhead_tokens));
+        levels.push(DepthLevelBudget {
+            level: index as u8 + 1,
+            role: DepthLevelRole::Coordinator,
+            nodes: *nodes,
+            auditors: *nodes,
+            tokens_per_node: model.per_coordinator_overhead_tokens,
+            tokens_per_auditor: model.per_auditor_overhead_tokens,
+            level_tokens,
+        });
+    }
+    let worker_per_node = worker_tokens.saturating_add(bonus);
+    levels.push(DepthLevelBudget {
+        level: depth,
+        role: DepthLevelRole::Worker,
+        nodes: workers,
+        auditors: 0,
+        tokens_per_node: worker_per_node,
+        tokens_per_auditor: 0,
+        level_tokens: workers.saturating_mul(worker_per_node),
+    });
+
+    Ok(DepthBudgetSplit {
+        depth,
+        parent_budget_tokens,
+        required_tokens,
+        levels,
+        reserve_tokens,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -581,5 +735,194 @@ mod tests {
         let round_tripped: DepthDecisionRecord =
             serde_json::from_value(value).expect("deserializes");
         assert_eq!(round_tripped, record);
+    }
+
+    #[test]
+    fn split_depth_one_gives_the_budget_to_one_worker() {
+        let record = decide_depth(
+            &input(3, 100_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        let split = split_budget(&record, 200_000).expect("split succeeds");
+        assert_eq!(split.depth, 1);
+        assert_eq!(split.required_tokens, 160_000);
+        assert_eq!(split.reserve_tokens, 0);
+        assert_eq!(
+            split.levels,
+            vec![DepthLevelBudget {
+                level: 1,
+                role: DepthLevelRole::Worker,
+                nodes: 1,
+                auditors: 0,
+                tokens_per_node: 200_000,
+                tokens_per_auditor: 0,
+                level_tokens: 200_000,
+            }]
+        );
+    }
+
+    #[test]
+    fn split_depth_two_spreads_the_surplus_over_workers() {
+        let record = decide_depth(
+            &input(4, 1_200_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        let split = split_budget(&record, 2_000_000).expect("split succeeds");
+        assert_eq!(split.depth, 2);
+        assert_eq!(split.required_tokens, 1_580_000);
+        assert_eq!(split.reserve_tokens, 0);
+        assert_eq!(
+            split.levels,
+            vec![
+                DepthLevelBudget {
+                    level: 1,
+                    role: DepthLevelRole::Coordinator,
+                    nodes: 1,
+                    auditors: 1,
+                    tokens_per_node: 120_000,
+                    tokens_per_auditor: 80_000,
+                    level_tokens: 200_000,
+                },
+                DepthLevelBudget {
+                    level: 2,
+                    role: DepthLevelRole::Worker,
+                    nodes: 3,
+                    auditors: 0,
+                    tokens_per_node: 600_000,
+                    tokens_per_auditor: 0,
+                    level_tokens: 1_800_000,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn split_depth_three_keeps_one_auditor_per_coordinator() {
+        let record = decide_depth(
+            &input(12, 4_000_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        let split = split_budget(&record, 5_400_025).expect("split succeeds");
+        assert_eq!(split.depth, 3);
+        assert_eq!(split.required_tokens, 5_400_000);
+        assert_eq!(split.reserve_tokens, 5);
+        assert_eq!(
+            split.levels,
+            vec![
+                DepthLevelBudget {
+                    level: 1,
+                    role: DepthLevelRole::Coordinator,
+                    nodes: 1,
+                    auditors: 1,
+                    tokens_per_node: 120_000,
+                    tokens_per_auditor: 80_000,
+                    level_tokens: 200_000,
+                },
+                DepthLevelBudget {
+                    level: 2,
+                    role: DepthLevelRole::Coordinator,
+                    nodes: 3,
+                    auditors: 3,
+                    tokens_per_node: 120_000,
+                    tokens_per_auditor: 80_000,
+                    level_tokens: 600_000,
+                },
+                DepthLevelBudget {
+                    level: 3,
+                    role: DepthLevelRole::Worker,
+                    nodes: 10,
+                    auditors: 0,
+                    tokens_per_node: 460_002,
+                    tokens_per_auditor: 0,
+                    level_tokens: 4_600_020,
+                },
+            ]
+        );
+        for level in &split.levels {
+            if level.role == DepthLevelRole::Coordinator {
+                assert_eq!(level.auditors, level.nodes);
+                assert!(level.nodes >= 1);
+            }
+        }
+        let total: u64 = split
+            .levels
+            .iter()
+            .map(|level| level.level_tokens)
+            .sum::<u64>()
+            + split.reserve_tokens;
+        assert_eq!(total, 5_400_025);
+    }
+
+    #[test]
+    fn split_refuses_an_insufficient_budget() {
+        let record = decide_depth(
+            &input(12, 4_000_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        let err = split_budget(&record, 5_399_999).expect_err("insufficient budget");
+        assert_eq!(
+            err,
+            DepthBudgetError::InsufficientBudget {
+                required: 5_400_000,
+                available: 5_399_999,
+            }
+        );
+        assert_eq!(
+            err.to_string(),
+            "parent budget 5399999 tokens is below the required 5400000 tokens"
+        );
+    }
+
+    #[test]
+    fn split_refuses_a_refused_decision() {
+        let record = decide_depth(
+            &input(12, 4_000_000, 4, 2),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        assert_eq!(
+            split_budget(&record, 1_000_000),
+            Err(DepthBudgetError::DecisionRefused)
+        );
+    }
+
+    #[test]
+    fn split_reports_a_missing_candidate() {
+        let mut record = decide_depth(
+            &input(4, 1_200_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        record.candidates.clear();
+        assert_eq!(
+            split_budget(&record, 2_000_000),
+            Err(DepthBudgetError::MissingCandidate { depth: 2 })
+        );
+    }
+
+    #[test]
+    fn budget_split_round_trips_through_json() {
+        let record = decide_depth(
+            &input(12, 4_000_000, 4, 4),
+            &DepthCostModel::uncalibrated_prior(),
+            &EvaluationFunction::shipped_default(),
+        )
+        .expect("decision succeeds");
+        let split = split_budget(&record, 5_400_025).expect("split succeeds");
+        let value = serde_json::to_value(&split).expect("serializes");
+        assert_eq!(value["levels"][0]["role"], "coordinator");
+        assert_eq!(value["levels"][2]["role"], "worker");
+        let round_tripped: DepthBudgetSplit = serde_json::from_value(value).expect("deserializes");
+        assert_eq!(round_tripped, split);
     }
 }
