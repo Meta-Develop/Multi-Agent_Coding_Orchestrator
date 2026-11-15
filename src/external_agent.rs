@@ -86,7 +86,10 @@ use std::{
 
 #[path = "codex_app_server.rs"]
 pub(crate) mod codex_app_server;
+#[cfg(target_os = "linux")]
+mod codex_auth_writeback;
 mod codex_parent_evidence;
+
 mod deepseek_capture;
 mod vibe;
 
@@ -8462,6 +8465,15 @@ fn run_external_agent_runtime_inner(
     }
 
     #[cfg(target_os = "linux")]
+    let codex_auth_lease = codex_auth.as_ref().map(|auth| {
+        codex_auth_writeback::CodexAuthLease::enter(
+            &auth.path,
+            &auth.bytes,
+            staged_codex_home.as_deref(),
+        )
+    });
+
+    #[cfg(target_os = "linux")]
     let grok_session = if runtime == ExternalExecutionRuntime::Verified
         && spec.invocation == ExternalAgentInvocation::Grok
     {
@@ -10662,6 +10674,13 @@ fn run_external_agent_runtime_inner(
         binding.attach_command_binding(&mut worker_journal_artifacts, &target_spec.cwd);
     }
     report.replace_worker_journal_artifacts(worker_journal_artifacts);
+    #[cfg(target_os = "linux")]
+    let staged_codex_auth = match (&codex_auth_lease, staged_codex_home.as_deref()) {
+        (Some(_), Some(home)) if report.scratch_quiescence_verified() => {
+            codex_auth_writeback::capture_staged_codex_auth(home)
+        }
+        _ => Ok(None),
+    };
     output_staging.record_target_quiescence(report.scratch_quiescence_verified());
     match output_staging.cleanup() {
         Ok(ExternalOutputCleanup::Quarantined(operation)) => {
@@ -10719,6 +10738,10 @@ fn run_external_agent_runtime_inner(
             );
             report.publishable = false;
         }
+    }
+    #[cfg(target_os = "linux")]
+    if let Some(lease) = codex_auth_lease {
+        lease.finish(staged_codex_auth);
     }
     report.stdout.run_metadata.gate_denials = retained_gate_denials;
     report.stdout.run_metadata.pre_action_review_metrics = retained_review_metrics;
