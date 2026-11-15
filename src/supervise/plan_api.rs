@@ -5134,6 +5134,14 @@ pub(super) fn supervisor_plan_value(
         ))
         .context("failed to serialize coordination topology")?,
     );
+    object.insert(
+        "depth_decision".to_string(),
+        serde_json::to_value(super::depth_record::plan_depth_decision(
+            plan,
+            &plan_metadata.assignment_schedule,
+        )?)
+        .context("failed to serialize depth decision")?,
+    );
     if !plan_metadata.coverage_gaps.is_empty() {
         object.insert(
             "coverage_gaps".to_string(),
