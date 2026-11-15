@@ -10480,6 +10480,11 @@ mod selection_policy_tests {
         #[test]
         fn headless_codex_setup_selection_supplies_managed_catalog_and_launch_binding() -> Result<()>
         {
+            if crate::containment_probe::skip_if_host_ownership_unavailable(
+                "supervise::scheduler::selection_policy_tests::account_observe_wire::headless_codex_setup_selection_supplies_managed_catalog_and_launch_binding",
+            )? {
+                return Ok(());
+            }
             use crate::account_authority::{codex_run_account_binding, CodexRunAccountBinding};
             use coding_agent_manager_lib::providers::codex_cli::{device_setup, CodexCliAdapter};
             let _socket = crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard::install(None);
@@ -11537,6 +11542,11 @@ mod selection_policy_tests {
 
         #[test]
         fn scheduler_account_observe_routes_through_configured_authority_socket() -> Result<()> {
+            if crate::containment_probe::skip_if_host_ownership_unavailable(
+                "supervise::scheduler::selection_policy_tests::account_observe_wire::scheduler_account_observe_routes_through_configured_authority_socket",
+            )? {
+                return Ok(());
+            }
             use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
             use coding_agent_manager_lib::account_authority::{
                 listen, resolve_socket_path, AuthorityContext, AuthorityServerConfig,
@@ -11664,6 +11674,11 @@ mod selection_policy_tests {
 
         #[test]
         fn scheduler_grok_socket_observe_freezes_selected_binding() -> Result<()> {
+            if crate::containment_probe::skip_if_host_ownership_unavailable(
+                "supervise::scheduler::selection_policy_tests::account_observe_wire::scheduler_grok_socket_observe_freezes_selected_binding",
+            )? {
+                return Ok(());
+            }
             use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
             use crate::account_authority::{
                 admit_grok_run_account_binding, frozen_observed_grok_selection,

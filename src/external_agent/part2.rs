@@ -8414,6 +8414,11 @@ mod selected_codex_auth_tests {
 
     #[test]
     fn local_codex_auth_endpoint_appearing_before_release_is_refused() -> Result<()> {
+        if crate::containment_probe::skip_if_host_ownership_unavailable(
+            "external_agent::selected_codex_auth_tests::local_codex_auth_endpoint_appearing_before_release_is_refused",
+        )? {
+            return Ok(());
+        }
         use crate::account_authority::record_observed_codex_selection_from_source;
 
         // Keep the full legacy loader's ancestry checks; this fixture never
@@ -8471,6 +8476,11 @@ mod selected_codex_auth_tests {
 
     #[test]
     fn local_codex_auth_revalidation_refuses_new_endpoint() -> Result<()> {
+        if crate::containment_probe::skip_if_host_ownership_unavailable(
+            "external_agent::selected_codex_auth_tests::local_codex_auth_revalidation_refuses_new_endpoint",
+        )? {
+            return Ok(());
+        }
         use std::os::unix::fs::MetadataExt;
 
         // Exercise the pre-release check with a synthetic captured source. The
@@ -8567,6 +8577,11 @@ mod selected_codex_auth_tests {
 
     #[test]
     fn selected_codex_auth_uses_managed_home_and_never_falls_back_to_ambient() -> Result<()> {
+        if crate::containment_probe::skip_if_host_ownership_unavailable(
+            "external_agent::selected_codex_auth_tests::selected_codex_auth_uses_managed_home_and_never_falls_back_to_ambient",
+        )? {
+            return Ok(());
+        }
         const CHILD_MARKER: &str = "MACO_SYNTHETIC_CODEX_AUTH_CHILD";
         const SELECTED: &[u8] = b"FAKE-selected-managed-auth";
         const AMBIENT: &[u8] = b"FAKE-conflicting-codex-auth";
