@@ -91,6 +91,8 @@ pub enum SyncError {
     EmptyAgentId,
     #[error("agent id may only contain ASCII letters, digits, '.', '_' and '-'")]
     InvalidAgentId,
+    #[error("agent id cannot be '.' or '..'")]
+    ReservedAgentId,
     #[error("claim must include at least one path")]
     EmptyClaim,
     #[error("path cannot be empty")]
@@ -465,7 +467,7 @@ fn normalize_agent_id(agent_id: &str) -> Result<String> {
         return Err(SyncError::EmptyAgentId);
     }
     if matches!(trimmed, "." | "..") {
-        return Err(SyncError::InvalidAgentId);
+        return Err(SyncError::ReservedAgentId);
     }
     if !trimmed
         .chars()
@@ -611,6 +613,28 @@ fn group_claims(claims: &BTreeMap<PathBuf, ClaimEntry>) -> BTreeMap<ClaimToken, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn agent_id_dot_and_dotdot_have_their_own_error() {
+        assert_eq!(normalize_agent_id("."), Err(SyncError::ReservedAgentId));
+        assert_eq!(normalize_agent_id(" .. "), Err(SyncError::ReservedAgentId));
+        assert_eq!(
+            SyncError::ReservedAgentId.to_string(),
+            "agent id cannot be '.' or '..'"
+        );
+        assert_eq!(normalize_agent_id("a/b"), Err(SyncError::InvalidAgentId));
+        assert_eq!(
+            SyncError::InvalidAgentId.to_string(),
+            "agent id may only contain ASCII letters, digits, '.', '_' and '-'"
+        );
+        assert_eq!(normalize_agent_id(""), Err(SyncError::EmptyAgentId));
+        assert_eq!(normalize_agent_id("   "), Err(SyncError::EmptyAgentId));
+        assert_eq!(
+            SyncError::EmptyAgentId.to_string(),
+            "agent id cannot be empty"
+        );
+        assert_eq!(normalize_agent_id("agent.1"), Ok("agent.1".to_string()));
+    }
 
     #[test]
     fn grants_exclusive_claims_for_disjoint_paths() {
