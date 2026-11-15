@@ -5232,7 +5232,7 @@ fn system_call_filter_rejects_each_incomplete_group_and_allow_list() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn hard_link_creation_is_allowed_by_every_profile_filter() {
+fn hard_link_and_fifo_creation_are_allowed_by_every_profile_filter() {
     for kind in [
         SideEffectConfinementProfileKind::StrictOfflineWorkspace,
         SideEffectConfinementProfileKind::GeminiOfflineBridge,
@@ -5266,16 +5266,10 @@ fn hard_link_creation_is_allowed_by_every_profile_filter() {
             .split_whitespace()
             .map(|token| token.trim_start_matches('~'))
             .collect::<Vec<_>>();
-        for syscall in ["link", "linkat"] {
+        for syscall in ["link", "linkat", "mknod", "mknodat"] {
             assert!(
                 !denied.contains(&syscall),
                 "{kind:?} denies {syscall}: {filter}"
-            );
-        }
-        for syscall in ["mknod", "mknodat"] {
-            assert!(
-                denied.contains(&syscall),
-                "{kind:?} allows {syscall}: {filter}"
             );
         }
         verify_effective_system_call_filter(kind, &filter)
@@ -6047,7 +6041,9 @@ fn strict_target_cannot_launch_sibling_user_unit() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn strict_target_can_create_hardlinks_but_not_fifos_after_start_gate() {
+fn strict_target_can_create_hardlinks_and_fifos_but_not_devices_after_start_gate() {
+    use std::os::unix::fs::FileTypeExt;
+
     skip_without_containment!();
     if !strict_backend_available_for_tests() {
         return;
@@ -6058,7 +6054,7 @@ fn strict_target_can_create_hardlinks_but_not_fifos_after_start_gate() {
         ProcessSpec::shell(
             "post-gate IPC creation",
             Shell::UnixSh,
-            "ln source alias >/dev/null 2>&1 || :; mkfifo fifo >/dev/null 2>&1 || :",
+            "ln source alias >/dev/null 2>&1 || :; mkfifo fifo >/dev/null 2>&1 || :; mknod device c 1 3 >/dev/null 2>&1 || :",
             temp.path(),
             128,
         )
@@ -6069,7 +6065,11 @@ fn strict_target_can_create_hardlinks_but_not_fifos_after_start_gate() {
     assert!(output.status.is_some_and(|status| status.success()));
     assert!(output.safety_evidence_verified());
     assert!(temp.path().join("alias").exists());
-    assert!(!temp.path().join("fifo").exists());
+    assert!(fs::symlink_metadata(temp.path().join("fifo"))
+        .expect("fifo")
+        .file_type()
+        .is_fifo());
+    assert!(fs::symlink_metadata(temp.path().join("device")).is_err());
 }
 
 #[cfg(target_os = "linux")]
