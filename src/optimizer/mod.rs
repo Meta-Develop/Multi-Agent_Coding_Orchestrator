@@ -12,6 +12,7 @@
 //! | `policy` candidate generation | #165 |
 //! | `replay` | #166 |
 //! | `evaluation_fn` | #157 first slice (quality-hard, min cost-to-certification) |
+//! | `depth_decision` | #830 first slice (per-task coordination depth) |
 //! | `seed_evidence` | #180 campaign observation re-home (evidence, not rules) |
 //! | `predictor`, `feasibility`, `objective`, `online_router`, `explanation` | #167 |
 //! | `value_of_information`, `hedge` | #168 |
@@ -36,6 +37,7 @@ pub mod blinding;
 pub mod calibration;
 pub mod catalog;
 pub mod certification;
+pub mod depth_decision;
 pub mod difficulty;
 mod digest;
 pub mod drift;
