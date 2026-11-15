@@ -3351,8 +3351,11 @@ fn canonicalize_journal_command_references(
                 "start_timestamp does not match the journal record",
                 &mut problems,
             );
-        } else if !record.command.is_empty() {
-            problem("command is not empty", &mut problems);
+        } else if !record.command.is_empty() && record.command != entry.command {
+            problem(
+                "command is not empty and differs from the journal record",
+                &mut problems,
+            );
         } else if record.cwd != entry.cwd {
             problem("cwd does not match the journal record", &mut problems);
         } else {

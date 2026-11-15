@@ -2793,6 +2793,59 @@ fn journal_record_reference_resolves_multiline_command() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn journal_record_reference_accepts_exact_matching_command() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let script = "printf 'a\\n'\n\nprintf 'b\\n'";
+    let (_temp, journals) = journal_record_reference_fixture(script);
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let line = entries.len() as u64;
+    let entry = entries.last().unwrap();
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.command = entry.command.clone();
+    record.cwd = entry.cwd.clone();
+    record.journal_record = Some(JournalRecordReference {
+        line,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
+    report.worker_reports[0].commands_run = vec![record];
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("journal-record-reference.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(report.accepted, "{}", finding_messages(&report));
+    assert_eq!(
+        &report.worker_reports[0].commands_run[0].command,
+        &entry.command
+    );
+
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.command = entry.command.clone();
+    record.cwd = PathBuf::from("/nonexistent-cwd");
+    record.journal_record = Some(JournalRecordReference {
+        line,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
+    report.worker_reports[0].commands_run = vec![record];
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("journal-record-reference.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(!report.accepted);
+    assert!(finding_messages(&report).contains("journal_record"));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn journal_record_reference_rejects_invalid_references() {
     let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
     let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'\n\nprintf 'b\\n'");
