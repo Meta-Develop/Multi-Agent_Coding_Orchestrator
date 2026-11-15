@@ -17,8 +17,8 @@ state from inside the unit namespace, and releases the target only after the hos
 report and the effective systemd properties. Workspace and artifact trees are bounded-scanned
 before setup and immediately before release. Sockets, FIFOs, device nodes, cross-filesystem
 subtrees, and hard-link aliases outside writable roots are rejected. Creation of sockets,
-FIFOs/device nodes, mounts, namespaces, and privileged kernel interfaces is denied as
-appropriate to the profile.
+device nodes, mounts, namespaces, and privileged kernel interfaces is denied as appropriate to the
+profile.
 Hard-link creation (`link`/`linkat`) is allowed, so Cargo hard-links build scripts into its target
 directory instead of copying them. With copies, a child process forked while a copy was still open
 could make Cargo's next exec of that build script fail with `Text file busy (os error 26)` (#939).
@@ -27,6 +27,12 @@ within one writable mount, and the bounded scans above still reject hard-link al
 writable roots. If a cargo command still fails with that error, Workers rerun that one invocation
 once through the journal wrapper and report both runs; a repeated failure is reported as a
 `sandbox_unavailable` environment failure.
+
+FIFO creation (`mknod`/`mknodat`, which `mkfifo` uses) is allowed, so repository tests that
+create FIFOs pass inside Worker validation (#1007). Contained units hold no capabilities
+(`CapabilityBoundingSet=` is empty) and run with `PrivateUsers=yes` and `PrivateDevices=yes`,
+so the kernel still refuses character and block device nodes, and the bounded scans above
+still reject FIFOs and other special files in the scanned trees.
 
 The verified profiles clear ambient environment variables, use fixed executable search paths,
 request private IPC/devices/temporary storage, mask user-systemd, D-Bus, credential, container,
