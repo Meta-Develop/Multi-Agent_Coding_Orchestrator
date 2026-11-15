@@ -992,7 +992,7 @@ pub(crate) fn load_codex_runtime_model_catalog_authorized(
 struct PreparedCodexRuntimeModelCatalogProcess {
     resolved_program: PathBuf,
     program_identity: ExternalProgramIdentity,
-    auth: ValidatedCodexAuth,
+    auth: Option<ValidatedCodexAuth>,
     process_spec: ProcessSpec,
 }
 
@@ -1054,11 +1054,9 @@ fn prepare_codex_runtime_model_catalog_process(
         validate_packaged_runtime_visibility(&resolved_program)?;
         let program_identity = external_program_identity(&resolved_program)
             .context(CodexRuntimeModelCatalogFailureCause::ExecutableIdentityFailed)?;
-        let auth = ValidatedCodexAuth::load()
-            .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?
-            .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
-        auth.verify_source_unchanged()
-            .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
+        let cam_managed = codex_launch_credentials_are_cam_managed()
+            .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?;
+        let auth = codex_runtime_model_catalog_auth(cam_managed)?;
 
         let (spec_program, spec_parent, grant) = match grant {
             Some(grant) => {
@@ -1095,10 +1093,13 @@ fn prepare_codex_runtime_model_catalog_process(
         .with_timeout(Some(timeout))
         .with_private_runtime_home(true)
         .with_private_runtime_codex_home(true)
-        .with_private_runtime_file("auth.json", auth.bytes.clone())
         .with_side_effect_confinement(SideEffectConfinementProfile::ExternalCodex(
             ExternalCodexProfile::read_only(&spec_parent),
         ));
+        let process_spec = match &auth {
+            Some(auth) => process_spec.with_private_runtime_file("auth.json", auth.bytes.clone()),
+            None => process_spec,
+        };
 
         Ok((
             PreparedCodexRuntimeModelCatalogProcess {
@@ -1110,6 +1111,47 @@ fn prepare_codex_runtime_model_catalog_process(
             grant,
         ))
     }
+}
+
+/// Whether CAM governs Codex launch credentials on this host (#1022).
+///
+/// Uses the selection source order of the scheduler: a configured CAM authority
+/// socket, otherwise a selected Codex account in the local CAM registry. Role
+/// launches then read the selected account home, never the ambient credential.
+#[cfg(target_os = "linux")]
+fn codex_launch_credentials_are_cam_managed() -> Result<bool> {
+    if crate::account_authority::configured_cam_authority_socket().is_some() {
+        return Ok(true);
+    }
+    let Some(data_dir) = coding_agent_manager_lib::paths::project_dirs() else {
+        return Ok(false);
+    };
+    let registry = coding_agent_manager_lib::account_authority::StoredAccountRegistry::new(
+        coding_agent_manager_lib::paths::stored_accounts_path(data_dir.data_dir()),
+    );
+    let selected = registry
+        .selected_binding(crate::account_authority::CODEX_CLI_PROVIDER_ID)
+        .context("failed to read selected Coding Agent Manager Codex account")?;
+    Ok(selected.is_some())
+}
+
+/// Credential for the Codex runtime model catalog preflight (#1022).
+///
+/// Under CAM the preflight runs `codex debug models` without any credential, so
+/// it neither requires an unused ambient `auth.json` nor rotates its refresh
+/// token in a discarded copy. Otherwise the validated ambient credential is
+/// still required.
+#[cfg(target_os = "linux")]
+fn codex_runtime_model_catalog_auth(cam_managed: bool) -> Result<Option<ValidatedCodexAuth>> {
+    if cam_managed {
+        return Ok(None);
+    }
+    let auth = ValidatedCodexAuth::load()
+        .context(CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)?
+        .context(CodexAuthValidationFailureCause::AuthFileMissing)?;
+    auth.verify_source_unchanged()
+        .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed)?;
+    Ok(Some(auth))
 }
 
 fn bind_catalog_preflight_grant(
@@ -1152,9 +1194,12 @@ fn execute_prepared_codex_runtime_model_catalog(
     let result = (|| {
         let current_identity = external_program_identity(&resolved_program)
             .context(CodexRuntimeModelCatalogFailureCause::ExecutableRevalidationFailed)?;
-        let auth_result = auth
-            .verify_source_unchanged()
-            .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed);
+        let auth_result = match &auth {
+            Some(auth) => auth
+                .verify_source_unchanged()
+                .context(CodexRuntimeModelCatalogFailureCause::AuthRevalidationFailed),
+            None => Ok(()),
+        };
         if current_identity != program_identity {
             return Err(CodexRuntimeModelCatalogFailureCause::ExecutableChanged.into());
         }
@@ -8318,6 +8363,48 @@ fn duration_millis(duration: Duration) -> u64 {
         u64::MAX
     } else {
         millis as u64
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod runtime_model_catalog_auth_tests {
+    use super::*;
+    use crate::account_authority::authority_socket_config::CamAuthoritySocketTestGuard;
+
+    #[test]
+    fn cam_managed_catalog_preflight_reads_no_credential() -> Result<()> {
+        let previous =
+            set_injected_codex_auth_home_for_test(Some(PathBuf::from("synthetic-relative-home")));
+        let auth = codex_runtime_model_catalog_auth(true);
+        set_injected_codex_auth_home_for_test(previous);
+        assert!(auth?.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn unmanaged_catalog_preflight_still_requires_validated_ambient_auth() {
+        let previous =
+            set_injected_codex_auth_home_for_test(Some(PathBuf::from("synthetic-relative-home")));
+        let auth = codex_runtime_model_catalog_auth(false);
+        set_injected_codex_auth_home_for_test(previous);
+        let error = auth.unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<CodexRuntimeModelCatalogFailureCause>(),
+            Some(&CodexRuntimeModelCatalogFailureCause::AuthValidationFailed)
+        );
+        assert_eq!(
+            error.downcast_ref::<CodexAuthValidationFailureCause>(),
+            Some(&CodexAuthValidationFailureCause::HomeNotAbsolute)
+        );
+    }
+
+    #[test]
+    fn configured_cam_socket_marks_codex_launch_credentials_cam_managed() -> Result<()> {
+        let _socket = CamAuthoritySocketTestGuard::install(Some(std::ffi::OsStr::new(
+            "/nonexistent/maco-1022/account-authority.sock",
+        )));
+        assert!(codex_launch_credentials_are_cam_managed()?);
+        Ok(())
     }
 }
 

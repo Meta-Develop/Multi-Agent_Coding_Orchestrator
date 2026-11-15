@@ -152,8 +152,10 @@ Prerequisites:
 - For the Codex-only command below, pass the canonical trusted file as
   `--runtime-bin`. Logical `--codex-bin codex` is also supported for ordinary
   routing; an absolute path must canonicalize to the same trusted file.
-- Catalog preflight runs `codex debug models` once, with a 30 second limit,
-  and requires a validated `auth.json`.
+- Catalog preflight runs `codex debug models` once, with a 30 second limit.
+  When CAM governs Codex credentials (a configured CAM authority socket, or a
+  selected Codex account in the local CAM registry), it runs without any
+  credential; otherwise it requires a validated `auth.json`.
 - Unset `MACO_CAM_AUTHORITY_SOCKET` and `CODEX_HOME`. With the
   socket unset, a local CAM registry selection is used when one exists.
   Otherwise Codex reads `$CODEX_HOME/auth.json`, or `$HOME/.codex/auth.json`
