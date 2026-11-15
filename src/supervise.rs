@@ -256,6 +256,7 @@ pub(crate) fn live_quota_concurrency_bound(
 mod plan_api;
 pub use plan_api::*;
 mod assignment_shape;
+mod depth_record;
 pub use assignment_shape::{
     AssignmentDelegation, AssignmentEffects, AssignmentShapeDeclaration, ValidatedAssignmentShape,
 };
