@@ -959,6 +959,7 @@ mod task_routing_lowering_tests {
 
     #[test]
     fn authored_run_cli_ceilings_refuse_before_loaded_plan_gate_or_artifacts() {
+        skip_without_containment!();
         for limits in [
             RunBudgetLimits {
                 soft_tokens: Some(1_000_000),
