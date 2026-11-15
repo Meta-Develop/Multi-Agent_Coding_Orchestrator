@@ -2265,13 +2265,19 @@ has only the deterministic-fake evaluation boundary described above; Issue
 
 Before a verified Codex run schedules any assignment, MACO invokes the trusted
 system Codex CLI's non-bundled `codex debug models` command exactly once. The
-preflight requires a validated `auth.json`, runs in the contained parent-Codex
-network profile with a private `HOME` and `CODEX_HOME`, bounds and validates the
-JSON catalog, and rechecks both the auth source and executable identity after
-the command. Explicit custom executables never receive auth or provider network
-access. Missing auth, a failed/nonzero command, unsafe containment, truncated or
-malformed output, an empty catalog, duplicate slugs, or invalid slug syntax
-fails closed before any child or auditor dispatch.
+preflight runs in the contained parent-Codex network profile with a private
+`HOME` and `CODEX_HOME`, bounds and validates the JSON catalog, and rechecks the
+executable identity after the command. When CAM governs Codex credentials (a
+configured CAM authority socket, or a selected Codex account in the local CAM
+registry), role launches read the selected account home and never the ambient
+`~/.codex` credential. The preflight then runs without any credential and
+reports the catalog bundled with the trusted executable: it neither requires an
+ambient `auth.json` nor refreshes a token in a discarded copy. Otherwise it
+requires a validated ambient `auth.json` and also rechecks that auth source
+after the command. Explicit custom executables never receive auth or provider
+network access. Missing required auth, a failed/nonzero command, unsafe
+containment, truncated or malformed output, an empty catalog, duplicate slugs,
+or invalid slug syntax fails closed before any child or auditor dispatch.
 
 Exact slug membership in that immutable per-run catalog determines availability
 for child and auditor command construction. A present slug remains explicit in
