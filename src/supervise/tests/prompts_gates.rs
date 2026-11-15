@@ -2264,16 +2264,16 @@ fn consecutive_warning_validation_does_not_reenter_parent_auditor() {
 }
 
 #[test]
-fn repeated_error_validation_keeps_existing_correction_bound() {
+fn repeated_error_validation_on_unchanged_candidate_stops_before_unused_correction() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
-    let (report, child_invocations, _) = run_validation_repair_script(
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
         &temp,
         &repo_path,
         &assignment,
         2,
-        "error-validation-existing-bound",
+        "error-validation-repeat-stop",
         |_, assignment| {
             injected_failed_validation_report(
                 assignment,
@@ -2283,20 +2283,35 @@ fn repeated_error_validation_keeps_existing_correction_bound() {
             )
         },
     );
-    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
+    let child = report
+        .orchestrator_reports
+        .first()
+        .expect("child orchestrator report");
+    assert!(child
+        .findings
+        .iter()
+        .any(|finding| finding.message.starts_with("validation repair stopped")));
 }
 
 #[test]
-fn distinct_error_messages_do_not_claim_identical_failure_narrowing() {
+fn distinct_error_messages_on_unchanged_candidate_still_stop_as_repeat() {
     skip_without_containment!();
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);
-    let (report, child_invocations, _) = run_validation_repair_script(
+    let (report, child_invocations, auditor_invocations) = run_validation_repair_script(
         &temp,
         &repo_path,
         &assignment,
         2,
-        "distinct-error-messages-no-identical-claim",
+        "distinct-error-messages-repeat-stop",
         |invocation, assignment| {
             injected_failed_validation_report(
                 assignment,
@@ -2306,7 +2321,14 @@ fn distinct_error_messages_do_not_claim_identical_failure_narrowing() {
             )
         },
     );
-    assert_existing_never_passing_bound(&report, child_invocations, 3, 2);
+    assert_warning_streak_stop(
+        &report,
+        child_invocations,
+        auditor_invocations,
+        2,
+        1,
+        GateApplyBlocker::ValidationFailed,
+    );
 }
 
 #[test]
