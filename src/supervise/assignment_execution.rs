@@ -6265,6 +6265,62 @@ fn validation_floor_from_results(
     }
 }
 
+/// Deterministic identity of one failed validation-repair cycle (#1026): the
+/// content of every assigned path in the child worktree plus the sorted failed
+/// validation commands. Worker-authored message text is excluded. Returns None
+/// when no validation failed or an assigned path is neither a regular file nor
+/// absent, so that the existing correction bound applies unchanged.
+fn validation_repair_failure_signature(
+    worktree: &Path,
+    assigned_paths: &[PathBuf],
+    results: &[ValidationResult],
+) -> Option<String> {
+    let mut failed = results
+        .iter()
+        .filter(|result| validation_failed(result))
+        .map(|result| {
+            if result.command.is_empty() {
+                format!("name:{}", result.name)
+            } else {
+                format!("command:{}", result.command.join("\u{1f}"))
+            }
+        })
+        .collect::<Vec<_>>();
+    if failed.is_empty() {
+        return None;
+    }
+    failed.sort();
+    failed.dedup();
+    let mut material = b"maco-validation-repair-v1\n".to_vec();
+    for path in assigned_paths {
+        material.extend_from_slice(path.to_string_lossy().as_bytes());
+        material.push(0);
+        let full = worktree.join(path);
+        match fs::symlink_metadata(full.as_path()) {
+            Ok(metadata) if metadata.is_file() => {
+                let content = fs::read(full.as_path()).ok()?;
+                let Ok(blob) = git2::Oid::hash_object(git2::ObjectType::Blob, &content) else {
+                    return None;
+                };
+                material.extend_from_slice(blob.to_string().as_bytes());
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                material.extend_from_slice(b"missing");
+            }
+            _ => return None,
+        }
+        material.push(b'\n');
+    }
+    for entry in &failed {
+        material.extend_from_slice(entry.as_bytes());
+        material.push(b'\n');
+    }
+    let Ok(digest) = git2::Oid::hash_object(git2::ObjectType::Blob, &material) else {
+        return None;
+    };
+    Some(format!("validation-repair:{digest}"))
+}
+
 fn consecutive_warning_validation_repair_should_stop(
     plan: &SupervisorPlan,
     outcome: &AssignmentExecutionOutcome,
@@ -6272,6 +6328,7 @@ fn consecutive_warning_validation_repair_should_stop(
     attempt_report: &OrchestratorReviewReport,
     structural_attempt: usize,
     current_depth: u8,
+    failure_signature: Option<String>,
 ) -> bool {
     use crate::loop_guard::{
         CascadeBreakerView, ExistingRoundLimits, LoopCycleObservation, LoopFindingSeverity,
@@ -6301,9 +6358,14 @@ fn consecutive_warning_validation_repair_should_stop(
         .map(|gate_tracker| gate_tracker.used)
         .unwrap_or(0);
     let used_child_retries = u8::try_from(structural_attempt.saturating_sub(1)).unwrap_or(u8::MAX);
+    let severity = if failure_signature.is_some() {
+        LoopFindingSeverity::Error
+    } else {
+        LoopFindingSeverity::Warning
+    };
     let Ok(observation) = LoopCycleObservation::new(
-        Some(LoopFindingSeverity::Warning),
-        None,
+        Some(severity),
+        failure_signature,
         validation_floor_from_results(&attempt_report.validation_results),
     ) else {
         return true;
@@ -6685,7 +6747,19 @@ fn decide_child_attempt(
             let highest = highest_loop_finding_severity(&attempt_report);
             let eligible_warning = highest == Some(crate::loop_guard::LoopFindingSeverity::Warning)
                 && plan.max_gate_corrections > 0;
-            if eligible_warning {
+            let eligible_error = highest == Some(crate::loop_guard::LoopFindingSeverity::Error)
+                && plan.max_gate_corrections > 0;
+            let repeat_signature = if eligible_error {
+                validation_repair_failure_signature(
+                    &preflight.worktree.path,
+                    &assignment.assigned_paths,
+                    &attempt_report.validation_results,
+                )
+            } else {
+                None
+            };
+            let repeat_guarded = repeat_signature.is_some();
+            if eligible_warning || repeat_guarded {
                 let current_depth = context
                     .assignment_schedule
                     .get(context.index)
@@ -6698,7 +6772,16 @@ fn decide_child_attempt(
                     &attempt_report,
                     *structural_attempt,
                     current_depth,
+                    repeat_signature,
                 ) {
+                    if repeat_guarded {
+                        attempt_report.findings.push(Finding {
+                            severity: FindingSeverity::Error,
+                            message: "validation repair stopped: this correction attempt returned the same assigned-path content and the same failed validations as the previous attempt"
+                                .to_string(),
+                            paths: assignment.assigned_paths.clone(),
+                        });
+                    }
                     attempt_report.status = ReviewStatus::Failed;
                     attempt_report.accepted = false;
                     attempt_report.rejected = true;
@@ -6736,7 +6819,7 @@ fn decide_child_attempt(
                     &mut outcome.health_signals,
                 )?;
             if let Some(authorized_denial) = authorized_denial {
-                if eligible_warning {
+                if eligible_warning || repeat_guarded {
                     *warning_streak = warning_streak_state;
                 }
                 *retry_feedback = Some(ChildAttemptCorrection::ValidationGate(
@@ -9234,6 +9317,54 @@ mod decomposition_tests {
     use std::os::unix::fs::PermissionsExt;
     #[cfg(target_os = "linux")]
     use std::time::Instant;
+    #[test]
+    fn validation_repair_failure_signature_tracks_candidate_content_and_failed_commands() {
+        let temp = tempfile::tempdir().expect("temporary signature worktree");
+        let assigned = [PathBuf::from("README.md")];
+        fs::write(temp.path().join("README.md"), "first candidate\n").expect("write candidate");
+        let failed = |command: &[&str], message: &str| ValidationResult {
+            name: "tests".to_string(),
+            status: ReviewStatus::Failed,
+            command: command.iter().map(|part| part.to_string()).collect(),
+            message: Some(message.to_string()),
+        };
+        let passed = ValidationResult {
+            name: "fmt".to_string(),
+            status: ReviewStatus::Succeeded,
+            command: vec!["cargo".to_string(), "fmt".to_string()],
+            message: None,
+        };
+        let results = [failed(&["cargo", "test"], "first message"), passed.clone()];
+        let first = validation_repair_failure_signature(temp.path(), &assigned, &results)
+            .expect("signature for a failed validation");
+        assert!(first.starts_with("validation-repair:"));
+        assert!(first.len() <= crate::loop_guard::MAX_FAILURE_SIGNATURE_BYTES);
+        let reworded = [passed.clone(), failed(&["cargo", "test"], "second message")];
+        assert_eq!(
+            validation_repair_failure_signature(temp.path(), &assigned, &reworded),
+            Some(first.clone())
+        );
+        let other_command = [failed(&["cargo", "test", "--lib"], "first message")];
+        assert_ne!(
+            validation_repair_failure_signature(temp.path(), &assigned, &other_command),
+            Some(first.clone())
+        );
+        fs::write(temp.path().join("README.md"), "second candidate\n").expect("rewrite candidate");
+        assert_ne!(
+            validation_repair_failure_signature(temp.path(), &assigned, &results),
+            Some(first)
+        );
+        assert_eq!(
+            validation_repair_failure_signature(temp.path(), &assigned, &[passed]),
+            None
+        );
+        fs::create_dir(temp.path().join("dir")).expect("create directory path");
+        assert_eq!(
+            validation_repair_failure_signature(temp.path(), &[PathBuf::from("dir")], &results),
+            None
+        );
+    }
+
     #[test]
     fn evidence_correction_allowed_only_for_budgeted_ordinary_evidence_rejections() {
         assert!(evidence_quality_correction_allowed(
