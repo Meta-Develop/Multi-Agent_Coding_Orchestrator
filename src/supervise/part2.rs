@@ -483,6 +483,23 @@ impl DispatchBudgetReservation<'_> {
                     }),
                 )
                 .context("failed to reconcile started dispatch budget reservation")?;
+            // A Worker launch without a live budget grant (for example Vibe) has
+            // no dispatch binding; retain its parent-held identity instead (#1058).
+            let unbound_identity = command.agent_lifecycle.as_ref().filter(|_| {
+                self.reservation.role == AgentRole::Worker
+                    && launch_runtime != SupervisorRuntime::Codex
+                    && invocation.is_none()
+                    && reliability == DispatchUsageReliability::Reliable
+            });
+            if let Some(identity) = unbound_identity {
+                self.ledger
+                    .record_unbound_worker_settlement(
+                        self.reservation.id,
+                        &identity.task_id,
+                        identity.parent.as_deref(),
+                    )
+                    .context("failed to record the unbound Worker settlement")?;
+            }
             DispatchUsageSettlement {
                 observed_usage: usage,
                 reliability,

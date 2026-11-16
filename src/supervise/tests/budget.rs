@@ -1,6 +1,81 @@
 use super::*;
 
 #[test]
+fn unbound_nested_worker_settlement_counts_as_observed_usage() -> Result<()> {
+    fn settled_worker(
+        ledger: &RunBudgetLedger,
+        tokens: Option<usize>,
+    ) -> Result<BudgetReservation> {
+        let reservation = match ledger.reserve(BudgetReservationRequest {
+            role: AgentRole::Worker,
+            tokens: 1_000,
+            cost_usd: None,
+        })? {
+            BudgetAdmission::Admitted { reservation, .. } => reservation,
+            BudgetAdmission::Refused { .. } => bail!("Worker reservation refused"),
+        };
+        let measurement = match tokens {
+            Some(tokens) => UsageMeasurement::Reliable {
+                tokens,
+                cost_usd: None,
+            },
+            None => UsageMeasurement::Missing,
+        };
+        ledger.reconcile(reservation.id, measurement)?;
+        Ok(reservation)
+    }
+    let plan: SupervisorPlan = serde_json::from_value(json!({
+        "version": SUPERVISOR_SCHEMA_VERSION, "task": "unbound Worker usage",
+        "max_depth": 2, "max_child_assignments": 1, "max_child_retries": 0,
+        "max_gate_corrections": 0, "child_timeout_seconds": 10,
+        "semantic_coordination": "off",
+        "assignments": [{"id": "parent", "phase": "execution", "role": "child_orchestrator",
+            "assigned_paths": ["src"], "task": "parent task",
+            "worker_assignments": [{"id": "worker", "role": "worker",
+                "assigned_paths": ["src/lib.rs"], "task": "worker task", "report_path": "worker.json"}]}],
+        "role_models": {
+            "child_orchestrator": {"model": "gpt-6.1-sol", "reasoning_effort": "high"},
+            "worker": {"model": "gpt-6.1-sol", "reasoning_effort": "high"},
+            "auditor": {"model": "gpt-6.1-sol", "reasoning_effort": "high"}
+        }
+    }))?;
+    let lacks = |ledger: &RunBudgetLedger| -> Result<bool> {
+        Ok(super::super::scheduler::nested_workers_lack_observed_usage(
+            &plan,
+            Some(&ledger.report()?),
+            &ledger.unbound_worker_settlements()?,
+        ))
+    };
+
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let reservation = settled_worker(&ledger, Some(700))?;
+    assert!(
+        lacks(&ledger)?,
+        "a settled charge alone does not name its Worker"
+    );
+    assert!(ledger.record_unbound_worker_settlement(reservation.id, "worker", Some("parent"))?);
+    assert!(!lacks(&ledger)?);
+    assert!(!ledger.record_unbound_worker_settlement(reservation.id, "worker", Some("parent"))?);
+
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let reservation = settled_worker(&ledger, Some(700))?;
+    assert!(ledger.record_unbound_worker_settlement(reservation.id, "worker", Some("other"))?);
+    assert!(
+        lacks(&ledger)?,
+        "a settlement under another parent is not this Worker's"
+    );
+
+    let ledger = RunBudgetLedger::new(RunBudgetLimits::default())?;
+    let reservation = settled_worker(&ledger, None)?;
+    assert!(!ledger.record_unbound_worker_settlement(reservation.id, "worker", Some("parent"))?);
+    assert!(
+        lacks(&ledger)?,
+        "an incomplete settlement is never recorded"
+    );
+    Ok(())
+}
+
+#[test]
 fn nested_budget_qualification_ceiling_preserves_candidate_then_exhaustion() -> Result<()> {
     let (_temporary, repo) = injected_repository();
     let loaded = plan_api::parse_supervisor_plan_with_consultant_in_repo(

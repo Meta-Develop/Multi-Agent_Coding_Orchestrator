@@ -696,11 +696,21 @@ struct AttachedRollingBudget {
     quota_pools: BTreeMap<String, PoolKey>,
 }
 
+/// The parent-held identity of a settled terminal Worker dispatch that has no
+/// live budget binding, for example a Vibe Worker (#1058).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub(super) struct UnboundWorkerSettlement {
+    pub(super) reservation_id: u64,
+    pub(super) assignment_id: String,
+    pub(super) parent_id: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 struct LedgerState {
     charges: Vec<BudgetChargeReport>,
     dispatch_bindings: BTreeMap<BudgetReservationId, BudgetDispatchBinding>,
     durable_dispatches: BTreeSet<BudgetReservationId>,
+    unbound_worker_settlements: BTreeSet<UnboundWorkerSettlement>,
     next_reservation_id: u64,
     active: BTreeMap<BudgetReservationId, BudgetReservation>,
     live_grants: BTreeMap<BudgetReservationId, usize>,
@@ -723,6 +733,7 @@ impl Default for LedgerState {
             charges: Vec::new(),
             dispatch_bindings: BTreeMap::new(),
             durable_dispatches: BTreeSet::new(),
+            unbound_worker_settlements: BTreeSet::new(),
             next_reservation_id: 1,
             active: BTreeMap::new(),
             live_grants: BTreeMap::new(),
@@ -1321,6 +1332,45 @@ impl RunBudgetLedger {
             binding.turn_id = turn_id;
         }
         Ok(binding.invocation_verified)
+    }
+
+    /// Records the parent-held identity of a settled terminal Worker dispatch
+    /// without a live budget binding. Records nothing, and returns false, unless
+    /// the reservation is settled with a complete Worker charge and has no
+    /// dispatch binding (#1058).
+    pub(super) fn record_unbound_worker_settlement(
+        &self,
+        id: BudgetReservationId,
+        assignment_id: &str,
+        parent_id: Option<&str>,
+    ) -> Result<bool> {
+        let mut state = self.lock_state()?;
+        if state.dispatch_bindings.contains_key(&id)
+            || state.active.contains_key(&id)
+            || !state.charges.iter().any(|charge| {
+                charge.reservation_id == id.get()
+                    && charge.role == AgentRole::Worker
+                    && charge.usage_complete
+            })
+        {
+            return Ok(false);
+        }
+        Ok(state
+            .unbound_worker_settlements
+            .insert(UnboundWorkerSettlement {
+                reservation_id: id.get(),
+                assignment_id: assignment_id.to_string(),
+                parent_id: parent_id.map(str::to_string),
+            }))
+    }
+
+    pub(super) fn unbound_worker_settlements(&self) -> Result<Vec<UnboundWorkerSettlement>> {
+        Ok(self
+            .lock_state()?
+            .unbound_worker_settlements
+            .iter()
+            .cloned()
+            .collect())
     }
 
     /// Called only after the admission is present in the authenticated journal.
