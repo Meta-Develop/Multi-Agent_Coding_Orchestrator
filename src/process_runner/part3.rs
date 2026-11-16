@@ -278,6 +278,8 @@ struct SystemdUnit {
     launcher_completed: bool,
     observed_owned: bool,
     cleaned: bool,
+    // app.slice memory.events oom_kill counter read when the unit was prepared (#1000).
+    oom_kill_baseline: Option<u64>,
 }
 
 #[cfg(target_os = "linux")]
@@ -560,6 +562,7 @@ impl SystemdUnit {
             .to_string_lossy()
             .into_owned();
         let cgroup_path = manager_path.join("app.slice").join(&name);
+        let oom_kill_baseline = cgroup_oom_kill_count(&manager_path.join("app.slice"));
         let runtime_dir = client_runtime
             .clone()
             .join(format!("maco-process-{runner_pid}-{sequence}"));
@@ -615,6 +618,7 @@ impl SystemdUnit {
             launcher_completed: false,
             observed_owned: false,
             cleaned: false,
+            oom_kill_baseline,
         })
     }
 
@@ -1537,6 +1541,22 @@ impl SystemdUnit {
             } else {
                 None
             };
+        // A failed or interrupted unit names an OOM kill seen in its slice (#1000).
+        let oom_failure = if context != "normal process-tree finalization"
+            || _child
+                .try_wait()
+                .ok()
+                .flatten()
+                .is_some_and(|status| !status.success())
+        {
+            let before = self.oom_kill_baseline.take();
+            self.cgroup_path.parent().and_then(|slice| {
+                let after = cgroup_oom_kill_count(slice);
+                oom_kill_failure_message(label, &self.name, slice, before, after)
+            })
+        } else {
+            None
+        };
         let mut error = self.kill_and_verify(label, context).err().map(|error| {
             format!(
                 "{label} {context} could not verify empty systemd containment unit {}: {error}",
@@ -1573,7 +1593,7 @@ impl SystemdUnit {
             side_effects: SideEffectConfinementEvidence::Unverified(
                 SideEffectConfinementProfileKind::TrustedCompatibility,
             ),
-            error: append_error(error, native_failure),
+            error: append_error(append_error(error, native_failure), oom_failure),
         }
     }
 
@@ -2078,6 +2098,42 @@ fn cgroup_populated_from_events_read(
 #[cfg(target_os = "linux")]
 fn cgroup_populated(path: &Path) -> std::io::Result<Option<bool>> {
     cgroup_populated_from_events_read(fs::read_to_string(path.join("cgroup.events")))
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_oom_kill_count_from_events(events: &str) -> Option<u64> {
+    events
+        .lines()
+        .find_map(|line| line.strip_prefix("oom_kill "))
+        .and_then(|value| value.trim().parse().ok())
+}
+
+#[cfg(target_os = "linux")]
+fn cgroup_oom_kill_count(path: &Path) -> Option<u64> {
+    fs::read_to_string(path.join("memory.events"))
+        .ok()
+        .and_then(|events| cgroup_oom_kill_count_from_events(&events))
+}
+
+// memory.events is hierarchical in cgroup v2, so a slice counter also counts kills in sibling
+// units; the message therefore says "likely" instead of naming this unit as the victim (#1000).
+#[cfg(target_os = "linux")]
+fn oom_kill_failure_message(
+    label: &str,
+    unit: &str,
+    slice: &Path,
+    before: Option<u64>,
+    after: Option<u64>,
+) -> Option<String> {
+    let (before, after) = (before?, after?);
+    (after > before).then(|| {
+        format!(
+            "{label} was likely killed by the OOM killer: memory.events oom_kill of {} rose \
+             from {before} to {after} while systemd containment unit {unit} ran (the slice \
+             counter also counts other units)",
+            slice.display()
+        )
+    })
 }
 
 #[cfg(unix)]

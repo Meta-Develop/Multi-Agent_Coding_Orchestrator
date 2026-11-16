@@ -504,6 +504,41 @@ fn vanished_cgroup_enodev_is_absent_not_a_stuck_owner() {
     assert_eq!(permission.kind(), std::io::ErrorKind::PermissionDenied);
 }
 
+#[cfg(target_os = "linux")]
+#[test]
+fn slice_oom_kill_increase_is_reported_for_a_failed_unit() {
+    let events = "low 0\nhigh 868\nmax 1552\noom 2\noom_kill 34\noom_group_kill 3\n";
+    assert_eq!(cgroup_oom_kill_count_from_events(events), Some(34));
+    assert_eq!(
+        cgroup_oom_kill_count_from_events("oom_group_kill 3\n"),
+        None
+    );
+    assert_eq!(cgroup_oom_kill_count_from_events("oom_kill x\n"), None);
+
+    let slice = tempfile::tempdir().expect("tempdir");
+    assert_eq!(cgroup_oom_kill_count(slice.path()), None);
+    fs::write(slice.path().join("memory.events"), events).expect("write memory.events");
+    assert_eq!(cgroup_oom_kill_count(slice.path()), Some(34));
+
+    let message = oom_kill_failure_message(
+        "worker",
+        "maco-process-1-2.service",
+        Path::new("/sys/fs/cgroup/app.slice"),
+        Some(33),
+        Some(34),
+    )
+    .expect("an increased oom_kill counter is reported");
+    assert!(message.contains("killed by the OOM killer"), "{message}");
+    assert!(message.contains("maco-process-1-2.service"), "{message}");
+    assert!(message.contains("from 33 to 34"), "{message}");
+    for (before, after) in [(Some(34), Some(34)), (None, Some(34)), (Some(33), None)] {
+        assert_eq!(
+            oom_kill_failure_message("worker", "unit", Path::new("/slice"), before, after),
+            None
+        );
+    }
+}
+
 #[cfg(unix)]
 fn assert_process_not_executable(pid: &str, context: &str) {
     let process_state = Command::new("ps")
@@ -3494,6 +3529,7 @@ fn systemd_unit_fixture(runtime: &Path, helper_search_path: Option<OsString>) ->
         launcher_completed: false,
         observed_owned: false,
         cleaned: false,
+        oom_kill_baseline: None,
     }
 }
 
