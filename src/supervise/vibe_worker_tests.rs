@@ -210,10 +210,10 @@ fn vibe_worker_admission_refuses_nested_worker_assignments() {
 #[test]
 fn vibe_worker_nested_launch_refusal_names_vibe() {
     let error = super::vibe_worker::refuse_nested_worker_launch()
-        .expect_err("nested Vibe Worker launch is never admitted");
+        .expect_err("a Vibe Worker under a runtime-native child bridge is never admitted");
     assert_eq!(
         error.to_string(),
-        "Vibe is not admitted for nested Worker assignments"
+        "Vibe is not admitted for Worker assignments under a runtime-native child bridge"
     );
 }
 
