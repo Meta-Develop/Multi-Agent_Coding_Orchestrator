@@ -1705,7 +1705,13 @@ impl SystemdUnit {
     }
 
     fn remove_runtime_files(&mut self) {
+        let staged_home = self.staged_codex_home.as_deref();
         for path in &self.runtime_file_paths {
+            // A staged Codex home outlives the unit: keep the final bytes of its published
+            // files in memory, so the parent can write rotated credentials back (#1040).
+            if staged_home.is_some() && path.parent() == staged_home {
+                retain_staged_codex_home_file(path);
+            }
             let _ = fs::remove_file(path);
         }
         let _ = fs::remove_file(&self.sandbox_report_path);
@@ -1722,6 +1728,57 @@ impl SystemdUnit {
             let _ = root.close();
         }
     }
+}
+
+/// Largest file published below a staged Codex home that teardown retains (#1040).
+#[cfg(target_os = "linux")]
+const RETAINED_STAGED_CODEX_HOME_FILE_MAX_BYTES: u64 = 1024 * 1024;
+
+#[cfg(target_os = "linux")]
+type RetainedStagedCodexHomeFiles = std::collections::BTreeMap<PathBuf, Vec<u8>>;
+
+/// Final bytes of files published below a staged Codex home, read at unit teardown just
+/// before their removal (#1040). The parent takes them by path to write rotated Codex
+/// credentials back; the files themselves still never outlive the unit.
+#[cfg(target_os = "linux")]
+static RETAINED_STAGED_CODEX_HOME_FILES: std::sync::Mutex<RetainedStagedCodexHomeFiles> =
+    std::sync::Mutex::new(RetainedStagedCodexHomeFiles::new());
+
+/// Reads one published staged-home file, bounded and without following symlinks, and
+/// retains its bytes by path. An unreadable, irregular or oversized file retains nothing.
+#[cfg(target_os = "linux")]
+fn retain_staged_codex_home_file(path: &Path) {
+    use std::io::Read as _;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let Ok(file) = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+    else {
+        return;
+    };
+    if !file.metadata().is_ok_and(|metadata| metadata.is_file()) {
+        return;
+    }
+    let mut bytes = Vec::new();
+    let limit = RETAINED_STAGED_CODEX_HOME_FILE_MAX_BYTES;
+    if file.take(limit + 1).read_to_end(&mut bytes).is_err() || bytes.len() as u64 > limit {
+        return;
+    }
+    RETAINED_STAGED_CODEX_HOME_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .insert(path.to_path_buf(), bytes);
+}
+
+/// Takes the bytes retained at unit teardown for one file published below a staged Codex
+/// home (#1040), or `None` when nothing was retained for that path.
+#[cfg(target_os = "linux")]
+pub(crate) fn take_retained_staged_codex_home_file(path: &Path) -> Option<Vec<u8>> {
+    RETAINED_STAGED_CODEX_HOME_FILES
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .remove(path)
 }
 
 #[cfg(target_os = "linux")]

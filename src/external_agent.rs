@@ -10674,11 +10674,19 @@ fn run_external_agent_runtime_inner(
         binding.attach_command_binding(&mut worker_journal_artifacts, &target_spec.cwd);
     }
     report.replace_worker_journal_artifacts(worker_journal_artifacts);
+    // Containment teardown removed the published staged auth file and retained its final
+    // bytes (#1040); take them for every staged home, so none stays retained.
+    #[cfg(target_os = "linux")]
+    let retained_staged_codex_auth = staged_codex_home.as_deref().and_then(|home| {
+        crate::process_runner::take_retained_staged_codex_home_file(&home.join("auth.json"))
+    });
     #[cfg(target_os = "linux")]
     let staged_codex_auth = match (&codex_auth_lease, staged_codex_home.as_deref()) {
-        (Some(_), Some(home)) if report.scratch_quiescence_verified() => {
-            codex_auth_writeback::capture_staged_codex_auth(home)
-        }
+        (Some(_), Some(home)) if report.scratch_quiescence_verified() => retained_staged_codex_auth
+            .map_or_else(
+                || codex_auth_writeback::capture_staged_codex_auth(home),
+                |bytes| Ok(Some(bytes)),
+            ),
         _ => Ok(None),
     };
     output_staging.record_target_quiescence(report.scratch_quiescence_verified());
