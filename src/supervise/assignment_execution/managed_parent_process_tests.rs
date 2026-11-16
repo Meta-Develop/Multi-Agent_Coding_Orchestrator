@@ -415,7 +415,8 @@ pub(super) fn exercise(
             assert!(
                 !super::super::scheduler::nested_workers_lack_observed_usage(
                     context.plan,
-                    Some(&budget)
+                    Some(&budget),
+                    &[]
                 )
             );
         }
@@ -612,7 +613,8 @@ pub(super) fn exercise(
                 assert!(
                     !super::super::scheduler::nested_workers_lack_observed_usage(
                         context.plan,
-                        Some(&budget)
+                        Some(&budget),
+                        &[]
                     )
                 );
                 let mut unverified = budget.clone();
@@ -623,7 +625,8 @@ pub(super) fn exercise(
                     .for_each(|b| b.invocation_verified = false);
                 assert!(super::super::scheduler::nested_workers_lack_observed_usage(
                     context.plan,
-                    Some(&unverified)
+                    Some(&unverified),
+                    &[]
                 ));
                 let mut missing = budget.clone();
                 missing
@@ -631,7 +634,8 @@ pub(super) fn exercise(
                     .retain(|b| b.invocation.assignment_id != "worker-two");
                 assert!(super::super::scheduler::nested_workers_lack_observed_usage(
                     context.plan,
-                    Some(&missing)
+                    Some(&missing),
+                    &[]
                 ));
                 let combined = collected
                     .attempt_report

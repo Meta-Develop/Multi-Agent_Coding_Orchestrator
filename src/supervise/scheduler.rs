@@ -2489,6 +2489,7 @@ struct SupervisorFinalReportConstruction<'context> {
 pub(super) fn nested_workers_lack_observed_usage(
     plan: &SupervisorPlan,
     budget: Option<&RunBudgetReport>,
+    unbound: &[crate::supervise_budget::UnboundWorkerSettlement],
 ) -> bool {
     plan.assignments.iter().any(|parent| {
         parent.worker_assignments.iter().any(|worker| {
@@ -2506,6 +2507,20 @@ pub(super) fn nested_workers_lack_observed_usage(
                                 && charge.role == AgentRole::Worker
                                 && charge.usage_complete
                                 && Some(charge.tokens) == binding.charged_tokens
+                        })
+                }) || unbound.iter().any(|settlement| {
+                    // A Worker launch without a live budget grant (for example
+                    // Vibe) is identified by its parent-held settlement (#1058).
+                    settlement.assignment_id == worker.id
+                        && settlement.parent_id.as_deref() == Some(parent.id.as_str())
+                        && !budget
+                            .dispatch_bindings
+                            .iter()
+                            .any(|binding| binding.reservation_id == settlement.reservation_id)
+                        && budget.charges.iter().any(|charge| {
+                            charge.reservation_id == settlement.reservation_id
+                                && charge.role == AgentRole::Worker
+                                && charge.usage_complete
                         })
                 })
             })
@@ -7700,7 +7715,14 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             (None, true)
         }
     };
-    if nested_workers_lack_observed_usage(&plan, run_budget_report.as_ref()) {
+    let unbound_worker_settlements = budget_ledger
+        .unbound_worker_settlements()
+        .unwrap_or_default();
+    if nested_workers_lack_observed_usage(
+        &plan,
+        run_budget_report.as_ref(),
+        &unbound_worker_settlements,
+    ) {
         collected.findings.push(Finding {
             severity: FindingSeverity::Warning,
             message: "separate process usage is unavailable for one or more authored Workers (unlaunched or without verified complete settlements); observed Worker settlements remain included in totals".into(),
