@@ -2846,6 +2846,77 @@ fn journal_record_reference_accepts_exact_matching_command() {
 
 #[cfg(target_os = "linux")]
 #[test]
+fn journal_record_reference_completes_omitted_journal_commands() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'");
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let line = entries.len() as u64;
+    let entry = entries.last().unwrap();
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    report.worker_reports[0].commands_run = Vec::new();
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("omitted-journal-command.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(report.accepted, "{}", finding_messages(&report));
+    let worker = &report.worker_reports[0];
+    assert_eq!(worker.commands_run.len(), 1);
+    let appended = &worker.commands_run[0];
+    assert_eq!(appended.command, entry.command);
+    assert_eq!(appended.cwd, entry.cwd);
+    assert_eq!(appended.status, ReviewStatus::Succeeded);
+    assert!(appended.stdout.is_empty() && appended.stderr.is_empty());
+    assert_eq!(
+        appended.journal_record,
+        Some(JournalRecordReference {
+            line,
+            start_timestamp: entry.start_timestamp.clone(),
+        })
+    );
+    assert!(worker.findings.iter().any(|finding| {
+        finding.severity == FindingSeverity::Info
+            && finding
+                .message
+                .contains("MACO appended 1 commands_run entries")
+    }));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn journal_record_reference_leaves_complete_commands_run_unchanged() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'");
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    let entry = entries.last().unwrap();
+    let assignment = injected_assignment(true);
+    let mut report = injected_child_report(&assignment);
+    let mut record = injected_command_record();
+    record.command = entry.command.clone();
+    record.cwd = entry.cwd.clone();
+    report.worker_reports[0].commands_run = vec![record.clone()];
+    validate_worker_execution_journal_evidence(
+        &assignment,
+        Path::new("complete-journal-commands.json"),
+        &journals,
+        &mut report,
+    );
+    assert!(report.accepted, "{}", finding_messages(&report));
+    assert_eq!(report.worker_reports[0].commands_run, vec![record]);
+    assert!(!report.worker_reports[0]
+        .findings
+        .iter()
+        .any(|finding| finding.message.contains("MACO appended")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn journal_record_reference_rejects_invalid_references() {
     let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
     let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'\n\nprintf 'b\\n'");
@@ -3240,7 +3311,18 @@ fn worker_journal_wrapper_direct_envelope_preserves_failed_command_metadata() {
         &mut report,
     );
     record.command = entry.command.clone();
-    assert_eq!(report.commands_run, vec![record]);
+    // The unreported completed record at line 2 is appended (#1053); the
+    // reported failed command keeps its metadata and is not duplicated.
+    assert_eq!(report.commands_run.len(), 2);
+    assert_eq!(report.commands_run[0], record);
+    assert_eq!(
+        report.commands_run[1]
+            .journal_record
+            .as_ref()
+            .map(|reference| reference.line),
+        Some(2)
+    );
+    assert_eq!(report.commands_run[1].status, ReviewStatus::Succeeded);
     assert_eq!(report.commands_run, report.worker_reports[0].commands_run);
     assert_eq!(report.validation_results[0].command, entry.command);
     assert_eq!(
@@ -3248,7 +3330,7 @@ fn worker_journal_wrapper_direct_envelope_preserves_failed_command_metadata() {
         report.worker_reports[0].validation_results
     );
     assert!(!finding_messages(&report).contains("commands_run entries are not supported"));
-    // Canonicalization is idempotent and does not add execution evidence.
+    // Canonicalization and journal completion are idempotent: a second pass adds nothing.
     let normalized = report.clone();
     validate_worker_execution_journal_evidence(
         &assignment,

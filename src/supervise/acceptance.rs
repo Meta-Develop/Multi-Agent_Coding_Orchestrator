@@ -3157,6 +3157,23 @@ pub(super) fn validate_worker_execution_journal_evidence(
             );
             blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
         }
+        // Complete evidence the Worker left out of its own journal (#1053).
+        let appended = append_omitted_journal_commands(&mut worker_report.commands_run, entries);
+        if !appended.is_empty() {
+            if assignment.role == AgentRole::Worker && !report.commands_run.is_empty() {
+                report.commands_run.extend(appended.iter().cloned());
+            }
+            worker_report.findings.push(Finding {
+                severity: FindingSeverity::Info,
+                message: format!(
+                    "MACO appended {} commands_run entries for completed or failed records of execution journal {} that worker '{}' did not report",
+                    appended.len(),
+                    journal.evidence_relative_path.display(),
+                    worker_report.id
+                ),
+                paths: vec![journal.evidence_relative_path.clone()],
+            });
+        }
         let journal_commands = entries
             .iter()
             .filter(|entry| {
@@ -3384,6 +3401,92 @@ fn canonicalize_journal_command_references(
         }
     }
     problems
+}
+
+/// Appends one commands_run entry for every completed or failed record of the
+/// Worker's own execution journal that no reported entry matches (#1053).
+/// A reported journal_record reference claims its record; the remaining
+/// entries match records one-to-one by argv, cwd and status in journal order;
+/// a completed record with a nonzero exit code is a failed command.
+/// Started records, native-edit observations and records without an
+/// observation are never appended. Returns the appended entries.
+fn append_omitted_journal_commands(
+    commands: &mut Vec<CommandRunRecord>,
+    entries: &[WorkerExecutionJournalEntry],
+) -> Vec<CommandRunRecord> {
+    let mut claimed = vec![false; entries.len()];
+    let mut used = vec![false; commands.len()];
+    for (position, record) in commands.iter().enumerate() {
+        let Some(index) = record
+            .journal_record
+            .as_ref()
+            .and_then(|reference| usize::try_from(reference.line).ok())
+            .and_then(|line| line.checked_sub(1))
+        else {
+            continue;
+        };
+        if index < entries.len() && !claimed[index] {
+            claimed[index] = true;
+            used[position] = true;
+        }
+    }
+    let mut appended = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let Some(observation) = entry.observation.as_ref() else {
+            continue;
+        };
+        let status = match observation.phase {
+            WorkerJournalObservationPhase::Completed => match observation.exit_code {
+                Some(0) | None => ReviewStatus::Succeeded,
+                Some(_) => ReviewStatus::Failed,
+            },
+            WorkerJournalObservationPhase::Failed => ReviewStatus::Failed,
+            WorkerJournalObservationPhase::Started | WorkerJournalObservationPhase::NativeEdit => {
+                continue
+            }
+        };
+        if claimed[index] {
+            continue;
+        }
+        if let Some(position) = commands.iter().zip(&used).position(|(record, used)| {
+            !*used
+                && record.command == entry.command
+                && record.cwd == entry.cwd
+                && record.status == status
+        }) {
+            used[position] = true;
+            continue;
+        }
+        let Ok(line) = u64::try_from(index + 1) else {
+            continue;
+        };
+        appended.push(CommandRunRecord {
+            command: entry.command.clone(),
+            cwd: entry.cwd.clone(),
+            exit_code: observation.exit_code,
+            status,
+            timeout_seconds: 0,
+            duration_ms: 0,
+            timed_out: false,
+            stdout: String::new(),
+            stderr: String::new(),
+            sandbox_denials: Vec::new(),
+            environment_preflight_results: Vec::new(),
+            environment_failures: Vec::new(),
+            error: None,
+            grok_stream_usage_evidence: None,
+            grok_acp_parent_evidence: None,
+            codex_parent_evidence: None,
+            runtime_identity: None,
+            fixed_version_probe_evidence: None,
+            journal_record: Some(JournalRecordReference {
+                line,
+                start_timestamp: entry.start_timestamp.clone(),
+            }),
+        });
+    }
+    commands.extend(appended.iter().cloned());
+    appended
 }
 
 fn mark_worker_report_structural_inconsistency(
