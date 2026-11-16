@@ -208,6 +208,38 @@ fn vibe_worker_admission_refuses_nested_worker_assignments() {
 }
 
 #[test]
+fn vibe_isolated_managed_parent_worker_subject_is_an_admitted_terminal_worker() {
+    let parent = assignment_with(json!({
+        "id": "managed-parent",
+        "role": "child_orchestrator",
+        "role_category": "delegating_coordinator",
+        "task": "parent task",
+        "worker_assignments": [nested_worker_assignment()],
+    }));
+    let worker = &parent.worker_assignments[0];
+    let subject = super::assignment_execution::isolated_worker_subject(
+        &parent,
+        worker,
+        SupervisorRuntime::Vibe,
+    );
+    assert_eq!(subject.id, "vibe-nested-worker");
+    assert_eq!(subject.phase, AssignmentPhase::Execution);
+    assert_eq!(subject.runtime, Some(SupervisorRuntime::Vibe));
+    assert_eq!(subject.role, AgentRole::Worker);
+    assert_eq!(
+        subject.effective_role_category(),
+        RoleCategory::NonDelegatingTerminalWorker
+    );
+    assert!(subject.worker_assignments.is_empty());
+    assert_eq!(subject.assigned_paths, worker.assigned_paths);
+    assert_eq!(subject.task.as_deref(), Some("parent task"));
+    validate_assignment(&subject, SupervisorRuntime::Vibe)
+        .expect("the isolated Worker subject is a direct terminal Vibe Worker");
+    validate_assignment(&parent, SupervisorRuntime::Vibe)
+        .expect_err("the delegating managed parent itself is never admitted for Vibe");
+}
+
+#[test]
 fn vibe_worker_nested_launch_refusal_names_vibe() {
     let error = super::vibe_worker::refuse_nested_worker_launch()
         .expect_err("a Vibe Worker under a runtime-native child bridge is never admitted");
