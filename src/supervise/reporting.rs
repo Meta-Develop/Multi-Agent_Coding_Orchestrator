@@ -1243,6 +1243,7 @@ fn environment_failure_category_name(category: EnvironmentFailureCategory) -> &'
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => {
             "runtime_model_catalog_unavailable"
         }
+        EnvironmentFailureCategory::OomKilled => "oom_killed",
     }
 }
 
@@ -1368,6 +1369,12 @@ fn sanitize_environment_failure(mut failure: EnvironmentFailure) -> EnvironmentF
             scope: EnvironmentRemediationScope::ProjectLocal,
             guidance:
                 "inspect the fixed preflight probe evidence and correct the project or host environment before rerunning"
+                    .to_string(),
+        }],
+        EnvironmentFailureCategory::OomKilled => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance:
+                "relaunch after the concurrent host memory pressure has ended; do not raise memory limits automatically"
                     .to_string(),
         }],
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => vec![

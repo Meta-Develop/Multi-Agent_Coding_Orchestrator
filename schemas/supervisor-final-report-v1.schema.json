@@ -1396,7 +1396,8 @@
                     "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
-                    "runtime_model_catalog_unavailable"
+                    "runtime_model_catalog_unavailable",
+                    "oom_killed"
                   ],
                   "type": "string"
                 },
@@ -2766,7 +2767,8 @@
               "missing_git_attribution",
               "sandbox_unavailable",
               "probe_failed",
-              "runtime_model_catalog_unavailable"
+              "runtime_model_catalog_unavailable",
+              "oom_killed"
             ],
             "type": "string"
           },
@@ -6779,7 +6781,8 @@
                                 "missing_git_attribution",
                                 "sandbox_unavailable",
                                 "probe_failed",
-                                "runtime_model_catalog_unavailable"
+                                "runtime_model_catalog_unavailable",
+                                "oom_killed"
                               ],
                               "type": "string"
                             },
@@ -8042,7 +8045,8 @@
                           "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
-                          "runtime_model_catalog_unavailable"
+                          "runtime_model_catalog_unavailable",
+                          "oom_killed"
                         ],
                         "type": "string"
                       },
@@ -8697,7 +8701,8 @@
                           "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
-                          "runtime_model_catalog_unavailable"
+                          "runtime_model_catalog_unavailable",
+                          "oom_killed"
                         ],
                         "type": "string"
                       },
@@ -10033,7 +10038,8 @@
                     "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
-                    "runtime_model_catalog_unavailable"
+                    "runtime_model_catalog_unavailable",
+                    "oom_killed"
                   ],
                   "type": "string"
                 },
@@ -14308,7 +14314,8 @@
                                 "missing_git_attribution",
                                 "sandbox_unavailable",
                                 "probe_failed",
-                                "runtime_model_catalog_unavailable"
+                                "runtime_model_catalog_unavailable",
+                                "oom_killed"
                               ],
                               "type": "string"
                             },
@@ -15643,7 +15650,8 @@
                           "missing_git_attribution",
                           "sandbox_unavailable",
                           "probe_failed",
-                          "runtime_model_catalog_unavailable"
+                          "runtime_model_catalog_unavailable",
+                          "oom_killed"
                         ],
                         "type": "string"
                       },
