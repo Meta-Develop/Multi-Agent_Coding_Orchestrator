@@ -3430,6 +3430,7 @@ pub enum EnvironmentFailureCategory {
     SandboxUnavailable,
     ProbeFailed,
     RuntimeModelCatalogUnavailable,
+    OomKilled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
@@ -10654,6 +10655,7 @@ fn run_external_agent_runtime_inner(
         }
     }
     retain_grok_native_failure(&mut report, spec.invocation);
+    retain_oom_kill_failure(&mut report);
     #[cfg(target_os = "linux")]
     if let Some(binding) = &grok_worker_journal {
         let checked = binding
@@ -12324,6 +12326,32 @@ fn record_completed_app_server_target(
         );
         report.publishable = false;
     }
+}
+
+/// Records a likely OOM kill named by the systemd cleanup error as a typed
+/// environment failure, so the attempt does not read as an agent failure (#1000).
+fn retain_oom_kill_failure(report: &mut ExternalAgentRun) {
+    let Some(error) = report.error.as_deref() else {
+        return;
+    };
+    if !error.contains(crate::process_runner::OOM_KILL_FAILURE_MARKER)
+        || report
+            .environment_failures()
+            .iter()
+            .any(|failure| failure.category == EnvironmentFailureCategory::OomKilled)
+    {
+        return;
+    }
+    let failure = environment_failure(
+        EnvironmentFailureCategory::OomKilled,
+        None,
+        error.to_string(),
+    );
+    report
+        .stdout
+        .run_metadata
+        .environment_failures
+        .push(failure);
 }
 
 fn retain_grok_native_failure(report: &mut ExternalAgentRun, invocation: ExternalAgentInvocation) {

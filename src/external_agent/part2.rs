@@ -746,6 +746,11 @@ fn environment_remediation(category: EnvironmentFailureCategory) -> Vec<Environm
             guidance: "Correct the bounded requirement or fixed project environment, then rerun preflight; MACO will not install software or relax policy automatically."
                 .to_string(),
         }],
+        EnvironmentFailureCategory::OomKilled => vec![EnvironmentRemediation {
+            scope: EnvironmentRemediationScope::CapabilityPolicy,
+            guidance: "Relaunch after the concurrent memory pressure on the host has ended, for example another build; MACO does not raise memory limits or change the selection automatically."
+                .to_string(),
+        }],
         EnvironmentFailureCategory::RuntimeModelCatalogUnavailable => vec![
             EnvironmentRemediation {
                 scope: EnvironmentRemediationScope::CapabilityPolicy,
