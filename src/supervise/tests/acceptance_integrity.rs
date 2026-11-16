@@ -575,6 +575,51 @@ fn worker_command_supersession_requires_clean_evidence() {
 }
 
 #[test]
+fn journal_bound_exploratory_failure_does_not_fail_validated_worker() {
+    let assignment = injected_assignment(true);
+    let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
+    let validation = vec!["cargo".to_string(), "test".to_string()];
+    worker.validation_results[0].command = validation.clone();
+    let mut exploratory = injected_command_record();
+    exploratory.command = vec!["git".to_string(), "log".to_string(), "-1".to_string()];
+    exploratory.status = ReviewStatus::Failed;
+    exploratory.exit_code = Some(128);
+    exploratory.journal_record = Some(JournalRecordReference {
+        line: 3,
+        start_timestamp: "2026-11-16T20:05:00Z".to_string(),
+    });
+    worker.commands_run = vec![exploratory.clone()];
+    assert!(!worker_technical_failure(&worker, &[]));
+    assert!(!decomposition_worker_technical_failure(&worker));
+
+    // Without a journal record the existing strict rule applies.
+    let mut unbound = exploratory.clone();
+    unbound.journal_record = None;
+    worker.commands_run = vec![unbound];
+    assert!(worker_technical_failure(&worker, &[]));
+
+    // A failed listed validation command, a timeout or a runner error is never excused.
+    let mut failed_validation = exploratory.clone();
+    failed_validation.command = validation;
+    let mut timed_out = exploratory.clone();
+    timed_out.timed_out = true;
+    let mut errored = exploratory.clone();
+    errored.error = Some("fixture error".to_string());
+    for record in [failed_validation, timed_out, errored] {
+        worker.commands_run = vec![record];
+        assert!(worker_technical_failure(&worker, &[]));
+    }
+
+    // Nothing is excused unless every listed validation succeeded with its command recorded.
+    worker.commands_run = vec![exploratory];
+    worker.validation_results[0].status = ReviewStatus::Failed;
+    assert!(worker_technical_failure(&worker, &[]));
+    worker.validation_results[0].status = ReviewStatus::Succeeded;
+    worker.validation_results[0].command = Vec::new();
+    assert!(worker_technical_failure(&worker, &[]));
+}
+
+#[test]
 fn worker_command_license_does_not_excuse_timeout() {
     let assignment = injected_assignment(true);
     let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
