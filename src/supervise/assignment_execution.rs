@@ -1290,9 +1290,7 @@ fn dispatch_isolated_parent_workers_inner(
             assignment_launch_runtime(&parent_preflight.assignment, context.options, policy),
             policy,
         );
-        if runtime == SupervisorRuntime::Vibe {
-            super::vibe_worker::refuse_nested_worker_launch()?;
-        }
+        // A Vibe Worker is admitted by the direct Worker launch of its subject (#1051).
         if grant.identity().0 != ordinal + 1
             || parent_preflight.assignment.worker_assignments.get(ordinal) != Some(worker)
         {

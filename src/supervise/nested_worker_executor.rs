@@ -281,9 +281,8 @@ pub(super) fn execute_nested_worker_attempt(
         ),
         &context.budget_policy,
     );
-    if runtime == SupervisorRuntime::Vibe {
-        super::super::vibe_worker::refuse_nested_worker_launch()?;
-    }
+    // A Vibe Worker launches through the same contained terminal Worker runner as a
+    // direct unit; bind_selected_runtime_launch applies the Vibe admission (#1051).
     if runtime == SupervisorRuntime::Fake {
         bail!("nested executor requires a real managed launch path");
     }

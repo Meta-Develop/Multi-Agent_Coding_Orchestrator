@@ -48,10 +48,12 @@ pub(super) fn validate_assignment(
     Ok(())
 }
 
-/// Refuse a nested Vibe Worker launch inside a managed coordinator.
+/// Refuse a Vibe Worker under a runtime-native child bridge.
 ///
-/// The managed coordinator path never admits Vibe, so the refusal is explicit
-/// rather than a silent fallthrough into another runtime arm.
+/// A runtime-native bridge launches its terminal workers inside the enclosing
+/// child session and cannot run Vibe, so the refusal is explicit rather than a
+/// silent fallthrough into another runtime arm. Managed parent cycles launch
+/// Vibe Workers through MACO's contained terminal Worker runner instead (#1051).
 pub(super) fn refuse_nested_worker_launch() -> Result<()> {
-    bail!("Vibe is not admitted for nested Worker assignments")
+    bail!("Vibe is not admitted for Worker assignments under a runtime-native child bridge")
 }
