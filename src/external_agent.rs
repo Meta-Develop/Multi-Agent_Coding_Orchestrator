@@ -8464,14 +8464,22 @@ fn run_external_agent_runtime_inner(
         report.stdout.run_metadata.managed_codex_selection = Some(authority.selection_evidence());
     }
 
+    // A lone launch whose ChatGPT token is due claims the proactive refresh (#1039).
     #[cfg(target_os = "linux")]
-    let codex_auth_lease = codex_auth.as_ref().map(|auth| {
-        codex_auth_writeback::CodexAuthLease::enter(
-            &auth.path,
-            &auth.bytes,
-            staged_codex_home.as_deref(),
-        )
-    });
+    let (codex_auth_lease, codex_auth_refresh) = match codex_auth.as_ref() {
+        Some(auth) => {
+            let (lease, refresh) = codex_auth_writeback::CodexAuthLease::enter_claiming_refresh(
+                &auth.path,
+                &auth.bytes,
+                staged_codex_home.as_deref(),
+                std::time::SystemTime::now(),
+            );
+            (Some(lease), refresh)
+        }
+        None => (None, false),
+    };
+    #[cfg(not(target_os = "linux"))]
+    let codex_auth_refresh = false;
 
     #[cfg(target_os = "linux")]
     let grok_session = if runtime == ExternalExecutionRuntime::Verified
@@ -9993,6 +10001,7 @@ fn run_external_agent_runtime_inner(
                 spec,
                 prompt,
                 codex_auth.as_ref(),
+                codex_auth_refresh,
             )
         } else if managed_worker_app_server {
             run_managed_worker_app_server_process_with_auth(
@@ -10001,6 +10010,7 @@ fn run_external_agent_runtime_inner(
                 spec,
                 prompt,
                 codex_auth.as_ref(),
+                codex_auth_refresh,
             )
         } else {
             let Some(review_runtime) = review_runtime.as_mut() else {
@@ -10022,6 +10032,7 @@ fn run_external_agent_runtime_inner(
                 prompt,
                 review_runtime,
                 codex_auth.as_ref(),
+                codex_auth_refresh,
             );
             retained_gate_denials = attempt.gate_denials;
             retained_review_metrics = Some(attempt.metrics);
@@ -11438,6 +11449,7 @@ fn run_read_only_terminal_app_server_process(
         spec,
         prompt,
         None,
+        false,
     )
 }
 
@@ -11448,7 +11460,14 @@ fn run_managed_worker_app_server_process(
     spec: &ExternalAgentCommand,
     prompt: String,
 ) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
-    run_managed_worker_app_server_process_with_auth(process_spec, cancellation, spec, prompt, None)
+    run_managed_worker_app_server_process_with_auth(
+        process_spec,
+        cancellation,
+        spec,
+        prompt,
+        None,
+        false,
+    )
 }
 
 #[cfg(test)]
@@ -11459,7 +11478,15 @@ fn run_duplex_app_server_process(
     prompt: String,
     runtime: &mut ExternalPreActionReviewRuntime<'_>,
 ) -> DuplexProcessAttempt {
-    run_duplex_app_server_process_with_auth(process_spec, cancellation, spec, prompt, runtime, None)
+    run_duplex_app_server_process_with_auth(
+        process_spec,
+        cancellation,
+        spec,
+        prompt,
+        runtime,
+        None,
+        false,
+    )
 }
 
 fn run_read_only_terminal_app_server_process_with_auth(
@@ -11468,6 +11495,7 @@ fn run_read_only_terminal_app_server_process_with_auth(
     spec: &ExternalAgentCommand,
     prompt: String,
     auth: Option<&ValidatedCodexAuth>,
+    refresh_account: bool,
 ) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
     let turn = codex_app_server::AppServerTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
@@ -11481,6 +11509,7 @@ fn run_read_only_terminal_app_server_process_with_auth(
             .filter(|identity| identity.role == AgentRole::Auditor.as_str())
             .map(|_| spec.reasoning_effort.clone().unwrap_or_default()),
         output_schema: load_codex_app_server_output_schema(spec)?,
+        refresh_account,
     };
     let cancellation = cancellation.child_scope();
     run_codex_interactive_process(process_spec, &cancellation, auth, |session| {
@@ -11576,6 +11605,7 @@ fn run_managed_worker_app_server_process_with_auth(
     spec: &ExternalAgentCommand,
     prompt: String,
     auth: Option<&ValidatedCodexAuth>,
+    refresh_account: bool,
 ) -> Result<InteractiveProcessOutput<codex_app_server::AppServerOutcome>, ProcessRunError> {
     let turn = codex_app_server::AppServerTurn {
         cwd: spec.cwd.to_string_lossy().into_owned(),
@@ -11585,6 +11615,7 @@ fn run_managed_worker_app_server_process_with_auth(
         model: spec.model.clone(),
         minimum_effort: None,
         output_schema: load_codex_app_server_output_schema(spec)?,
+        refresh_account,
     };
     let cancellation = cancellation.child_scope();
     run_codex_interactive_process(process_spec, &cancellation, auth, |session| {
@@ -11656,6 +11687,7 @@ fn run_duplex_app_server_process_with_auth(
     prompt: String,
     runtime: &mut ExternalPreActionReviewRuntime<'_>,
     auth: Option<&ValidatedCodexAuth>,
+    refresh_account: bool,
 ) -> DuplexProcessAttempt {
     let review_session_id = duplex_review_session_id(runtime.context, spec);
     let mut reviewer = DuplexApprovalReviewer {
@@ -11673,6 +11705,7 @@ fn run_duplex_app_server_process_with_auth(
         prompt,
         model: spec.model.clone(),
         minimum_effort: None,
+        refresh_account,
         output_schema: match load_codex_app_server_output_schema(spec) {
             Ok(schema) => schema,
             Err(error) => {

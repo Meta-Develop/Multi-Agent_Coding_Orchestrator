@@ -533,6 +533,7 @@ fn qualification_mode(
                 prompt: fs::read_to_string(&command.prompt).unwrap(),
                 model: command.model.clone(),
                 minimum_effort: None,
+                refresh_account: false,
                 output_schema: None,
             };
             let observed = crate::external_agent::run_managed_worker_app_server_turn(

@@ -98,7 +98,6 @@ fn chatgpt_account(bytes: &[u8]) -> Option<String> {
 
 /// A ChatGPT access token that expires within this margin is refreshed before a
 /// launch while no other launch of its source runs (#1039).
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) const CODEX_AUTH_PROACTIVE_REFRESH_MARGIN: Duration =
     Duration::from_secs(3 * 24 * 60 * 60);
 
@@ -130,7 +129,6 @@ fn decode_base64url(text: &str) -> Option<Vec<u8>> {
 /// Expiry of the ChatGPT access token in auth bytes: the `exp` claim (seconds
 /// since the Unix epoch) of the unverified JWT payload of `tokens.access_token`
 /// (#1039). `None` when the bytes carry no such claim.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn access_token_expiry(bytes: &[u8]) -> Option<SystemTime> {
     let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
     let token = value.get("tokens")?.get("access_token")?.as_str()?;
@@ -143,7 +141,6 @@ pub(super) fn access_token_expiry(bytes: &[u8]) -> Option<SystemTime> {
 
 /// Whether auth bytes carry a ChatGPT account whose access token expires within
 /// `margin` of `now` (#1039). Bytes without a readable expiry are never due.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(super) fn codex_auth_refresh_due(bytes: &[u8], now: SystemTime, margin: Duration) -> bool {
     if chatgpt_account(bytes).is_none() {
         return false;
@@ -299,9 +296,36 @@ pub(super) struct CodexAuthLease {
 
 impl CodexAuthLease {
     /// Enters a lease for `source`, which was staged from `launch` bytes.
+    #[cfg(test)]
     pub(super) fn enter(source: &Path, launch: &[u8], staged_home: Option<&Path>) -> Self {
         let mut leases = lock_codex_auth_leases();
         Self::enter_locked(&mut leases, source, launch, staged_home)
+    }
+
+    /// Enters a lease for `source` and reports whether this launch claims the
+    /// proactive refresh of its ChatGPT token (#1039): the launch bytes are due
+    /// within the margin, the launch has a staged Codex home to refresh in, and no
+    /// other lease, refresh or pending write-back of that source exists. The
+    /// claiming launch refreshes in its staged home; overlapping launches keep
+    /// their still-valid access tokens, and the last lease writes the rotated
+    /// bytes back as usual.
+    pub(super) fn enter_claiming_refresh(
+        source: &Path,
+        launch: &[u8],
+        staged_home: Option<&Path>,
+        now: SystemTime,
+    ) -> (Self, bool) {
+        let mut leases = lock_codex_auth_leases();
+        let busy = leases
+            .get(source)
+            .is_some_and(|entry| entry.active > 0 || entry.refreshing || entry.pending.is_some());
+        let claim = staged_home.is_some()
+            && !busy
+            && codex_auth_refresh_due(launch, now, CODEX_AUTH_PROACTIVE_REFRESH_MARGIN);
+        (
+            Self::enter_locked(&mut leases, source, launch, staged_home),
+            claim,
+        )
     }
 
     /// Enters a lease for `source` unless a proactive refresh of that source is
@@ -667,6 +691,37 @@ mod tests {
             .unwrap()
             .expect("no refresh in progress");
         assert!(begin_codex_auth_refresh(&source).is_none());
+        lease.finish(Ok(None));
+    }
+
+    #[test]
+    fn a_lone_due_launch_claims_the_refresh() {
+        let day = 24 * 60 * 60;
+        let due = jwt_auth_bytes("acct-1", "eyJleHAiOjE3MDAwMDAwMDB9");
+        let (dir, source) = source_with_auth(&due);
+        let home = Some(dir.path());
+        let now = epoch_plus(1_700_000_000 - day);
+        let (first, claimed) = CodexAuthLease::enter_claiming_refresh(&source, &due, home, now);
+        assert!(claimed);
+        let (second, overlapping) =
+            CodexAuthLease::enter_claiming_refresh(&source, &due, home, now);
+        assert!(!overlapping);
+        second.finish(Ok(None));
+        first.finish(Ok(None));
+        let early = epoch_plus(1_700_000_000 - 4 * day);
+        let (lease, not_due) = CodexAuthLease::enter_claiming_refresh(&source, &due, home, early);
+        assert!(!not_due);
+        lease.finish(Ok(None));
+        let (lease, unstaged) = CodexAuthLease::enter_claiming_refresh(&source, &due, None, now);
+        assert!(!unstaged);
+        lease.finish(Ok(None));
+        let guard = begin_codex_auth_refresh(&source).expect("no active lease");
+        let (lease, refreshing) = CodexAuthLease::enter_claiming_refresh(&source, &due, home, now);
+        assert!(!refreshing);
+        lease.finish(Ok(None));
+        drop(guard);
+        let (lease, again) = CodexAuthLease::enter_claiming_refresh(&source, &due, home, now);
+        assert!(again);
         lease.finish(Ok(None));
     }
 
