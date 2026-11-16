@@ -8270,17 +8270,36 @@ fn ensure_existing_directory_without_symlinks(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Separates the start and the end of a shortened output summary (#1000).
+const OUTPUT_OMISSION_MARKER: &str = "\n[... MACO omitted the middle of this output ...]\n";
+
+/// Returns `text` unchanged when it has at most `limit` characters. A longer
+/// text keeps its first `limit / 2` characters, the omission marker and its
+/// last characters, exactly `limit` characters in total, so the final lines of
+/// a long stream, such as the last error of an agent, survive (#1000).
+fn head_and_tail_chars(text: &str, limit: usize) -> (String, bool) {
+    let total = text.chars().count();
+    if total <= limit {
+        return (text.to_string(), false);
+    }
+    let head = limit / 2;
+    let tail = limit.saturating_sub(head + OUTPUT_OMISSION_MARKER.chars().count());
+    let mut value = text.chars().take(head).collect::<String>();
+    value.push_str(OUTPUT_OMISSION_MARKER);
+    value.extend(text.chars().skip(total - tail));
+    (value, true)
+}
+
 fn summarize_redacted_output(
     output: &CapturedBytes,
     credential_redactor: &CredentialRedactor,
 ) -> CapturedOutput {
     let bytes = credential_redactor.redact_bytes(output.as_bytes());
     let text = String::from_utf8_lossy(&bytes);
-    let mut chars = text.chars();
-    let value = chars.by_ref().take(OUTPUT_CHAR_LIMIT).collect::<String>();
+    let (value, shortened) = head_and_tail_chars(&text, OUTPUT_CHAR_LIMIT);
     CapturedOutput {
         text: value,
-        truncated: output.is_truncated() || chars.next().is_some(),
+        truncated: output.is_truncated() || shortened,
         bytes,
         raw_truncated: Some(output.is_truncated()),
         target_launch_attempted: false,
@@ -9164,5 +9183,51 @@ mod fixed_version_probe_redaction_tests {
             retained.stdout.text,
             std::str::from_utf8(CREDENTIAL_REDACTION).expect("CREDENTIAL_REDACTION is utf-8")
         );
+    }
+}
+
+#[cfg(test)]
+mod output_summary_tests {
+    use super::*;
+
+    fn summarize(stream: &str) -> CapturedOutput {
+        let output = CapturedBytes::from_bytes_for_test(stream.as_bytes().to_vec());
+        summarize_redacted_output(&output, &CredentialRedactor::default())
+    }
+
+    #[test]
+    fn a_long_output_summary_keeps_its_start_and_its_final_lines() {
+        let mut stream = String::from("echoed prompt\n");
+        stream.push_str(&"m".repeat(3 * OUTPUT_CHAR_LIMIT));
+        stream.push_str("\nfinal error line\n");
+        let summary = summarize(&stream);
+        assert_eq!(summary.text.chars().count(), OUTPUT_CHAR_LIMIT);
+        assert!(summary.text.starts_with("echoed prompt\n"));
+        assert!(summary.text.ends_with("\nfinal error line\n"));
+        assert_eq!(summary.text.matches(OUTPUT_OMISSION_MARKER).count(), 1);
+        assert!(summary.truncated);
+        assert_eq!(summary.raw_truncated, Some(false));
+        assert_eq!(summary.bytes, stream.as_bytes());
+    }
+
+    #[test]
+    fn an_output_within_the_limit_is_kept_whole() {
+        let summary = summarize("short output\n");
+        assert_eq!(summary.text, "short output\n");
+        assert!(!summary.truncated);
+        let exact = "y".repeat(OUTPUT_CHAR_LIMIT);
+        let summary = summarize(&exact);
+        assert_eq!(summary.text, exact);
+        assert!(!summary.truncated);
+    }
+
+    #[test]
+    fn a_shortened_summary_counts_characters_and_keeps_them_whole() {
+        let stream = "\u{3042}".repeat(2 * OUTPUT_CHAR_LIMIT);
+        let summary = summarize(&stream);
+        assert_eq!(summary.text.chars().count(), OUTPUT_CHAR_LIMIT);
+        assert!(summary.text.starts_with('\u{3042}'));
+        assert!(summary.text.ends_with('\u{3042}'));
+        assert!(summary.truncated);
     }
 }
