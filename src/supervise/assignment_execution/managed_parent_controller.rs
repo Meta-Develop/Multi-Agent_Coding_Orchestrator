@@ -506,7 +506,7 @@ fn require_managed_parent_input(
     source_attempt: usize,
     prepared: &PreparedChildAttempt<'_>,
 ) -> Result<()> {
-    if source_attempt != 1
+    if source_attempt % 2 != 1
         || context.execution_runtime != SupervisorExecutionRuntime::Verified
         || context.execution_target.is_some()
         || context.evidence_only_reaudit.is_some()
@@ -518,7 +518,7 @@ fn require_managed_parent_input(
         || prepared.command.workspace_access != WorkspaceAccess::ReadOnly
     {
         bail!(
-            "managed parent cycle requires source attempt 1 on a verified child orchestrator with authored workers and no primary, evidence-only, or simulated runtime"
+            "managed parent cycle requires an odd source attempt on a verified child orchestrator with authored workers and no primary, evidence-only, or simulated runtime"
         );
     }
     Ok(())

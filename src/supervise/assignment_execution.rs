@@ -2815,14 +2815,14 @@ fn prepare_child_attempt_with_purpose<'a>(
         && (context.execution_runtime != SupervisorExecutionRuntime::Verified
             || context.execution_target.is_some()
             || context.evidence_only_reaudit.is_some()
-            || attempt != 1
+            || attempt % 2 != 1
             || assignment.role != AgentRole::ChildOrchestrator
             || assignment.phase != AssignmentPhase::Execution
             || assignment.effective_role_category() != RoleCategory::DelegatingCoordinator
             || assignment.worker_assignments.is_empty())
     {
         bail!(
-            "managed parent initial preparation requires a verified execution-phase delegating ChildOrchestrator with authored workers on attempt 1 and no execution target or evidence-only reaudit"
+            "managed parent initial preparation requires a verified execution-phase delegating ChildOrchestrator with authored workers on an odd source attempt and no execution target or evidence-only reaudit"
         );
     }
     if let Some(expected) = context.worktree_creation.expected_source_head() {
@@ -8528,6 +8528,30 @@ pub(super) fn persist_final_assignment_report(
     Ok(report.clone())
 }
 
+/// Step and last attempt number of one assignment's gate loop. A managed parent
+/// cycle k uses source attempt 2k-1 and its parent continuation attempt 2k, so
+/// its loop visits only odd attempts; every other assignment visits each attempt
+/// (#1050). Either way the loop runs at most `max_attempts` iterations.
+fn gate_loop_attempts(managed_parent_cycle: bool, max_attempts: usize) -> (usize, usize) {
+    if managed_parent_cycle {
+        (2, max_attempts.saturating_mul(2).saturating_sub(1))
+    } else {
+        (1, max_attempts)
+    }
+}
+
+#[test]
+fn gate_loop_attempts_use_odd_source_attempts_for_managed_parent_cycles() {
+    let (step, last) = gate_loop_attempts(true, 3);
+    assert_eq!((step, last), (2, 5));
+    assert_eq!((1..=last).step_by(step).collect::<Vec<_>>(), [1, 3, 5]);
+    let (step, last) = gate_loop_attempts(false, 3);
+    assert_eq!((step, last), (1, 3));
+    assert_eq!((1..=last).step_by(step).collect::<Vec<_>>(), [1, 2, 3]);
+    assert_eq!(gate_loop_attempts(true, 1), (2, 1));
+    assert_eq!((3..=5).step_by(2).collect::<Vec<_>>(), [3, 5]);
+}
+
 fn initial_completed_parent_review_cycles(
     context: &AssignmentExecutionContext<'_, '_>,
 ) -> Result<Option<usize>> {
@@ -8602,10 +8626,12 @@ fn execute_supervisor_assignment_inner(
             let mut child_containment_verified = false;
             let mut child_gate_terminal = false;
             let first_attempt = next_attempt;
-            for attempt in first_attempt..=max_attempts {
-                next_attempt = attempt.saturating_add(1);
+            let (attempt_step, last_attempt) =
+                gate_loop_attempts(managed_parent_cycle, max_attempts);
+            for attempt in (first_attempt..=last_attempt).step_by(attempt_step) {
+                next_attempt = attempt.saturating_add(attempt_step);
                 if attempt > 1 {
-                    let retry_count = u32::try_from(attempt.saturating_sub(1))
+                    let retry_count = u32::try_from(attempt.saturating_sub(1) / attempt_step)
                         .context("assignment retry count does not fit selector input")?;
                     let decisions = active_budget_policy.reselect(
                         options.runtime,
