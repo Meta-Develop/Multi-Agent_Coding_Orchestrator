@@ -1594,7 +1594,8 @@ fn read_supervise_goal_file(goal_file: &Path) -> Result<String> {
 #[derive(Debug, Subcommand)]
 #[allow(clippy::large_enum_variant)]
 enum SuperviseSubcommand {
-    /// Execute a command or observe a native edit and append to the exact precreated Worker journal.
+    /// Execute a command or observe a native edit and append to the exact precreated Worker
+    /// journal.
     JournalAppend(WorkerJournalAppendArgs),
     /// Build a validated plan from a goal/spec, task file, or JSON supervisor plan.
     Plan(PlanSuperviseArgs),
@@ -2008,11 +2009,13 @@ struct RunSuperviseArgs {
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
-    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
+    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default
+    /// otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
     /// Enable the Codex named profile's network for this development invocation and its children.
-    /// Filesystem, approval, model, and delegation controls remain unchanged; omitted on resume means off.
+    /// Filesystem, approval, model, and delegation controls remain unchanged; omitted on resume
+    /// means off.
     #[arg(long)]
     development_codex_network: bool,
     /// Additional canonical executable for a distinct non-Fake runtime in this Linux supervise run.
@@ -2026,7 +2029,8 @@ struct RunSuperviseArgs {
     /// Runtime. Fake is deterministic in-process simulation and never executes Codex or publishes.
     #[arg(long, value_enum)]
     runtime: Option<supervise::SupervisorRuntime>,
-    /// Restrict selection and dispatch to this runtime; requires matching --runtime and an absolute --runtime-bin.
+    /// Restrict selection and dispatch to this runtime; requires matching --runtime and an absolute
+    /// --runtime-bin.
     #[arg(
         long,
         value_enum,
@@ -2123,7 +2127,8 @@ struct ReauditSuperviseArgs {
     /// Codex-compatible executable to invoke. Ignored by the deterministic Fake runtime.
     #[arg(long, default_value = "codex")]
     codex_bin: PathBuf,
-    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default otherwise.
+    /// Selected runtime executable. Defaults to `--codex-bin` for Codex and the adapter default
+    /// otherwise.
     #[arg(long)]
     runtime_bin: Option<PathBuf>,
     /// Runtime. Fake is deterministic in-process simulation and never publishes.
@@ -2805,7 +2810,8 @@ struct RunWorkspaceInboxArgs {
     /// Codex-compatible executable to pass through to per-repository inbox runs.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot
+    /// dispatch.
     #[arg(long, requires = "machine_global_runtime_root_id")]
     machine_global_config: Option<PathBuf>,
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
@@ -2833,7 +2839,8 @@ struct WatchWorkspaceInboxArgs {
     /// Codex-compatible executable to pass through to per-repository inbox runs.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot
+    /// dispatch.
     #[arg(long, requires = "machine_global_runtime_root_id")]
     machine_global_config: Option<PathBuf>,
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
@@ -2855,7 +2862,8 @@ struct ScanInboxArgs {
     /// Enable real GitHub API reads through the local gh CLI.
     #[arg(long)]
     github: bool,
-    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or
+    /// github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
     /// Absolute operator-owned GitHub review policy file outside the source repository.
@@ -2883,7 +2891,8 @@ struct RunInboxArgs {
     /// Enable real GitHub API reads/comments and GitHub publication through gh.
     #[arg(long)]
     github: bool,
-    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or
+    /// github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
     /// Absolute operator-owned GitHub review policy file outside the source repository.
@@ -2894,7 +2903,8 @@ struct RunInboxArgs {
     codex_bin: Option<PathBuf>,
     #[command(flatten)]
     rolling_budget: InboxRollingBudgetArgs,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot
+    /// dispatch.
     #[arg(long, requires = "machine_global_runtime_root_id")]
     machine_global_config: Option<PathBuf>,
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
@@ -3002,7 +3012,8 @@ struct WatchInboxArgs {
     /// Enable real GitHub API reads/comments and GitHub publication through gh.
     #[arg(long)]
     github: bool,
-    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or github_full.
+    /// Select inbox capabilities: fake, github_read, github_local, github_git, github_pr, or
+    /// github_full.
     #[arg(long, value_parser = parse_inbox_permission_mode)]
     permission: Option<InboxPermissionMode>,
     /// Absolute operator-owned GitHub review policy file outside the source repository.
@@ -3011,7 +3022,8 @@ struct WatchInboxArgs {
     /// Codex-compatible executable to invoke. Omit for deterministic local fake mode.
     #[arg(long)]
     codex_bin: Option<PathBuf>,
-    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot dispatch.
+    /// Exact reviewed config used to gate private runtime output-staging cleanup for item autopilot
+    /// dispatch.
     #[arg(long, requires = "machine_global_runtime_root_id")]
     machine_global_config: Option<PathBuf>,
     /// Reviewed root id whose canonical root must contain `/run/user/<uid>`.
@@ -4076,7 +4088,8 @@ struct ClaimTimingArgs {
     /// Desired heartbeat interval in seconds. Must be paired with --stale-after-seconds.
     #[arg(long, requires = "stale_after_seconds")]
     heartbeat_interval_seconds: Option<u64>,
-    /// Age in seconds at which a claim becomes stale. Must be paired with --heartbeat-interval-seconds.
+    /// Age in seconds at which a claim becomes stale. Must be paired with
+    /// --heartbeat-interval-seconds.
     #[arg(long, requires = "heartbeat_interval_seconds")]
     stale_after_seconds: Option<u64>,
 }
@@ -4912,26 +4925,32 @@ struct RunExperimentArgs {
     /// Owns retained artifacts with --execute-held-out; never the evaluated source repository.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Requested mode; deterministic-fake is the default. real-provider requires the full opt-in tuple.
+    /// Requested mode; deterministic-fake is the default. real-provider requires the full opt-in
+    /// tuple.
     #[arg(
         long,
         default_value = "deterministic-fake",
         value_parser = parse_evaluation_execution
     )]
     execution: crate::evaluation::EvaluationExecution,
-    /// Acknowledge real-provider execution; required with --execution real-provider and the rest of the tuple.
+    /// Acknowledge real-provider execution; required with --execution real-provider and the rest of
+    /// the tuple.
     #[arg(long)]
     allow_real_provider: bool,
-    /// Explicitly execute declared local argv in contained candidate copies and retain bound observations.
+    /// Explicitly execute declared local argv in contained candidate copies and retain bound
+    /// observations.
     #[arg(long)]
     execute_held_out: bool,
-    /// Evaluated Git repository for held-out baselines. Requires --execute-held-out and --base-commit.
+    /// Evaluated Git repository for held-out baselines. Requires --execute-held-out and
+    /// --base-commit.
     #[arg(long, value_name = "PATH")]
     source_repo: Option<PathBuf>,
-    /// Full 40-character commit object name in --source-repo. Requires --execute-held-out and --source-repo.
+    /// Full 40-character commit object name in --source-repo. Requires --execute-held-out and
+    /// --source-repo.
     #[arg(long, value_name = "FULL_OID")]
     base_commit: Option<String>,
-    /// Operator-owned supervisor plan outside the evaluated source repository. Required with real-provider.
+    /// Operator-owned supervisor plan outside the evaluated source repository. Required with
+    /// real-provider.
     #[arg(long, value_name = "PATH")]
     provider_plan: Option<PathBuf>,
     /// Non-Fake runtime for real-provider held-out execution. Required with real-provider.
@@ -4951,10 +4970,12 @@ struct RunExperimentArgs {
     /// Dated selection priors and capability evidence inside --source-repo. Real-provider only.
     #[arg(long, value_name = "REPO_RELATIVE_FILE")]
     prior_data: Option<PathBuf>,
-    /// Exact reviewed machine-global config. Required with real-provider; never inferred from --source-repo.
+    /// Exact reviewed machine-global config. Required with real-provider; never inferred from
+    /// --source-repo.
     #[arg(long, value_name = "PATH")]
     machine_global_config: Option<PathBuf>,
-    /// Reviewed machine-global runtime root id. Required with real-provider; never inferred from --source-repo.
+    /// Reviewed machine-global runtime root id. Required with real-provider; never inferred from
+    /// --source-repo.
     #[arg(long)]
     machine_global_runtime_root_id: Option<String>,
     /// Emit machine-readable JSON.

@@ -536,7 +536,8 @@ struct CreateWorktreeArgs {
     /// Base revision used when creating a new branch. Defaults to HEAD.
     #[arg(long)]
     base: Option<String>,
-    /// Parent directory for agent worktrees. Defaults to <repo>/.maco/worktrees/<sanitized-repo-name>.
+    /// Parent directory for agent worktrees. Defaults to
+    /// <repo>/.maco/worktrees/<sanitized-repo-name>.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// After creation, remove eligible older clean worktrees older than this many seconds.
@@ -545,7 +546,8 @@ struct CreateWorktreeArgs {
     /// After creation, keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     gc_max_count: Option<usize>,
-    /// After creation, retain at most this many apparent, not allocated, bytes in newest eligible lanes.
+    /// After creation, retain at most this many apparent, not allocated, bytes in newest eligible
+    /// lanes.
     #[arg(long)]
     gc_max_total_bytes: Option<u64>,
     /// Apply the bounded O2-launch default of retaining the newest 10 lanes after creation.
@@ -567,7 +569,8 @@ struct GcWorktreeArgs {
     /// Repository path.
     #[arg(long, default_value = ".")]
     repo: PathBuf,
-    /// Parent directory for agent worktrees. Defaults to <repo>/.maco/worktrees/<sanitized-repo-name>.
+    /// Parent directory for agent worktrees. Defaults to
+    /// <repo>/.maco/worktrees/<sanitized-repo-name>.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// List cleanup actions without removing anything.
@@ -576,7 +579,8 @@ struct GcWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
-    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with
+    /// retention filters.
     #[arg(long)]
     targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
@@ -585,7 +589,8 @@ struct GcWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees.
     #[arg(long)]
     max_count: Option<usize>,
-    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes; sizing failure protects a lane.
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes; sizing
+    /// failure protects a lane.
     #[arg(long)]
     max_total_bytes: Option<u64>,
     /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
@@ -607,7 +612,8 @@ struct GcWorktreeArgs {
 
 #[derive(Debug, Args)]
 struct SweepWorktreeArgs {
-    /// Repository or workspace containing grouped .maco/worktrees roots or manual <repo>/.worktrees roots.
+    /// Repository or workspace containing grouped .maco/worktrees roots or manual <repo>/.worktrees
+    /// roots.
     #[arg(long)]
     workspace: PathBuf,
     /// Apply cleanup. Without this flag, the sweep is a dry-run.
@@ -616,7 +622,8 @@ struct SweepWorktreeArgs {
     /// Keep per-worktree target/ directories for retained worktrees.
     #[arg(long)]
     keep_targets: bool,
-    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with retention filters.
+    /// Reclaim eligible target/ directories while retaining every lane and branch; conflicts with
+    /// retention filters.
     #[arg(long)]
     targets_only: bool,
     /// Remove only eligible clean worktrees older than this many seconds.
@@ -625,7 +632,8 @@ struct SweepWorktreeArgs {
     /// Keep at most this many newest eligible clean worktrees per discovered root.
     #[arg(long)]
     max_count: Option<usize>,
-    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes per discovered root.
+    /// Retain a newest eligible prefix within this many apparent, not allocated, bytes per
+    /// discovered root.
     #[arg(long)]
     max_total_bytes: Option<u64>,
     /// Exact repository-relative untracked path allowed during full-lane removal. Repeatable.
@@ -662,7 +670,8 @@ struct LifecycleWorktreeArgs {
     /// Schedule the bounded O2-launch run-artifact retention profile.
     #[arg(long)]
     o2_launch_retention: bool,
-    /// Parent directory for agent worktrees. Defaults to <repo>/.maco/worktrees/<sanitized-repo-name>.
+    /// Parent directory for agent worktrees. Defaults to
+    /// <repo>/.maco/worktrees/<sanitized-repo-name>.
     #[arg(long)]
     worktree_root: Option<PathBuf>,
     /// Remove only eligible clean worktrees older than this many seconds.
@@ -1163,7 +1172,8 @@ struct MergePreviewArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
-    /// Validation JSON. With --require-validation, use an envelope containing the exact current candidate.validation_binding and passed reports; legacy arrays are unbound.
+    /// Validation JSON. With --require-validation, use an envelope containing the exact current
+    /// candidate.validation_binding and passed reports; legacy arrays are unbound.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
     /// Require passed validation evidence bound exactly to the current candidate snapshot.
@@ -1211,7 +1221,8 @@ struct MergeApplyArgs {
     /// Explicit claimed path. Repeat to provide multiple claims.
     #[arg(long)]
     claim: Vec<PathBuf>,
-    /// Validation JSON. With --require-validation, use an exact candidate-bound envelope; legacy arrays are unbound. Repeat to supply multiple files.
+    /// Validation JSON. With --require-validation, use an exact candidate-bound envelope; legacy
+    /// arrays are unbound. Repeat to supply multiple files.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
     /// Require an exact candidate-bound passed report or a passed candidate validation command.
@@ -1278,7 +1289,8 @@ struct MergeArbitrateArgs {
     /// Candidate-bound validation command. At least one is required.
     #[arg(long = "validation-command", required = true)]
     validation_command: Vec<String>,
-    /// Explicitly accept a preserved, validated proposal. A later ordinary merge apply is still required.
+    /// Explicitly accept a preserved, validated proposal. A later ordinary merge apply is still
+    /// required.
     #[arg(long)]
     approve: bool,
     /// Codex-compatible executable used through the existing trusted local agent boundary.
@@ -1530,9 +1542,11 @@ enum PrSubcommand {
     Preview(PrPreviewArgs),
     /// Publish an exact reviewed commit through an explicit forge with retry reconciliation.
     Publish(PrPublishArgs),
-    /// Preview an exact committed B-to-C update of an existing same-repository GitHub PR without a provider request.
+    /// Preview an exact committed B-to-C update of an existing same-repository GitHub PR without a
+    /// provider request.
     PreviewUpdate(PrOriginalUpdateArgs),
-    /// Update the original PR head with an explicit operator grant and passed candidate-bound validation.
+    /// Update the original PR head with an explicit operator grant and passed candidate-bound
+    /// validation.
     UpdateExisting(PrOriginalUpdateArgs),
 }
 
@@ -1582,10 +1596,12 @@ struct PrPreviewArgs {
     /// Build a deterministic squash import commit on this local base branch before publishing.
     #[arg(long, requires = "from_branch")]
     squash_onto: Option<String>,
-    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple paths.
+    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple
+    /// paths.
     #[arg(long = "exclude", requires = "from_branch")]
     exclude: Vec<PathBuf>,
-    /// Validation JSON. With --require-validation, copy the exact current preview.candidate.validation_binding into an envelope with passed reports.
+    /// Validation JSON. With --require-validation, copy the exact current
+    /// preview.candidate.validation_binding into an envelope with passed reports.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
     /// Require passed validation evidence bound exactly to this PR candidate snapshot.
@@ -1619,16 +1635,20 @@ struct PrPublishArgs {
     /// Build a deterministic squash import commit on this local base branch before publishing.
     #[arg(long, requires = "from_branch")]
     squash_onto: Option<String>,
-    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple paths.
+    /// Exclude a repository-local path from the published branch snapshot. Repeat for multiple
+    /// paths.
     #[arg(long = "exclude", requires = "from_branch")]
     exclude: Vec<PathBuf>,
-    /// Candidate-bound validation envelope produced after previewing the clean, committed candidate; legacy report arrays are unbound.
+    /// Candidate-bound validation envelope produced after previewing the clean, committed
+    /// candidate; legacy report arrays are unbound.
     #[arg(long)]
     validation_report: Vec<PathBuf>,
-    /// Require a clean committed candidate and passed evidence bound exactly to its current preview binding.
+    /// Require a clean committed candidate and passed evidence bound exactly to its current preview
+    /// binding.
     #[arg(long)]
     require_validation: bool,
-    /// Forge adapter. `github` binds origin host/owner/repo, verifies the OID receipt, and journals retry state.
+    /// Forge adapter. `github` binds origin host/owner/repo, verifies the OID receipt, and journals
+    /// retry state.
     #[arg(long, value_parser = parse_forge_kind)]
     forge: ForgeKind,
     /// Mark the pull request ready for review instead of draft.
