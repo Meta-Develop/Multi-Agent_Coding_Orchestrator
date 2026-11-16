@@ -1729,6 +1729,22 @@ pub(super) fn command_is_repaired_by_later_success(
         })
 }
 
+/// A journal-bound command that failed only by its exit status and is not one of
+/// the Worker's listed validation commands does not fail an attempt whose listed
+/// validations all succeeded with their commands recorded. The record stays in
+/// `commands_run`, so review still sees it (#1061).
+fn excused_exploratory_failure(worker: &WorkerReport, command: &CommandRunRecord) -> bool {
+    command.journal_record.is_some()
+        && !worker.validation_results.is_empty()
+        && worker.validation_results.iter().all(|validation| {
+            validation.status == ReviewStatus::Succeeded && !validation.command.is_empty()
+        })
+        && !worker
+            .validation_results
+            .iter()
+            .any(|validation| validation.command == command.command)
+}
+
 /// Technical completion is independent of the Worker's self-reported acceptance.
 /// Exceptions require the supervisor's reconciled licensed-failure records.
 pub(super) fn worker_technical_failure(
@@ -1767,7 +1783,8 @@ pub(super) fn worker_technical_failure(
                             && !licensed.iter().any(|failure| {
                                 command.stdout.contains(&failure.failure_signature)
                                     || command.stderr.contains(&failure.failure_signature)
-                            })))
+                            })
+                            && !excused_exploratory_failure(worker, command)))
                         && !command_is_repaired_by_later_success(
                             command,
                             &worker.commands_run[index + 1..],
