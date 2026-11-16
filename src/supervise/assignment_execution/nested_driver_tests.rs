@@ -365,7 +365,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
     let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
     let cancellation = ProcessCancellation::new();
     let preflight = AssignmentExecutionPreflight {
-        nested_turn_issued: AtomicBool::new(false),
+        nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
         journal_parent_id: run_id.as_str(),
         environment_requirements: Vec::new(),
         semantic_token: None,
@@ -1436,7 +1436,13 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             }
             _ => bail!("unknown permit case {case}"),
         }
-        for attempt in [1, 2] {
+        // A continuation attempt never receives a nested turn, and a refused
+        // request burns every later source attempt as well (#1050).
+        for (attempt, expected) in [
+            (1, "already been issued"),
+            (2, "source attempt"),
+            (3, "already been issued"),
+        ] {
             let mut different_outcome = AssignmentExecutionOutcome::default();
             let error = NestedWorkerSerialDriver::from_collected_parent(
                 &context,
@@ -1447,7 +1453,10 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
             )
             .err()
             .context("nested permit was reissued")?;
-            assert!(error.to_string().contains("already been issued"));
+            assert!(
+                error.to_string().contains(expected),
+                "attempt {attempt}: {error}"
+            );
         }
         assert_eq!(*calls.lock().unwrap(), ["parent"]);
         assert_eq!(sync_store.snapshot()?, vec![claim.clone()]);

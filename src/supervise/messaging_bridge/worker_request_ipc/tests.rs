@@ -141,6 +141,68 @@ fn fresh_worker_admission_claims_once_with_stable_authenticated_generation() -> 
 }
 
 #[test]
+fn fresh_worker_admission_admits_each_managed_cycle_source_attempt_once() -> Result<()> {
+    let fixture = FreshFixture::new()?;
+    with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+        let run = RunId::new("run")?;
+        let parent = &fixture.plan.assignments[0];
+        let claim = |attempt| {
+            factory.claim_fresh_worker_request_binding(
+                &run,
+                parent,
+                attempt,
+                SupervisorRuntime::Codex,
+            )
+        };
+        let first = claim(1)?;
+        let second = claim(3)?;
+        let third = claim(5)?;
+        let first_value = serde_json::to_value(&first)?;
+        let second_value = serde_json::to_value(&second)?;
+        let third_value = serde_json::to_value(&third)?;
+        assert_eq!(first_value["attempt"], 1);
+        assert_eq!(second_value["attempt"], 3);
+        assert_eq!(third_value["attempt"], 5);
+        assert_ne!(first_value["generation"], second_value["generation"]);
+        assert_ne!(second_value["generation"], third_value["generation"]);
+        first.verify_session(factory, "parent")?;
+        second.verify_session(factory, "parent")?;
+        third.verify_session(factory, "parent")?;
+        // Any refused claim, including a replay of a claimed attempt, burns the parent.
+        assert!(claim(5).is_err(), "replayed third cycle");
+        assert!(claim(7).is_err(), "claim after a refused replay");
+        Ok(())
+    })?;
+    assert!(fixture.claim_at(1).is_ok());
+    Ok(())
+}
+
+#[test]
+fn fresh_worker_admission_refused_cycle_attempt_burns_parent() -> Result<()> {
+    for refused in [2, 4, 5] {
+        let fixture = FreshFixture::new()?;
+        with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
+            let run = RunId::new("run")?;
+            let parent = &fixture.plan.assignments[0];
+            let claim = |attempt| {
+                factory.claim_fresh_worker_request_binding(
+                    &run,
+                    parent,
+                    attempt,
+                    SupervisorRuntime::Codex,
+                )
+            };
+            claim(1)?;
+            assert!(claim(refused).is_err(), "attempt {refused}");
+            assert!(claim(3).is_err(), "retry after attempt {refused}");
+            Ok(())
+        })?;
+        assert!(fixture.claim_at(1).is_ok(), "second parent after {refused}");
+    }
+    Ok(())
+}
+
+#[test]
 fn fresh_worker_admission_concurrent_claims_have_one_winner() -> Result<()> {
     let fixture = FreshFixture::new()?;
     with_supervisor_messaging_session(fixture.writer.run_dir(), |factory| {
