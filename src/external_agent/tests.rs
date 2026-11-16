@@ -16599,6 +16599,7 @@ mod managed_worker_live_budget {
             approval_policy: codex_app_server::AppServerApprovalPolicy::OnRequest,
             prompt: "effective Worker prompt including the bound helper appendix".into(),
             model: Some("gpt-5.6-sol".into()),
+            refresh_account: false,
             minimum_effort: None,
             output_schema: None,
         }

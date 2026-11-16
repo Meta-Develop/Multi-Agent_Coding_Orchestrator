@@ -72,6 +72,7 @@ fn researcher_replays_codex_0162_login_shell_commands_without_invented_wrappers(
             model: Some("gpt-6.1-sol".to_string()),
             minimum_effort: Some("xhigh".to_string()),
             output_schema: None,
+            refresh_account: false,
         },
         AppServerLimits::default(),
         &mut |_: ApprovalRequest| Err("replay must not request approval".to_string()),

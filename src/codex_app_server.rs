@@ -806,6 +806,10 @@ pub(crate) struct AppServerTurn {
     /// Selected Auditor requirement; other roles keep their existing qualification path.
     pub(crate) minimum_effort: Option<String>,
     pub(crate) output_schema: Option<Value>,
+    /// Requests a proactive ChatGPT token refresh (`account/read` with
+    /// `refreshToken: true`) before `thread/start`; set only when this
+    /// invocation's auth lease claimed the single-flight refresh (#1039).
+    pub(crate) refresh_account: bool,
 }
 
 impl AppServerTurn {
@@ -1551,8 +1555,10 @@ impl ProtocolState {
                     message: "retry notification is malformed or oversized".to_string(),
                 });
             }
-            if matches!(phase, "thread/start" | "turn/start" | "turn")
-                && message.get("method").and_then(Value::as_str) == Some("account/updated")
+            if matches!(
+                phase,
+                "account/read" | "thread/start" | "turn/start" | "turn"
+            ) && message.get("method").and_then(Value::as_str) == Some("account/updated")
             {
                 self.account_update_notices += 1;
                 if !valid_account_updated(&line)
@@ -1596,7 +1602,7 @@ impl ProtocolState {
                         .to_string(),
                 });
             }
-            if phase == "thread/start"
+            if matches!(phase, "account/read" | "thread/start")
                 && is_startup_information(&message)
                 && !valid_startup_information(&line)
             {
@@ -1844,6 +1850,31 @@ where
         None,
     )?;
     state.send(transport, &json!({"method": "initialized"}))?;
+    if turn.refresh_account {
+        // This invocation's auth lease claimed the proactive single-flight refresh (#1039).
+        // Codex rotates the staged ChatGPT tokens; the lease writes them back afterwards.
+        // A refused refresh leaves the still-valid access token in use.
+        let account_read_id = state.allocate_request_id()?;
+        state.send(
+            transport,
+            &json!({
+                "id": account_read_id.to_value(),
+                "method": "account/read",
+                "params": {"refreshToken": true}
+            }),
+        )?;
+        match wait_for_response(
+            &mut state,
+            transport,
+            &account_read_id,
+            "account/read",
+            &cancelled,
+            None,
+        ) {
+            Ok(_) | Err(AppServerError::Remote { .. }) => {}
+            Err(error) => return Err(error),
+        }
+    }
 
     // An empty environment selection disables execution access. Select only the
     // local environment; the fixed permission profile and outer systemd scope
@@ -2083,7 +2114,7 @@ where
     let mut startup_information_count = 0;
     let message = loop {
         let message = state.receive(transport, phase, cancelled)?;
-        if phase == "thread/start" && is_startup_information(&message) {
+        if matches!(phase, "account/read" | "thread/start") && is_startup_information(&message) {
             // receive validated the original envelope, including absence of any request id,
             // result/error, unknown or duplicate fields. These notices confer no authority.
             startup_information_count += 1;
@@ -4008,6 +4039,7 @@ mod tests {
             approval_policy: AppServerApprovalPolicy::OnRequest,
             prompt: "perform the bounded task".to_string(),
             model: None,
+            refresh_account: false,
             minimum_effort: None,
             output_schema: None,
         }
@@ -4505,6 +4537,83 @@ mod tests {
             assert!(matches!(error, AppServerError::ProtocolLoss { .. }));
             assert!(partial.is_none_or(|outcome| outcome.token_usage.is_none()));
         }
+    }
+
+    fn refresh_account_messages(account_read_response: Value) -> Vec<Value> {
+        let notice = captured_0162_values(CODEX_0162_WORKER_TURN)
+            .into_iter()
+            .find(|value| value["method"] == "account/updated")
+            .unwrap();
+        let startup =
+            json!({"method": "configWarning", "params": {"summary": "notice", "details": null}});
+        let mut messages = command_observation_messages();
+        messages[1]["id"] = json!(3);
+        messages[2]["id"] = json!(4);
+        messages.splice(1..1, [startup, notice, account_read_response]);
+        messages
+    }
+
+    fn run_refresh_account_turn(
+        transport: &mut FakeTransport,
+        refresh_account: bool,
+    ) -> Result<AppServerOutcome, AppServerError> {
+        let turn = AppServerTurn {
+            refresh_account,
+            ..test_turn()
+        };
+        run_app_server_turn(
+            transport,
+            &turn,
+            AppServerLimits::default(),
+            &mut |_: ApprovalRequest| Ok(ApprovalReview::accept()),
+            || false,
+        )
+    }
+
+    #[test]
+    fn refresh_account_reads_the_account_with_a_token_refresh_before_thread_start() {
+        let response = json!({"id": 2, "result": {"account": null, "requiresOpenaiAuth": false}});
+        let mut transport = FakeTransport::from_values(refresh_account_messages(response));
+        let outcome = run_refresh_account_turn(&mut transport, true).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        let methods = transport
+            .sent
+            .iter()
+            .map(|message| message["method"].clone())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            &methods[..4],
+            &[
+                json!("initialize"),
+                json!("initialized"),
+                json!("account/read"),
+                json!("thread/start")
+            ]
+        );
+        assert_eq!(
+            transport.sent[2],
+            json!({"id": 2, "method": "account/read", "params": {"refreshToken": true}})
+        );
+        let mut plain = FakeTransport::from_values(command_observation_messages());
+        run_refresh_account_turn(&mut plain, false).unwrap();
+        assert!(plain
+            .sent
+            .iter()
+            .all(|message| message["method"] != "account/read"));
+    }
+
+    #[test]
+    fn a_refused_account_refresh_keeps_the_turn_and_a_malformed_one_fails() {
+        let refused = json!({"id": 2, "error": {"code": -32603, "message": "refresh failed"}});
+        let mut transport = FakeTransport::from_values(refresh_account_messages(refused));
+        let outcome = run_refresh_account_turn(&mut transport, true).unwrap();
+        assert_eq!(outcome.status, TurnTerminalStatus::Completed);
+        let malformed = json!({"id": 2, "result": "not an object"});
+        let mut transport = FakeTransport::from_values(refresh_account_messages(malformed));
+        assert!(matches!(
+            run_refresh_account_turn(&mut transport, true),
+            Err(AppServerError::Malformed { .. })
+        ));
     }
 
     #[test]
