@@ -3535,6 +3535,42 @@ fn systemd_unit_fixture(runtime: &Path, helper_search_path: Option<OsString>) ->
 
 #[cfg(target_os = "linux")]
 #[test]
+fn systemd_teardown_retains_staged_codex_home_files_for_the_parent() {
+    let temp = tempfile::tempdir().unwrap();
+    let runtime = temp.path().join("runtime");
+    fs::create_dir(&runtime).unwrap();
+    let home = temp.path().join("codex-home");
+    fs::create_dir(&home).unwrap();
+    let mut unit = systemd_unit_fixture(&runtime, None);
+    unit.staged_codex_home = Some(home.clone());
+    let staged_auth = home.join("auth.json");
+    fs::write(&staged_auth, b"ROTATED").unwrap();
+    let outside = temp.path().join("outside");
+    fs::write(&outside, b"OUTSIDE").unwrap();
+    let linked = home.join("linked.json");
+    std::os::unix::fs::symlink(&outside, &linked).unwrap();
+    let private_file = runtime.join("private-input");
+    fs::write(&private_file, b"SECRET").unwrap();
+    unit.runtime_file_paths.push(staged_auth.clone());
+    unit.runtime_file_paths.push(linked.clone());
+    unit.runtime_file_paths.push(private_file.clone());
+
+    unit.remove_runtime_files();
+
+    assert!(!staged_auth.exists());
+    assert!(!private_file.exists());
+    assert_eq!(
+        take_retained_staged_codex_home_file(&staged_auth),
+        Some(b"ROTATED".to_vec())
+    );
+    assert_eq!(take_retained_staged_codex_home_file(&staged_auth), None);
+    assert_eq!(take_retained_staged_codex_home_file(&linked), None);
+    assert_eq!(take_retained_staged_codex_home_file(&private_file), None);
+    assert_eq!(fs::read(&outside).unwrap(), b"OUTSIDE");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
 fn systemd_withheld_attach_stages_retain_observed_evidence_after_rollback() {
     for stage in 0..=8 {
         let _guard = AttachTestGuard;
