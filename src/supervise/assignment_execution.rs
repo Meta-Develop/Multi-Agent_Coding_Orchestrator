@@ -1206,7 +1206,7 @@ fn prepare_assignment_execution<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
 ) -> Result<AssignmentExecutionDisposition<AssignmentExecutionPreflight<'a>>> {
-    prepare_assignment_execution_with_claim(context, outcome, None)
+    prepare_assignment_execution_with_claim(context, outcome, None, None)
 }
 
 #[cfg(test)]
@@ -1639,13 +1639,18 @@ fn execute_isolated_worker_capture(
         "preparing",
         &child.assignment.id,
     );
-    let mut preflight =
-        match prepare_assignment_execution_with_claim(child, outcome, Some(grant.claim()))? {
-            AssignmentExecutionDisposition::Continue(preflight) => preflight,
-            AssignmentExecutionDisposition::Complete => {
-                bail!("isolated Worker preflight refused before dispatch")
-            }
-        };
+    let worktree_id = grant.worktree_id();
+    let mut preflight = match prepare_assignment_execution_with_claim(
+        child,
+        outcome,
+        Some(grant.claim()),
+        Some(worktree_id.as_str()),
+    )? {
+        AssignmentExecutionDisposition::Continue(preflight) => preflight,
+        AssignmentExecutionDisposition::Complete => {
+            bail!("isolated Worker preflight refused before dispatch")
+        }
+    };
     grant.revalidate(parent, parent_preflight)?;
     if preflight.child_base_head != parent_preflight.child_base_head
         || preflight.worktree.path == parent_preflight.worktree.path
@@ -1663,8 +1668,8 @@ fn execute_isolated_worker_capture(
         policy,
         &preflight,
         &parent_preflight.assignment.id,
-        1,
-        1,
+        parent_attempt,
+        parent_attempt,
         &None,
         &child
             .dirs
@@ -1684,7 +1689,7 @@ fn execute_isolated_worker_capture(
         outcome,
         &preflight,
         &parent_preflight.assignment.id,
-        1,
+        parent_attempt,
         prepared,
         Some(release_state),
     );
@@ -1758,7 +1763,7 @@ fn execute_isolated_worker_capture(
         parent_preflight,
         grant,
         lease,
-        1,
+        parent_attempt,
         preflight.semantic_token,
         parsed.report,
         journals,
@@ -1778,6 +1783,7 @@ fn prepare_assignment_execution_with_claim<'a>(
     context: &AssignmentExecutionContext<'a, '_>,
     outcome: &mut AssignmentExecutionOutcome,
     subordinate_claim: Option<&PathClaim>,
+    worktree_id: Option<&str>,
 ) -> Result<AssignmentExecutionDisposition<AssignmentExecutionPreflight<'a>>> {
     let AssignmentExecutionContext {
         index,
@@ -1999,6 +2005,10 @@ fn prepare_assignment_execution_with_claim<'a>(
     } else {
         None
     };
+    // An isolated Worker of a later managed parent cycle receives a fresh sibling
+    // worktree and lease identity; its assignment id is unchanged (#1050).
+    let worktree_agent_id =
+        worktree_id.map_or_else(|| effective_assignment.id.clone(), str::to_string);
     if !reused
         && !matches!(
             worktree_creation,
@@ -2015,7 +2025,7 @@ fn prepare_assignment_execution_with_claim<'a>(
             return Ok(AssignmentExecutionDisposition::Complete);
         }
         let create_options = WorktreeCreateOptions {
-            agent_id: effective_assignment.id.clone(),
+            agent_id: worktree_agent_id.clone(),
             branch: None,
             base: worktree_creation
                 .expected_source_head()
@@ -2029,7 +2039,7 @@ fn prepare_assignment_execution_with_claim<'a>(
                 .with_context(|| {
                     format!(
                         "failed to create capability-bound child worktree '{}'",
-                        effective_assignment.id
+                        worktree_agent_id
                     )
                 }),
             SupervisorWorktreeCreation::ExistingOnly => {
@@ -2063,11 +2073,11 @@ fn prepare_assignment_execution_with_claim<'a>(
         None
     } else {
         match manager
-            .acquire_write_execution_lease(&effective_assignment.id)
+            .acquire_write_execution_lease(&worktree_agent_id)
             .with_context(|| {
                 format!(
                     "failed to acquire exclusive execution lease for child worktree '{}'",
-                    effective_assignment.id
+                    worktree_agent_id
                 )
             }) {
             Ok(lease) => Some(lease),

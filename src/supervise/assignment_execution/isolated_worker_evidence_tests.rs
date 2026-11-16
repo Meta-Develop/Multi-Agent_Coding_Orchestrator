@@ -294,6 +294,60 @@ pub(super) fn check_interrupted_result(
 }
 
 #[test]
+fn later_managed_parent_cycle_uses_fresh_isolated_worker_identity() -> Result<()> {
+    use super::bound_parent_turn::isolated_worker_worktree_id;
+    use super::isolated_worker_evidence::isolated_worker_journal_root;
+    assert_eq!(isolated_worker_worktree_id("worker", 1), "worker");
+    assert_eq!(isolated_worker_worktree_id("worker", 3), "worker.attempt-3");
+    assert_eq!(isolated_worker_journal_root("worker", 1), None);
+    assert_eq!(
+        isolated_worker_journal_root("worker", 3),
+        Some(std::path::PathBuf::from("logs/workers/worker/attempt-3"))
+    );
+    let temp = tempfile::tempdir()?;
+    let repo = temp.path().join("repo");
+    crate::worktree::WorktreeManager::init_repository(&repo, "main")?;
+    fs::write(repo.join("lib.rs"), "pub fn base() {}\n")?;
+    let git = crate::git_repository::open(&repo)?;
+    let mut index = git.index()?;
+    index.add_path(std::path::Path::new("lib.rs"))?;
+    index.write()?;
+    let tree = git.find_tree(index.write_tree()?)?;
+    let signature = git2::Signature::now("test", "test@example.invalid")?;
+    git.commit(Some("HEAD"), &signature, &signature, "base", &tree, &[])?;
+    let manager = crate::worktree::WorktreeManager::new(&repo);
+    let create = |agent_id: String| {
+        manager.create_for_test(crate::worktree::WorktreeCreateOptions {
+            agent_id,
+            branch: None,
+            base: None,
+            worktree_root: Some(temp.path().join("worktrees")),
+        })
+    };
+    // Cycle 1 leaves its Worker worktree with a retained candidate.
+    let first = create(isolated_worker_worktree_id("worker", 1))?;
+    fs::write(first.path.join("lib.rs"), "pub fn first_cycle() {}\n")?;
+    assert!(
+        create(isolated_worker_worktree_id("worker", 1)).is_err(),
+        "the identity of the first cycle cannot be created again"
+    );
+    let second = create(isolated_worker_worktree_id("worker", 3))?;
+    assert_ne!(first.path, second.path);
+    assert_ne!(first.branch, second.branch);
+    assert_eq!(
+        fs::read_to_string(first.path.join("lib.rs"))?,
+        "pub fn first_cycle() {}\n"
+    );
+    assert_eq!(
+        fs::read_to_string(second.path.join("lib.rs"))?,
+        "pub fn base() {}\n"
+    );
+    let lease = manager.acquire_write_execution_lease("worker.attempt-3")?;
+    assert_eq!(lease.record().name, "worker.attempt-3");
+    Ok(())
+}
+
+#[test]
 fn interrupted_isolated_worker_uses_host_outcome_before_empty_report() -> Result<()> {
     super::nested_driver_tests::driver_fixture("managed-cycle-isolated-interrupted-host-outcome")
 }

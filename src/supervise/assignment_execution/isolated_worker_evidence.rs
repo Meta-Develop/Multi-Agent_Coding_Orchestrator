@@ -15,12 +15,14 @@ pub(super) fn retain(
     }
     // Attempt each independent import before propagating failures. In particular,
     // an invalid report or an uncapturable candidate must not hide its journals.
+    let journal_root = isolated_worker_journal_root(&preflight.assignment.id, parent_attempt);
     let journals = with_supervisor_artifacts(context.artifacts, |writer, journal| {
-        let evidence = import_worker_execution_journals(
+        let evidence = import_worker_execution_journals_at(
             writer,
             &preflight.assignment,
             &captured.incoming_scratch,
             &captured.external_run,
+            journal_root.as_deref(),
         )?;
         record_worker_journal_events(journal, writer, &preflight.assignment, &evidence);
         Ok(evidence)
@@ -84,6 +86,28 @@ pub(super) fn retain(
     Ok((journals?, candidate?))
 }
 
+/// The first managed parent cycle keeps the default Worker journal evidence path;
+/// a later cycle retains its Worker journal beside, not over, the journal of an
+/// earlier cycle (#1050).
+pub(super) fn isolated_worker_journal_root(
+    assignment_id: &str,
+    parent_attempt: usize,
+) -> Option<PathBuf> {
+    (parent_attempt > 1).then(|| {
+        PathBuf::from("logs")
+            .join("workers")
+            .join(assignment_id)
+            .join(format!("attempt-{parent_attempt}"))
+    })
+}
+
+fn isolated_worker_journal_evidence(assignment_id: &str, parent_attempt: usize) -> PathBuf {
+    isolated_worker_journal_root(assignment_id, parent_attempt).map_or_else(
+        || worker_execution_journal_evidence_relative(assignment_id, assignment_id),
+        |root| root.join(worker_execution_journal_file_name(assignment_id)),
+    )
+}
+
 fn retain_candidate(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
@@ -123,13 +147,13 @@ fn retain_candidate(
         writer.write_json(&manifest, &json!({
             "version":1, "run_id":context.options.run_id.as_str(),
             "parent_id":parent_id, "parent_attempt":parent_attempt,
-            "assignment_id":preflight.assignment.id, "attempt":1,
+            "assignment_id":preflight.assignment.id, "attempt":parent_attempt,
             "reservation_id":captured.budget_reservation.reservation.id,
             "base_commit":preflight.child_base_head.to_string(),
             "candidate_tree":candidate.snapshot_tree.to_string(),
             "assigned_paths":preflight.assignment.assigned_paths,
             "changed_paths":candidate.changed_paths, "patch":patch,
-            "worker_journal":worker_execution_journal_evidence_relative(&preflight.assignment.id, &preflight.assignment.id),
+            "worker_journal":isolated_worker_journal_evidence(&preflight.assignment.id, parent_attempt),
             "raw_report":captured.attempt_artifacts.raw_report_relative,
             "review_status":"pending", "acceptance_authority":false
         }), ArtifactFileDisposition::PrivateEvidence)?;

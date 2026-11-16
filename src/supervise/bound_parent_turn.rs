@@ -448,6 +448,18 @@ fn release_unstarted_grants(
     }
 }
 
+/// The managed worktree and lease identity of an isolated Worker in the managed
+/// parent cycle whose source attempt is `parent_attempt`. The first cycle keeps
+/// the authored Worker id; a later cycle gets a fresh sibling, so the worktrees
+/// and evidence of earlier cycles stay intact (#1050).
+pub(super) fn isolated_worker_worktree_id(worker_id: &str, parent_attempt: usize) -> String {
+    if parent_attempt <= 1 {
+        worker_id.to_string()
+    } else {
+        format!("{worker_id}.attempt-{parent_attempt}")
+    }
+}
+
 /// No wire constructor and no Clone: only the held frozen-yield consumer issues it.
 pub(super) struct IsolatedWorkerDispatchAuthority {
     sequence: usize,
@@ -466,6 +478,9 @@ impl IsolatedWorkerDispatchAuthority {
     }
     pub(super) fn worker(&self) -> &WorkerAssignment {
         &self.worker
+    }
+    pub(super) fn worktree_id(&self) -> String {
+        isolated_worker_worktree_id(&self.worker.id, self.parent_attempt)
     }
     pub(super) fn claim(&self) -> &PathClaim {
         &self.claim
@@ -622,12 +637,14 @@ impl IsolatedWorkerAttemptEvidence {
             self.model_provenance(),
             self.run(),
         )?;
+        let worktree_id = self.authority.worktree_id();
         context
             .manager
-            .verify_write_execution_lease(&worker.id, &self.lease)?;
+            .verify_write_execution_lease(&worktree_id, &self.lease)?;
         let changes = primary_integrity_changes(before, after);
         if self.worker_attempt == 0
-            || self.lease.record().name != worker.id
+            || self.worker_attempt != self.authority.parent_attempt
+            || self.lease.record().name != worktree_id
             || self.lease.path() == preflight.worktree.path
             || self.run().cwd != self.lease.path()
             || self.command.cwd != self.lease.path()
