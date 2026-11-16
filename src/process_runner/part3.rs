@@ -2172,6 +2172,10 @@ fn cgroup_oom_kill_count(path: &Path) -> Option<u64> {
         .and_then(|events| cgroup_oom_kill_count_from_events(&events))
 }
 
+/// Phrase of the likely OOM kill message; an external agent run that carries it
+/// records a typed `oom_killed` environment failure (#1000).
+pub(crate) const OOM_KILL_FAILURE_MARKER: &str = "was likely killed by the OOM killer";
+
 // memory.events is hierarchical in cgroup v2, so a slice counter also counts kills in sibling
 // units; the message therefore says "likely" instead of naming this unit as the victim (#1000).
 #[cfg(target_os = "linux")]
@@ -2185,7 +2189,7 @@ fn oom_kill_failure_message(
     let (before, after) = (before?, after?);
     (after > before).then(|| {
         format!(
-            "{label} was likely killed by the OOM killer: memory.events oom_kill of {} rose \
+            "{label} {OOM_KILL_FAILURE_MARKER}: memory.events oom_kill of {} rose \
              from {before} to {after} while systemd containment unit {unit} ran (the slice \
              counter also counts other units)",
             slice.display()

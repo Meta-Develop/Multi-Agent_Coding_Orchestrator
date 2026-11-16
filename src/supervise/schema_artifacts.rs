@@ -4611,7 +4611,8 @@ fn environment_failure_schema_value() -> serde_json::Value {
                     "missing_git_attribution",
                     "sandbox_unavailable",
                     "probe_failed",
-                    "runtime_model_catalog_unavailable"
+                    "runtime_model_catalog_unavailable",
+                    "oom_killed"
                 ]
             },
             "requirement": environment_requirement_schema_value(),

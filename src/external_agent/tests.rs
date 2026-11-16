@@ -6212,6 +6212,7 @@ fn environment_failure_category_spellings_are_stable() -> Result<()> {
             EnvironmentFailureCategory::RuntimeModelCatalogUnavailable,
             "runtime_model_catalog_unavailable",
         ),
+        (EnvironmentFailureCategory::OomKilled, "oom_killed"),
     ];
     for (category, spelling) in categories {
         assert_eq!(serde_json::to_value(category)?, spelling);
@@ -17705,6 +17706,43 @@ fn selected_merge_wire_flags_cannot_restore_private_completion() -> Result<()> {
         .selected_merge_completion
         .is_none());
     assert!(restored.qualified_merge_arbiter_output(&command).is_err());
+    Ok(())
+}
+
+#[test]
+fn a_likely_oom_kill_in_the_process_error_is_a_typed_environment_failure() -> Result<()> {
+    let spec = ExternalAgentCommand::codex(
+        "codex",
+        "/workspace",
+        "prompt",
+        "log",
+        "output",
+        Duration::from_secs(1),
+    );
+    let detail = format!(
+        "external agent {}: memory.events oom_kill of /sys/fs/cgroup/app.slice rose from 34 to 35 while systemd containment unit maco-process-1-2.service ran (the slice counter also counts other units)",
+        crate::process_runner::OOM_KILL_FAILURE_MARKER
+    );
+    let mut report = failed_external_run(&spec, Instant::now(), vec![], false, detail.clone());
+    retain_oom_kill_failure(&mut report);
+    retain_oom_kill_failure(&mut report);
+    assert_eq!(report.environment_failures().len(), 1);
+    let failure = &report.environment_failures()[0];
+    assert_eq!(failure.category, EnvironmentFailureCategory::OomKilled);
+    assert_eq!(serde_json::to_value(failure.category)?, "oom_killed");
+    assert_eq!(failure.summary, detail);
+    assert!(!failure.remediation.is_empty());
+    assert_eq!(report.error.as_deref(), Some(detail.as_str()));
+    assert!(!report.succeeded());
+    let mut unrelated = failed_external_run(
+        &spec,
+        Instant::now(),
+        vec![],
+        false,
+        "external agent exited with status 1".to_string(),
+    );
+    retain_oom_kill_failure(&mut unrelated);
+    assert!(unrelated.environment_failures().is_empty());
     Ok(())
 }
 
