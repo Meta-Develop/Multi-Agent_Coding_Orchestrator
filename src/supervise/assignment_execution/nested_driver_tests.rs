@@ -312,6 +312,9 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         plan.max_depth = 3;
         plan.max_child_assignments = 3;
         plan.child_timeout_seconds = 30;
+        if case == "managed-cycle-process-isolated-second-cycle" {
+            plan.max_gate_corrections = 1;
+        }
         plan = validate_supervisor_plan(
             plan,
             SupervisorPlanMetadata {
@@ -735,7 +738,13 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 && subject.id == "parent"
                 && command.codex_managed_readonly_continuation_enabled()
             {
-                let children = captured_worker_claims.lock().unwrap().clone();
+                let mut children = captured_worker_claims.lock().unwrap().clone();
+                if case == "managed-cycle-process-isolated-second-cycle"
+                    && children.len() == 2 * parent.worker_assignments.len()
+                {
+                    // The second cycle's final parent holds only that cycle's Worker claims.
+                    children = children.split_off(parent.worker_assignments.len());
+                }
                 assert!(
                     children.len() == parent.worker_assignments.len(),
                     "isolated final parent requires every captured worker claim"
@@ -1338,7 +1347,11 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         }
         if case == "managed-cycle-process-isolated-initial-import-failure" {
             assert!(overlapping_workers.state.lock().unwrap().workers.is_empty());
-        } else if isolated && !interrupted_worker && case != "managed-cycle-isolated-unstarted" {
+        } else if isolated
+            && !interrupted_worker
+            && case != "managed-cycle-isolated-unstarted"
+            && case != "managed-cycle-process-isolated-second-cycle"
+        {
             let live = overlapping_workers.state.lock().unwrap().workers.clone();
             assert_eq!(live.len(), 2);
             let latest_start = live.iter().map(|entry| entry.2).max().unwrap();

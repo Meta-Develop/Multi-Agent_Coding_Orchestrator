@@ -14,6 +14,16 @@ pub(super) fn run(
     let mode;
     let report;
     let mut payload = json!({"case":case});
+    // The second-cycle case runs two managed parent cycles of two Workers each,
+    // with source attempts 1 and 3 (#1050); every other case runs one cycle.
+    let second_cycle = case == "isolated-second-cycle";
+    let held_workers = workers.lock().unwrap().len();
+    let initial_attempt = if second_cycle { held_workers + 1 } else { 1 };
+    let final_source_attempt = if second_cycle {
+        held_workers.saturating_sub(1)
+    } else {
+        1
+    };
     if identity.task_id != "parent" {
         mode = "worker";
         report = serde_json::from_slice(template.output_last_message().unwrap())?;
@@ -37,7 +47,7 @@ pub(super) fn run(
         mode = "initial";
         assert!(command.worker_journal_artifacts.is_empty());
         report = json!({"version":1,"outcome":"yield_workers","run_id":identity.run_id,
-            "parent_id":"parent","parent_attempt":1,"requests":[
+            "parent_id":"parent","parent_attempt":initial_attempt,"requests":[
                 {"request_id":"r1","worker_id":"worker"},
                 {"request_id":"r2","worker_id":"worker-two"}]});
     } else {
@@ -46,7 +56,12 @@ pub(super) fn run(
         assert!(command.worker_journal_artifacts.is_empty());
         let mut parent: OrchestratorReviewReport =
             serde_json::from_slice(template.output_last_message().unwrap())?;
-        parent.worker_reports = workers.lock().unwrap().clone();
+        let mut held = workers.lock().unwrap().clone();
+        if second_cycle {
+            // Each cycle's final turn reports only that cycle's two Workers.
+            held = held.split_off(held.len() - 2);
+        }
+        parent.worker_reports = held;
         parent.worker_reports.sort_by(|a, b| a.id.cmp(&b.id));
         parent.files_changed = vec!["src/lib.rs".into(), "src/other.rs".into()];
         if case == "isolated-misreported-paths" {
@@ -60,7 +75,7 @@ pub(super) fn run(
             parent.rejected = true;
             parent.status = ReviewStatus::Failed;
         }
-        if case == "isolated-collector-rejected" {
+        if case == "isolated-collector-rejected" || (second_cycle && final_source_attempt == 1) {
             parent.gate_denials.push(GateDenial::new(
                 "self-authored-fixture",
                 GateDenialReason::ClaimConflict,
@@ -102,7 +117,7 @@ pub(super) fn run(
             _ => {}
         }
         report = json!({"version":2,"run_id":identity.run_id,"parent_id":"parent",
-            "source_parent_attempt":1,"parent_attempt":2,"completed_worker_ids":["worker","worker-two"],
+            "source_parent_attempt":final_source_attempt,"parent_attempt":final_source_attempt + 1,"completed_worker_ids":["worker","worker-two"],
             "turn":turn});
     }
     payload["mode"] = json!(mode);
@@ -186,6 +201,9 @@ pub(super) fn exercise(
     // preflight's pending token so terminal cleanup can detect double releases.
     outcome.claim_tokens.push(preflight.claim.token);
     let schemas = &context.dirs.schemas;
+    if case == "isolated-second-cycle" {
+        return exercise_second_cycle(context, preflight, outcome, prepared, calls);
+    }
     if case == "isolated-initial-import-failure" {
         let destination = context
             .run_dir
@@ -661,6 +679,156 @@ pub(super) fn exercise(
     Ok(())
 }
 
+/// Drives two managed parent cycles as the gate loop does with one gate
+/// correction (max_attempts 2): a collector-rejected first cycle on source
+/// attempt 1, then a corrected second cycle on source attempt 3 whose isolated
+/// Workers get fresh identities (#1050).
+fn exercise_second_cycle(
+    context: &AssignmentExecutionContext<'_, '_>,
+    preflight: &AssignmentExecutionPreflight<'_>,
+    outcome: &mut AssignmentExecutionOutcome,
+    prepared: Box<PreparedChildAttempt<'_>>,
+    calls: &Mutex<Vec<String>>,
+) -> Result<()> {
+    let schemas = &context.dirs.schemas;
+    let run_id = context.options.run_id.as_str();
+    let max_attempts = 2;
+    let first_findings = {
+        let first = super::managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
+            context,
+            outcome,
+            preflight,
+            run_id,
+            1,
+            prepared,
+            &context.budget_policy,
+            max_attempts,
+            &schemas.join("orchestrator-review-report.schema.json"),
+            &schemas.join("worker-report.schema.json"),
+            &schemas.join("auditor-report.schema.json"),
+        )
+        .context("first managed parent cycle")?;
+        assert!(report_failed(&first.attempt_report));
+        first.attempt_report.findings.clone()
+    };
+    assert!(
+        first_findings.iter().any(|finding| finding
+            .message
+            .contains("self-assert supervisor-owned gate correction evidence")),
+        "{first_findings:?}"
+    );
+    assert_eq!(outcome.released_claims.len(), 2);
+    assert_eq!(
+        current_head_oid(&preflight.worktree.path)?,
+        preflight.child_base_head
+    );
+    let correction = Some(ChildAttemptCorrection::StructuralReport(vec![
+        "fixture first-cycle correction".to_string(),
+    ]));
+    let prepared = match prepare_managed_parent_initial_attempt(
+        context,
+        outcome,
+        &context.budget_policy,
+        preflight,
+        run_id,
+        3,
+        max_attempts,
+        &correction,
+        &schemas.join("orchestrator-review-report.schema.json"),
+        &schemas.join("worker-report.schema.json"),
+        &schemas.join("auditor-report.schema.json"),
+    )? {
+        AssignmentExecutionDisposition::Continue(prepared) => prepared,
+        AssignmentExecutionDisposition::Complete => {
+            bail!("second managed parent cycle preparation unexpectedly completed")
+        }
+    };
+    let collected = super::managed_parent_controller::dispatch_and_collect_managed_parent_attempt(
+        context,
+        outcome,
+        preflight,
+        run_id,
+        3,
+        prepared,
+        &context.budget_policy,
+        max_attempts,
+        &schemas.join("orchestrator-review-report.schema.json"),
+        &schemas.join("worker-report.schema.json"),
+        &schemas.join("auditor-report.schema.json"),
+    )
+    .context("second managed parent cycle")?;
+    assert!(
+        !report_failed(&collected.attempt_report),
+        "{:?}",
+        collected.attempt_report.findings
+    );
+    assert!(collected.attempt_containment_verified);
+    assert_eq!(collected._worker_journal_evidence.len(), 2);
+    let combined = collected
+        .attempt_report
+        .validation_results
+        .iter()
+        .find(|v| v.name == "combined check")
+        .context("second-cycle final parent did not run combined check")?;
+    assert_eq!(combined.status, ReviewStatus::Succeeded);
+    let observed = calls.lock().unwrap().clone();
+    assert_eq!(observed.len(), 8, "{observed:?}");
+    for index in [0, 3, 4, 7] {
+        assert_eq!(observed[index], "parent", "{observed:?}");
+    }
+    assert!(
+        fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?
+            .contains("pub fn first() -> u32 { 40 }")
+    );
+    assert!(
+        fs::read_to_string(preflight.worktree.path.join("src/other.rs"))?
+            .contains("pub fn second() -> u32 { crate::first() + 2 }")
+    );
+    assert_eq!(outcome.released_claims.len(), 4);
+    assert_eq!(
+        context.sync_store.snapshot()?,
+        vec![preflight.claim.clone()]
+    );
+    let names = context
+        .manager
+        .list_managed_verified()?
+        .into_iter()
+        .map(|record| record.name)
+        .collect::<Vec<_>>();
+    for name in [
+        "worker",
+        "worker-two",
+        "worker.attempt-3",
+        "worker-two.attempt-3",
+    ] {
+        assert!(names.iter().any(|entry| entry == name), "{names:?}");
+    }
+    for worker in ["worker", "worker-two"] {
+        let journal = context
+            .run_dir
+            .join("logs/workers")
+            .join(worker)
+            .join("attempt-3");
+        assert!(journal.is_dir(), "{}", journal.display());
+    }
+    assert!(
+        preflight.issue_nested_turn(3).is_err(),
+        "spent second-cycle turn replayed"
+    );
+    let budget = context.budget_ledger.report()?;
+    assert_eq!(budget.active_reservations, 0);
+    assert_eq!(budget.reserved.tokens, 0);
+    assert!(!outcome.usage_incomplete);
+    assert!(
+        !super::super::scheduler::nested_workers_lack_observed_usage(
+            context.plan,
+            Some(&budget),
+            &[]
+        )
+    );
+    Ok(())
+}
+
 fn assert_combined_review_handoff(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
@@ -905,6 +1073,14 @@ fn managed_parent_process_isolated_collector_rejection_discards_without_worker_c
         "managed_parent_process_isolated_collector_rejection_discards_without_worker_commits"
     );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-collector-rejected")
+}
+
+#[test]
+fn managed_parent_process_isolated_second_cycle_uses_fresh_worker_identities() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_second_cycle_uses_fresh_worker_identities"
+    );
+    super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-second-cycle")
 }
 
 #[test]
