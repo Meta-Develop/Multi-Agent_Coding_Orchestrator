@@ -628,6 +628,15 @@ fn exercise_retained_failure(
             );
             raw.push(b'\n');
         }
+        // The public summary keeps the start and the end of the stream (#1000); this later
+        // message keeps the late command in its omitted middle, retained only privately.
+        raw.extend(
+            serde_json::to_vec(&json!({
+                "method":"item/agentMessage/delta", "params":{"delta":"y".repeat(40 * 1024)}
+            }))
+            .unwrap(),
+        );
+        raw.push(b'\n');
         raw.extend(
             serde_json::to_vec(&json!({
                 "method":"thread/tokenUsage/updated", "params":{
