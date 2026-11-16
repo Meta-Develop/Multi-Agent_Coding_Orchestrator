@@ -734,6 +734,17 @@ fn review_pipe_probe(script: &str) -> Duration {
 }
 
 fn pipe_probe(script: &str, large_input: bool) -> Duration {
+    // A loaded runner can stop the fake ssh at the 200 ms deadline before it records its
+    // descendant; such an attempt did not exercise the escaped pipe owner (#1046).
+    for _ in 0..3 {
+        if let Some(elapsed) = pipe_probe_attempt(script, large_input) {
+            return elapsed;
+        }
+    }
+    panic!("the pipe-holding descendant did not start in 3 attempts");
+}
+
+fn pipe_probe_attempt(script: &str, large_input: bool) -> Option<Duration> {
     let f = Fixture::new(COMPLETE, "none");
     let descendant = f.temp.path().join("descendant.pid");
     let script = script.replace(
@@ -791,7 +802,9 @@ fn pipe_probe(script: &str, large_input: bool) -> Duration {
     });
     assert!(matches!(result, TransportCall::LostResponse { .. }));
     let elapsed = start.elapsed();
-    let pid = fs::read_to_string(descendant).expect("the pipe-holding descendant started");
+    let Ok(pid) = fs::read_to_string(descendant) else {
+        return None;
+    };
     if let Ok(stat) = fs::read_to_string(format!("/proc/{pid}/stat")) {
         assert_eq!(
             stat.rsplit_once(')').unwrap().1.split_whitespace().next(),
@@ -799,7 +812,7 @@ fn pipe_probe(script: &str, large_input: bool) -> Duration {
             "pipe-holding descendant survived transport cleanup"
         );
     }
-    elapsed
+    Some(elapsed)
 }
 
 #[test]
