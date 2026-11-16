@@ -1,7 +1,8 @@
 //! Opt-in submit/status transport for a supervisor-held inbox. No launch authority.
 //!
-//! A fresh session may mint one supervisor-owned first-turn binding per authored
-//! parent. The staged transport caller supplies the frozen authored parent, current
+//! A fresh session may mint one supervisor-owned binding per managed cycle of each
+//! authored parent, for source attempts 1, 3, 5, ... in that order (#1050). The
+//! staged transport caller supplies the frozen authored parent, current
 //! binding and an already-opened inbox. It must persist/reuse that generation,
 //! reconcile recovery, and cancel/drop the endpoint at attempt end. There is no
 //! automatic fresh/recover fallback here. Ordinary assignment endpoints do not gain
@@ -45,7 +46,8 @@ impl SupervisorMessagingSessionFactory {
         Ok(())
     }
 
-    /// Claims one fresh inbox identity for an exact authored parent in this live session.
+    /// Claims one fresh inbox identity for an exact authored parent's next managed
+    /// cycle in this live session: source attempt 1 first, then 3, 5, ... (#1050).
     /// `parent`, `attempt`, and the resolved runtime must come from supervisor launch
     /// context. The critical section removes only the entry with that parent id. Exact
     /// authored equality then prevents substituting another parent's Workers. The only
@@ -54,8 +56,10 @@ impl SupervisorMessagingSessionFactory {
     /// to its selected runtime. An explicit frozen runtime must match exactly. No other field,
     /// including nested Workers, may differ. A known parent is consumed even when the
     /// claim is later refused, so callers must retain the returned binding for this live
-    /// turn and never retry that parent after downstream failure. An unknown parent id
-    /// leaves every remaining permit. This is inbox admission only, not permission to
+    /// turn and never retry that parent after downstream failure. Only a successful claim
+    /// re-admits the parent, for its next managed cycle's source attempt alone (attempt
+    /// plus 2). An unknown parent id leaves every remaining permit. This is inbox
+    /// admission only, not permission to
     /// dispatch or recover any Worker.
     #[allow(dead_code)] // No production caller until the complete turn controller lands.
     pub(in crate::supervise) fn claim_fresh_worker_request_binding(
@@ -67,7 +71,7 @@ impl SupervisorMessagingSessionFactory {
     ) -> Result<WorkerRequestBinding> {
         // Remove only this parent id before verification, randomness, or any other
         // fallible downstream work. A foreign id must not burn a different permit.
-        let authored = {
+        let (authored, next_attempt) = {
             let mut admission = self
                 .fresh_worker_request_parents
                 .lock()
@@ -77,22 +81,35 @@ impl SupervisorMessagingSessionFactory {
                 .context("fresh Worker request admission is unavailable or already consumed")?;
             let index = parents
                 .iter()
-                .position(|authored| authored.id == parent.id)
+                .position(|(authored, _)| authored.id == parent.id)
                 .context("fresh Worker request admission does not include that authored parent")?;
             parents.remove(index)
         };
-        if attempt != 1
+        if attempt != next_attempt
             || resolved_runtime == SupervisorRuntime::Fake
             || parent
                 .runtime
                 .is_some_and(|runtime| runtime != resolved_runtime)
             || !authored_parent_accepts_runtime_projection(&authored, parent, resolved_runtime)
         {
-            bail!("fresh Worker request admission requires the exact authored first selected parent turn");
+            bail!("fresh Worker request admission requires the exact authored parent at its next managed cycle source attempt");
         }
+        let following = attempt
+            .checked_add(2)
+            .context("fresh Worker request admission exhausted its managed cycles")?;
         let generation =
             random_identifier().context("failed to mint fresh Worker inbox generation")?;
-        self.worker_request_binding(run_id, parent, attempt, &generation)
+        let binding = self.worker_request_binding(run_id, parent, attempt, &generation)?;
+        // Re-admit this parent for its next managed cycle only after the claim succeeded.
+        // A revoked admission stays revoked.
+        let mut admission = self
+            .fresh_worker_request_parents
+            .lock()
+            .map_err(|_| anyhow::anyhow!("fresh Worker request admission is poisoned"))?;
+        if let Some(parents) = admission.as_mut() {
+            parents.push((authored, following));
+        }
+        Ok(binding)
     }
 
     /// `parent` and attempt identity must come from the current supervisor context,

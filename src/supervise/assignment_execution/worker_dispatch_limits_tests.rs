@@ -244,7 +244,7 @@ fn qualification_mode(
     let cancellation = ProcessCancellation::new();
     let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
     let preflight = AssignmentExecutionPreflight {
-        nested_turn_issued: AtomicBool::new(false),
+        nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
         journal_parent_id: run_id.as_str(),
         environment_requirements: Vec::new(),
         semantic_token: None,
@@ -792,6 +792,18 @@ fn qualification_mode(
         preflight.issue_nested_turn(1).is_err(),
         "replayed spent turn"
     );
+    let next_cycle = preflight.issue_nested_turn(3)?;
+    next_cycle.revalidate(&preflight, 3)?;
+    assert!(
+        next_cycle.revalidate(&preflight, 1).is_err(),
+        "next-cycle permit revalidated for the spent attempt"
+    );
+    for replay in [3, 2, 1] {
+        assert!(
+            preflight.issue_nested_turn(replay).is_err(),
+            "replayed attempt {replay} after the next cycle"
+        );
+    }
     Ok(())
 }
 

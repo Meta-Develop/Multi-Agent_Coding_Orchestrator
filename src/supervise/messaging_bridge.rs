@@ -103,9 +103,11 @@ pub(super) struct SupervisorMessagingSessionFactory {
     registry: CredentialRegistry,
     capabilities: BTreeMap<String, PresentedCredential>,
     persistent: Option<PersistentMessagingBinding>,
-    // Process-local, one-shot authority; never reconstructed from a descriptor or journal.
+    // Process-local authority; never reconstructed from a descriptor or journal.
     // Only successful fresh initialization installs the exact supervisor-authored plan.
-    fresh_worker_request_parents: Mutex<Option<Vec<OrchestratorAssignment>>>,
+    // Each authored parent carries the only source attempt it may claim next: 1 for
+    // its first managed cycle, then 3, 5, ... (#1050).
+    fresh_worker_request_parents: Mutex<Option<Vec<(OrchestratorAssignment, usize)>>>,
 }
 
 impl SupervisorMessagingSessionFactory {
@@ -497,7 +499,11 @@ pub(super) fn initialize_supervisor_messaging_session(
                 .create_initial_persistent_broker()
                 .context("supervisor messaging pre-launch journal creation failed")?,
         );
-        factory.fresh_worker_request_parents = Mutex::new(Some(plan.assignments.clone()));
+        let mut parents = Vec::new();
+        for parent in &plan.assignments {
+            parents.push((parent.clone(), 1));
+        }
+        factory.fresh_worker_request_parents = Mutex::new(Some(parents));
     } else {
         drop(
             factory

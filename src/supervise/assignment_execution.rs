@@ -1125,7 +1125,7 @@ fn refuse_source_head_execution_base(
 }
 
 pub(super) struct AssignmentExecutionPreflight<'a> {
-    nested_turn_issued: AtomicBool,
+    nested_turn_attempt: std::sync::atomic::AtomicUsize,
     journal_parent_id: &'a str,
     environment_requirements: Vec<EnvironmentRequirement>,
     semantic_token: Option<u64>,
@@ -1141,20 +1141,28 @@ pub(super) struct AssignmentExecutionPreflight<'a> {
 }
 
 impl<'a> AssignmentExecutionPreflight<'a> {
-    /// Burn the slot before checking the request. Failed construction and permit
-    /// drop never authorize a replacement driver, including for another attempt.
+    /// Burn the slot before checking the request. Each permit covers one source
+    /// attempt, that is one managed parent cycle (#1050). Failed construction and
+    /// permit drop never authorize a replacement driver for that attempt or an
+    /// earlier one, and a continuation (even) attempt never receives a permit.
     pub(super) fn issue_nested_turn(
         &self,
         parent_attempt: usize,
     ) -> Result<NestedTurnExecutionPermit<'_, 'a>> {
-        if self.nested_turn_issued.swap(true, Ordering::AcqRel) {
-            bail!("nested turn execution permit has already been issued");
+        let valid = parent_attempt % 2 == 1
+            && self.assignment.role == AgentRole::ChildOrchestrator
+            && self.assignment.phase == AssignmentPhase::Execution;
+        // A valid request burns its attempt and every earlier one; a refused
+        // request burns every attempt, so no later cycle can follow it.
+        let burn = if valid { parent_attempt } else { usize::MAX };
+        let previous = self.nested_turn_attempt.fetch_max(burn, Ordering::AcqRel);
+        if !valid {
+            bail!(
+                "nested turn execution permit requires an authored parent execution source attempt"
+            );
         }
-        if parent_attempt == 0
-            || self.assignment.role != AgentRole::ChildOrchestrator
-            || self.assignment.phase != AssignmentPhase::Execution
-        {
-            bail!("nested turn execution permit requires an authored parent execution attempt");
+        if previous >= parent_attempt {
+            bail!("nested turn execution permit has already been issued");
         }
         Ok(NestedTurnExecutionPermit {
             preflight: self,
@@ -1186,7 +1194,7 @@ impl NestedTurnExecutionPermit<'_, '_> {
     ) -> Result<()> {
         if !std::ptr::eq(self.preflight, preflight)
             || self.parent_attempt != parent_attempt
-            || !preflight.nested_turn_issued.load(Ordering::Acquire)
+            || preflight.nested_turn_attempt.load(Ordering::Acquire) != parent_attempt
         {
             bail!("nested turn execution permit differs from the current preflight or attempt");
         }
@@ -2298,7 +2306,7 @@ fn prepare_assignment_execution_with_claim<'a>(
         })?;
     Ok(AssignmentExecutionDisposition::Continue(
         AssignmentExecutionPreflight {
-            nested_turn_issued: AtomicBool::new(false),
+            nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
             journal_parent_id,
             environment_requirements,
             semantic_token,
@@ -13203,7 +13211,7 @@ mod decomposition_tests {
                 &assignment.assigned_paths,
             )?;
             AssignmentExecutionPreflight {
-                nested_turn_issued: AtomicBool::new(false),
+                nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
                 journal_parent_id: options.run_id.as_str(),
                 environment_requirements: Vec::new(),
                 semantic_token: None,

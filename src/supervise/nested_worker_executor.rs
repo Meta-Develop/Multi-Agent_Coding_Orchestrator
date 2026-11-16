@@ -957,7 +957,7 @@ mod tests {
         let claim = sync_store.claim_paths_for_run(&run_id, &parent.id, &parent.assigned_paths)?;
         let cancellation = ProcessCancellation::new();
         let preflight = AssignmentExecutionPreflight {
-            nested_turn_issued: AtomicBool::new(false),
+            nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
             journal_parent_id: run_id.as_str(),
             environment_requirements: Vec::new(),
             semantic_token: None,
@@ -989,7 +989,7 @@ mod tests {
                 &assignment.assigned_paths,
             )?;
             Some(AssignmentExecutionPreflight {
-                nested_turn_issued: AtomicBool::new(false),
+                nested_turn_attempt: std::sync::atomic::AtomicUsize::new(0),
                 journal_parent_id: run_id.as_str(),
                 environment_requirements: Vec::new(),
                 semantic_token: None,
@@ -1418,7 +1418,7 @@ mod tests {
         let mut permit = foreign_preflight
             .as_ref()
             .unwrap_or(&preflight)
-            .issue_nested_turn(if case == "wrong-permit-attempt" { 2 } else { 1 })?;
+            .issue_nested_turn(if case == "wrong-permit-attempt" { 3 } else { 1 })?;
         if case == "live-checkpoint-failure" {
             install_checkpoint_failure(run_id.as_str(), "live_budget_settled");
         }
