@@ -381,8 +381,8 @@
     },
     "declared_input_sha256": "5c1f762c0fe91e8c80e7408a7d30dea40736a713f4c68368c2752b7c6a528b72",
     "features": {
-      "complexity": 5050,
-      "context_tokens": 6360,
+      "complexity": 4550,
+      "context_tokens": 4875,
       "dependency_edges": 0,
       "evidence": [
         "canonical_scope_and_disjointness_revalidated",
@@ -393,7 +393,7 @@
         "context_estimates_encoded_declared_inputs_and_policy_allowances_only",
         "score_saturation_is_explicit_loaded_policy"
       ],
-      "horizon": 4840,
+      "horizon": 4340,
       "independent_groups": 3,
       "risk": 620,
       "scope_modules": 0,

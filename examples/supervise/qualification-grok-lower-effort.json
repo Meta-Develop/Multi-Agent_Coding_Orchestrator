@@ -299,10 +299,10 @@
         "context_estimates_encoded_declared_inputs_and_policy_allowances_only",
         "score_saturation_is_explicit_loaded_policy"
       ],
-      "complexity": 2050,
+      "complexity": 1850,
       "risk": 540,
-      "horizon": 1980,
-      "context_tokens": 2424
+      "horizon": 1780,
+      "context_tokens": 1887
     },
     "policy_sha256": "b36e669327e729d9cee22480ff20f0b60415f4144ac26f70e4a6e116e4c10c08",
     "provenance": "policy_heuristic"

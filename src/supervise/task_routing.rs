@@ -382,6 +382,30 @@ fn checked_weighted_score(
     Ok(score)
 }
 
+// Bytes of the smaller specification views: the declared task, the fragment texts and
+// the assignment tasks each restate the same specification (#1035).
+fn repeated_view_bytes(declaration: &TaskEstimationDeclaration) -> Result<u64> {
+    let declared = u64::try_from(declaration.declared_task.len())?;
+    let mut fragments = 0u64;
+    for fragment in &declaration.fragments {
+        fragments = fragments
+            .checked_add(u64::try_from(fragment.text.len())?)
+            .context("task declaration byte count overflow")?;
+    }
+    let mut tasks = 0u64;
+    for assignment in &declaration.assignments {
+        tasks = tasks
+            .checked_add(u64::try_from(assignment.task.len())?)
+            .context("task declaration byte count overflow")?;
+    }
+    let largest = declared.max(fragments).max(tasks);
+    declared
+        .checked_add(fragments)
+        .and_then(|sum| sum.checked_add(tasks))
+        .map(|sum| sum - largest)
+        .context("task declaration byte count overflow")
+}
+
 fn contains_ascii_word(haystack: &str, needle: &str) -> bool {
     if needle.is_empty() {
         return false;
@@ -402,7 +426,10 @@ fn estimate_declaration(
 ) -> Result<(TaskRoutingFeatures, String)> {
     let policy = effective_estimator(frozen)?;
     let canonical = declaration.validate_bounds(policy)?;
-    let declared_bytes = u64::try_from(canonical.len())?;
+    // The declared task, the fragment texts and the assignment tasks restate one
+    // specification; the size terms count its largest view once, plus structure (#1035).
+    let repeated = repeated_view_bytes(declaration)?;
+    let declared_bytes = u64::try_from(canonical.len())?.saturating_sub(repeated);
     let mut features =
         features_from_proposal(&declaration.to_proposal(), &empty_structural_seed())?;
     let mut complexity =
@@ -741,6 +768,28 @@ mod tests {
         assert_ne!(simple_profile.context, demanding_profile.context);
         assert_eq!(demanding_profile.authority_role, base.authority_role);
         assert_eq!(demanding_profile.task_class, base.task_class);
+        Ok(())
+    }
+
+    #[test]
+    fn repeated_specification_views_count_once_in_size_terms() -> Result<()> {
+        let frozen = estimation_policy()?;
+        let task = "Edit exactly the dictated lines of one file. ".repeat(300);
+        let mut short = proposal();
+        short.fragments.truncate(1);
+        short.assignments.truncate(1);
+        let mut repeated = short.clone();
+        repeated.fragments[0].text = task.clone();
+        repeated.assignments[0].task = task.clone();
+        let once = assess_task_routing(&task, &short, &frozen)?;
+        let thrice = assess_task_routing(&task, &repeated, &frozen)?;
+        assert_eq!(thrice.features.complexity, once.features.complexity);
+        assert_eq!(thrice.features.horizon, once.features.horizon);
+        assert_eq!(thrice.features.context_tokens, once.features.context_tokens);
+        thrice.validate(&frozen)?;
+        let profile = project_task_profile(&unassessed_profile(), &thrice, &frozen)?;
+        assert_eq!(profile.boundedness, crate::selection::Boundedness::Bounded);
+        assert_eq!(profile.horizon, crate::selection::TaskHorizon::Medium);
         Ok(())
     }
 
