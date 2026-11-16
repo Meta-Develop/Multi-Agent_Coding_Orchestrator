@@ -1264,6 +1264,39 @@ fn dispatch_isolated_parent_workers(
     result
 }
 
+/// The direct terminal Worker assignment that an isolated managed parent cycle
+/// launches for one authored Worker, with the runtime MACO selected for it. A
+/// Vibe Worker is admitted by the direct Worker launch of this subject (#1051).
+pub(super) fn isolated_worker_subject(
+    parent: &OrchestratorAssignment,
+    worker: &WorkerAssignment,
+    runtime: SupervisorRuntime,
+) -> OrchestratorAssignment {
+    OrchestratorAssignment {
+        assignment_shape: None,
+        id: worker.id.clone(),
+        phase: AssignmentPhase::Execution,
+        runtime: Some(runtime),
+        role: AgentRole::Worker,
+        role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+        selection_source: worker.selection_source,
+        assigned_paths: worker.assigned_paths.clone(),
+        semantic_symbols: worker.semantic_symbols.clone(),
+        semantic_modules: worker.semantic_modules.clone(),
+        task: worker.task.clone().or_else(|| parent.task.clone()),
+        worker_assignments: Vec::new(),
+        environment_requirements: parent
+            .environment_requirements
+            .iter()
+            .chain(&worker.environment_requirements)
+            .cloned()
+            .collect(),
+        licensed_breakage: parent.licensed_breakage.clone(),
+        notes: parent.notes.clone(),
+        decision_refs: parent.decision_refs.clone(),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_isolated_parent_workers_inner(
     context: &AssignmentExecutionContext<'_, '_>,
@@ -1304,33 +1337,7 @@ fn dispatch_isolated_parent_workers_inner(
         {
             bail!("isolated dispatch grant order differs from the frozen authored turn");
         }
-        let subject = OrchestratorAssignment {
-            assignment_shape: None,
-            id: worker.id.clone(),
-            phase: AssignmentPhase::Execution,
-            runtime: Some(runtime),
-            role: AgentRole::Worker,
-            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
-            selection_source: worker.selection_source,
-            assigned_paths: worker.assigned_paths.clone(),
-            semantic_symbols: worker.semantic_symbols.clone(),
-            semantic_modules: worker.semantic_modules.clone(),
-            task: worker
-                .task
-                .clone()
-                .or_else(|| parent_preflight.assignment.task.clone()),
-            worker_assignments: Vec::new(),
-            environment_requirements: parent_preflight
-                .assignment
-                .environment_requirements
-                .iter()
-                .chain(&worker.environment_requirements)
-                .cloned()
-                .collect(),
-            licensed_breakage: parent_preflight.assignment.licensed_breakage.clone(),
-            notes: parent_preflight.assignment.notes.clone(),
-            decision_refs: parent_preflight.assignment.decision_refs.clone(),
-        };
+        let subject = isolated_worker_subject(&parent_preflight.assignment, worker, runtime);
         if subject.runtime == Some(SupervisorRuntime::Fake) {
             bail!("isolated verified Worker cannot use the simulated runtime");
         }
