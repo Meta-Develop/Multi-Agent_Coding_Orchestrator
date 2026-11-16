@@ -11,7 +11,8 @@ use std::{
     fs,
     io::{Read, Write},
     path::{Path, PathBuf},
-    sync::{Mutex, MutexGuard},
+    sync::{Condvar, Mutex, MutexGuard},
+    time::{Duration, Instant, SystemTime},
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -93,6 +94,64 @@ fn chatgpt_account(bytes: &[u8]) -> Option<String> {
         return None;
     }
     Some(account.to_string())
+}
+
+/// A ChatGPT access token that expires within this margin is refreshed before a
+/// launch while no other launch of its source runs (#1039).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) const CODEX_AUTH_PROACTIVE_REFRESH_MARGIN: Duration =
+    Duration::from_secs(3 * 24 * 60 * 60);
+
+/// Decodes unpadded base64url (RFC 4648 section 5); `None` on any other byte.
+fn decode_base64url(text: &str) -> Option<Vec<u8>> {
+    let mut bits = 0u32;
+    let mut count = 0u32;
+    let mut decoded = Vec::with_capacity(text.len() * 3 / 4);
+    for byte in text.bytes() {
+        let value = match byte {
+            b'A'..=b'Z' => byte - b'A',
+            b'a'..=b'z' => byte - b'a' + 26,
+            b'0'..=b'9' => byte - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        bits = (bits << 6) | u32::from(value);
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            decoded.push((bits >> count) as u8);
+            bits &= (1 << count) - 1;
+        }
+    }
+    Some(decoded)
+}
+
+/// Expiry of the ChatGPT access token in auth bytes: the `exp` claim (seconds
+/// since the Unix epoch) of the unverified JWT payload of `tokens.access_token`
+/// (#1039). `None` when the bytes carry no such claim.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn access_token_expiry(bytes: &[u8]) -> Option<SystemTime> {
+    let value = serde_json::from_slice::<serde_json::Value>(bytes).ok()?;
+    let token = value.get("tokens")?.get("access_token")?.as_str()?;
+    let payload = token.split('.').nth(1)?;
+    let decoded = decode_base64url(payload)?;
+    let claims = serde_json::from_slice::<serde_json::Value>(&decoded).ok()?;
+    let exp = claims.get("exp")?.as_u64()?;
+    SystemTime::UNIX_EPOCH.checked_add(Duration::from_secs(exp))
+}
+
+/// Whether auth bytes carry a ChatGPT account whose access token expires within
+/// `margin` of `now` (#1039). Bytes without a readable expiry are never due.
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn codex_auth_refresh_due(bytes: &[u8], now: SystemTime, margin: Duration) -> bool {
+    if chatgpt_account(bytes).is_none() {
+        return false;
+    }
+    match (access_token_expiry(bytes), now.checked_add(margin)) {
+        (Some(expiry), Some(limit)) => expiry <= limit,
+        _ => false,
+    }
 }
 
 /// Returns the `auth_mode` JSON value of auth bytes, or `None` when the bytes
@@ -188,11 +247,16 @@ struct CodexAuthLeaseEntry {
     active: usize,
     /// Pending `(launch bytes, staged bytes)` pair of a finished lease.
     pending: Option<(Vec<u8>, Vec<u8>)>,
+    /// Whether a proactive refresh of that source is in progress (#1039).
+    refreshing: bool,
 }
 
 /// Process-global registry of active Codex auth leases per source path.
 static CODEX_AUTH_LEASES: Mutex<BTreeMap<PathBuf, CodexAuthLeaseEntry>> =
     Mutex::new(BTreeMap::new());
+
+/// Signalled when a proactive refresh of a source ends (#1039).
+static CODEX_AUTH_LEASES_CHANGED: Condvar = Condvar::new();
 
 /// Locks the lease registry, recovering a poisoned lock.
 fn lock_codex_auth_leases() -> MutexGuard<'static, BTreeMap<PathBuf, CodexAuthLeaseEntry>> {
@@ -237,6 +301,50 @@ impl CodexAuthLease {
     /// Enters a lease for `source`, which was staged from `launch` bytes.
     pub(super) fn enter(source: &Path, launch: &[u8], staged_home: Option<&Path>) -> Self {
         let mut leases = lock_codex_auth_leases();
+        Self::enter_locked(&mut leases, source, launch, staged_home)
+    }
+
+    /// Enters a lease for `source` unless a proactive refresh of that source is
+    /// in progress (#1039). While one is, waits until it ends and returns
+    /// `Ok(None)`, so the caller reloads the source bytes and enters again; fails
+    /// when `deadline` passes first.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub(super) fn enter_unless_refreshing(
+        source: &Path,
+        launch: &[u8],
+        staged_home: Option<&Path>,
+        deadline: Instant,
+    ) -> Result<Option<Self>> {
+        let mut leases = lock_codex_auth_leases();
+        if !leases.get(source).is_some_and(|entry| entry.refreshing) {
+            return Ok(Some(Self::enter_locked(
+                &mut leases,
+                source,
+                launch,
+                staged_home,
+            )));
+        }
+        while leases.get(source).is_some_and(|entry| entry.refreshing) {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return Err(anyhow!(
+                    "timed out waiting for a proactive codex auth refresh of the same source"
+                ));
+            }
+            leases = CODEX_AUTH_LEASES_CHANGED
+                .wait_timeout(leases, remaining)
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0;
+        }
+        Ok(None)
+    }
+
+    fn enter_locked(
+        leases: &mut BTreeMap<PathBuf, CodexAuthLeaseEntry>,
+        source: &Path,
+        launch: &[u8],
+        staged_home: Option<&Path>,
+    ) -> Self {
         let entry = leases.entry(source.to_path_buf()).or_default();
         entry.active = entry.active.saturating_add(1);
         Self {
@@ -296,6 +404,42 @@ impl Drop for CodexAuthLease {
             None => Ok(None),
         };
         self.leave(staged);
+    }
+}
+
+/// Exclusive right to refresh the auth of one source while no lease of that
+/// source is active (#1039). Dropping it ends the refresh and wakes the launches
+/// that wait for it.
+pub(super) struct CodexAuthRefreshGuard {
+    source: PathBuf,
+}
+
+/// Begins a proactive refresh of `source` when no lease of that source is active
+/// and no other refresh of it is in progress (#1039).
+#[cfg_attr(not(test), allow(dead_code))]
+pub(super) fn begin_codex_auth_refresh(source: &Path) -> Option<CodexAuthRefreshGuard> {
+    let mut leases = lock_codex_auth_leases();
+    let entry = leases.entry(source.to_path_buf()).or_default();
+    if entry.active > 0 || entry.refreshing {
+        return None;
+    }
+    entry.refreshing = true;
+    Some(CodexAuthRefreshGuard {
+        source: source.to_path_buf(),
+    })
+}
+
+impl Drop for CodexAuthRefreshGuard {
+    fn drop(&mut self) {
+        let mut leases = lock_codex_auth_leases();
+        if let Some(entry) = leases.get_mut(&self.source) {
+            entry.refreshing = false;
+            if entry.active == 0 && entry.pending.is_none() {
+                leases.remove(&self.source);
+            }
+        }
+        drop(leases);
+        CODEX_AUTH_LEASES_CHANGED.notify_all();
     }
 }
 
@@ -409,6 +553,121 @@ mod tests {
         fs::remove_file(home.path().join("auth.json")).unwrap();
         std::os::unix::fs::symlink(&target_file, home.path().join("auth.json")).unwrap();
         assert!(capture_staged_codex_auth(home.path()).is_err());
+    }
+
+    fn jwt_auth_bytes(account: &str, payload: &str) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "auth_mode": "chatgpt",
+            "OPENAI_API_KEY": null,
+            "tokens": {
+                "account_id": account,
+                "refresh_token": "old",
+                "access_token": format!("e30.{payload}.sig"),
+                "id_token": "id",
+            },
+            "last_refresh": "2026-11-01T00:00:00Z",
+        }))
+        .unwrap()
+    }
+
+    fn epoch_plus(seconds: u64) -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(seconds)
+    }
+
+    #[test]
+    fn access_token_expiry_reads_the_jwt_exp_claim() {
+        // {"exp":1700000000}, {"exp": 1700000000} (a partial last group) and {"exp":"soon"}.
+        let exact = jwt_auth_bytes("acct-1", "eyJleHAiOjE3MDAwMDAwMDB9");
+        let partial = jwt_auth_bytes("acct-1", "eyJleHAiOiAxNzAwMDAwMDAwfQ");
+        let text = jwt_auth_bytes("acct-1", "eyJleHAiOiJzb29uIn0");
+        assert_eq!(access_token_expiry(&exact), Some(epoch_plus(1_700_000_000)));
+        assert_eq!(
+            access_token_expiry(&partial),
+            Some(epoch_plus(1_700_000_000))
+        );
+        assert_eq!(access_token_expiry(&text), None);
+        assert_eq!(access_token_expiry(&jwt_auth_bytes("acct-1", "e30+")), None);
+        assert_eq!(access_token_expiry(&auth_bytes("acct-1", "old")), None);
+        assert_eq!(access_token_expiry(b"not json"), None);
+    }
+
+    #[test]
+    fn a_refresh_is_due_only_within_the_margin() {
+        let bytes = jwt_auth_bytes("acct-1", "eyJleHAiOjE3MDAwMDAwMDB9");
+        let margin = CODEX_AUTH_PROACTIVE_REFRESH_MARGIN;
+        let day = 24 * 60 * 60;
+        assert!(codex_auth_refresh_due(
+            &bytes,
+            epoch_plus(1_700_000_000 - 2 * day),
+            margin
+        ));
+        assert!(codex_auth_refresh_due(
+            &bytes,
+            epoch_plus(1_700_000_000 - 3 * day),
+            margin
+        ));
+        assert!(!codex_auth_refresh_due(
+            &bytes,
+            epoch_plus(1_700_000_000 - 4 * day),
+            margin
+        ));
+        assert!(codex_auth_refresh_due(
+            &bytes,
+            epoch_plus(1_700_000_000 + day),
+            margin
+        ));
+        let api = serde_json::to_vec(&serde_json::json!({"OPENAI_API_KEY": "sk-test"})).unwrap();
+        assert!(!codex_auth_refresh_due(
+            &api,
+            epoch_plus(1_700_000_000),
+            margin
+        ));
+        let unreadable = auth_bytes("acct-1", "old");
+        assert!(!codex_auth_refresh_due(
+            &unreadable,
+            epoch_plus(1_700_000_000),
+            margin
+        ));
+    }
+
+    #[test]
+    fn a_refresh_begins_only_without_active_leases_or_refreshes() {
+        let launch = auth_bytes("acct-1", "old");
+        let (_dir, source) = source_with_auth(&launch);
+        let lease = CodexAuthLease::enter(&source, &launch, None);
+        assert!(begin_codex_auth_refresh(&source).is_none());
+        lease.finish(Ok(None));
+        let guard = begin_codex_auth_refresh(&source).expect("no active lease");
+        assert!(begin_codex_auth_refresh(&source).is_none());
+        drop(guard);
+        assert!(begin_codex_auth_refresh(&source).is_some());
+    }
+
+    #[test]
+    fn a_launch_waits_for_a_refresh_and_then_reloads() {
+        let launch = auth_bytes("acct-1", "old");
+        let (_dir, source) = source_with_auth(&launch);
+        let guard = begin_codex_auth_refresh(&source).expect("no active lease");
+        let expired = Instant::now() + Duration::from_millis(50);
+        assert!(CodexAuthLease::enter_unless_refreshing(&source, &launch, None, expired).is_err());
+        let waiter = {
+            let source = source.clone();
+            let launch = launch.clone();
+            std::thread::spawn(move || {
+                let deadline = Instant::now() + Duration::from_secs(30);
+                CodexAuthLease::enter_unless_refreshing(&source, &launch, None, deadline)
+                    .map(|lease| lease.is_none())
+            })
+        };
+        std::thread::sleep(Duration::from_millis(200));
+        drop(guard);
+        assert!(waiter.join().unwrap().unwrap());
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let lease = CodexAuthLease::enter_unless_refreshing(&source, &launch, None, deadline)
+            .unwrap()
+            .expect("no refresh in progress");
+        assert!(begin_codex_auth_refresh(&source).is_none());
+        lease.finish(Ok(None));
     }
 
     #[test]
