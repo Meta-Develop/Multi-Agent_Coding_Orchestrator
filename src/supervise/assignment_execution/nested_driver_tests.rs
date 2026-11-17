@@ -312,7 +312,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         plan.max_depth = 3;
         plan.max_child_assignments = 3;
         plan.child_timeout_seconds = 30;
-        if case == "managed-cycle-process-isolated-second-cycle" {
+        if case.starts_with("managed-cycle-process-isolated-second-cycle") {
             plan.max_gate_corrections = 1;
         }
         plan = validate_supervisor_plan(
@@ -739,7 +739,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
                 && command.codex_managed_readonly_continuation_enabled()
             {
                 let mut children = captured_worker_claims.lock().unwrap().clone();
-                if case == "managed-cycle-process-isolated-second-cycle"
+                if case.starts_with("managed-cycle-process-isolated-second-cycle")
                     && children.len() == 2 * parent.worker_assignments.len()
                 {
                     // The second cycle's final parent holds only that cycle's Worker claims.
@@ -1350,7 +1350,7 @@ fn driver_fixture_with_scheduler(case: &str, scheduler: Option<(usize, bool)>) -
         } else if isolated
             && !interrupted_worker
             && case != "managed-cycle-isolated-unstarted"
-            && case != "managed-cycle-process-isolated-second-cycle"
+            && !case.starts_with("managed-cycle-process-isolated-second-cycle")
         {
             let live = overlapping_workers.state.lock().unwrap().workers.clone();
             assert_eq!(live.len(), 2);

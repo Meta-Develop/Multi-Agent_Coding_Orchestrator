@@ -5671,11 +5671,13 @@ fn collect_prepared_managed_parent_isolated_final<'a>(
 ) -> Result<CollectedChildAttempt<'a>> {
     require_managed_parent_final_capture(context, preflight, &prepared.captured)?;
     completed.revalidate(context, preflight, source_attempt, current)?;
-    if report_failed(&prepared.collection.parsed.report) {
-        bail!("isolated parent rejected its Worker set; integration is not authorized");
-    }
+    // A parent that rejects its own Worker set is collected as a failed attempt,
+    // as on the shared route, so the gate loop can run a correction cycle (#1050).
+    // A failed report never passes the materialization gate, so no Worker commit
+    // is integrated, and the controller discards the held review candidate.
+    let parent_rejected = report_failed(&prepared.collection.parsed.report);
     let expected_candidate = prepared.collection.expected_candidate.clone();
-    prepared.collection.authorizes_materialization = true;
+    prepared.collection.authorizes_materialization = !parent_rejected;
     // Ordinary acceptance can reject a schema-valid, successful parent report.
     // Run it before any Worker commit/import, using the same held report and journals.
     let mut integrate = |outcome: &mut AssignmentExecutionOutcome, accepted_paths: &[PathBuf]| {
