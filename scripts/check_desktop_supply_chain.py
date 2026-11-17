@@ -22,11 +22,20 @@ def check_exceptions(manifest: dict, lock: dict, policy: dict) -> list[str]:
     if policy.get("advisories", {}).get("unsound") != "all":
         raise ValueError("desktop policy must check transitive unsoundness advisories")
     ids = []
+    deny_ids = []
+    required = {"id", "package", "version", "reason", "removal"}
     for entry in exceptions:
-        if set(entry) != {"id", "package", "version", "reason", "removal"}:
-            raise ValueError("advisory exceptions require id, package, version, reason and removal")
+        if set(entry) not in (required, required | {"scope"}):
+            raise ValueError("advisory exceptions require id, package, version, reason and removal, and allow only an optional scope")
         if not all(isinstance(value, str) and value.strip() for value in entry.values()):
             raise ValueError("advisory exception fields must be nonempty strings")
+        # A lockfile-scoped exception covers a package that the lockfile lists but no
+        # desktop build compiles, such as an optional dependency named only in weak
+        # `dep?/feature` entries. cargo audit scans the lockfile and reports it; the
+        # feature-resolved cargo deny graph does not, so a deny ignore would be unused.
+        lockfile_only = "scope" in entry
+        if lockfile_only and entry["scope"] != "lockfile":
+            raise ValueError("advisory exception scope must be lockfile")
         if not re.fullmatch(r"RUSTSEC-\d{4}-\d{4}", entry["id"]):
             raise ValueError("invalid advisory identifier")
         if not re.fullmatch(r"\d+\.\d+\.\d+", entry["version"]):
@@ -37,11 +46,13 @@ def check_exceptions(manifest: dict, lock: dict, policy: dict) -> list[str]:
         if packages[0].get("source") != "registry+https://github.com/rust-lang/crates.io-index":
             raise ValueError(f"review {entry['id']}: package source changed")
         ids.append(entry["id"])
+        if not lockfile_only:
+            deny_ids.append(entry["id"])
     if len(ids) != len(set(ids)):
         raise ValueError("duplicate advisory exception")
     if any(not isinstance(entry, dict) or set(entry) != {"id", "reason"} for entry in ignored):
         raise ValueError("desktop deny ignores require an id and a reason")
-    if sorted(entry["id"] for entry in ignored) != sorted(ids):
+    if sorted(entry["id"] for entry in ignored) != sorted(deny_ids):
         raise ValueError("desktop deny exceptions differ from the version-exact manifest")
     return ids
 

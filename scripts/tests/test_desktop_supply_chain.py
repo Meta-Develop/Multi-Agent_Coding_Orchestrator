@@ -65,6 +65,25 @@ class DesktopSupplyChainTests(unittest.TestCase):
                 self.check()
             self.policy["advisories"][key] = "deny" if key.startswith("unused") else "all"
 
+    def test_lockfile_scope_applies_to_cargo_audit_only(self):
+        # A lockfile-only package is passed to cargo audit but must stay out of the
+        # deny ignore list, which rejects ignores that cargo deny never encounters.
+        self.entry["scope"] = "lockfile"
+        self.policy["advisories"]["ignore"] = []
+        self.assertEqual(self.check(), [self.entry["id"]])
+        self.policy["advisories"]["ignore"] = [{"id": self.entry["id"], "reason": self.entry["reason"]}]
+        with self.assertRaises(ValueError):
+            self.check()
+
+    def test_unknown_scope_or_extra_field_rejected(self):
+        for key, value in (("scope", "graph"), ("scope", ""), ("note", "reviewed")):
+            original = copy.deepcopy(self.entry)
+            with self.subTest(key=key, value=value), self.assertRaises(ValueError):
+                self.entry[key] = value
+                self.check()
+            self.entry.clear()
+            self.entry.update(original)
+
     def report(self):
         return {
             "vulnerabilities": {"found": False, "list": []},

@@ -22,7 +22,7 @@ three checks. `--check-only` validates exception scope without network access.
 
 ## Remaining upstream constraints
 
-Five desktop-only advisories have no compatible patched release in the current
+Six desktop-only advisories have no compatible patched release in the current
 Tauri stack. An unqualified audit of the desktop lockfile still reports them;
 the policy passes with these explicit dispositions, not with zero advisories.
 Their exact versions, rationale and removal conditions are in
@@ -31,6 +31,14 @@ rejects changed versions, additional versions, source replacements, missing
 packages and differences between the manifest and the deny ignore list.
 `cargo deny` also rejects unused exceptions and checks transitive unsoundness.
 
+An exception with `scope = "lockfile"` covers a package that the lockfile lists
+but no desktop build compiles, such as an optional dependency that a crate names
+only in weak `dep?/feature` entries. `cargo audit` scans the lockfile and
+reports it; the feature-resolved `cargo deny` graph does not contain it. The
+checker passes such an exception only to `cargo audit` and requires it to be
+absent from the deny ignore list, so `cargo deny` fails if a dependency later
+enables it.
+
 | Advisory                                                                   | Exact package            | Constraint and removal condition                                                                     |
 | -------------------------------------------------------------------------- | ------------------------ | ---------------------------------------------------------------------------------------------------- |
 | [RUSTSEC-2024-0370](https://rustsec.org/advisories/RUSTSEC-2024-0370.html) | `proc-macro-error` 1.0.4 | Build-time dependency of GTK3/glib macros. Remove when Tauri drops this macro stack.                 |
@@ -38,6 +46,7 @@ packages and differences between the manifest and the deny ignore list.
 | [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html) | `zbus_names` 4.3.4       | Opener 2.7.2 requires zbus 5; name types moved into zbus 6. Remove when released opener migrates.    |
 | [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html) | `zvariant` 5.15.0        | Opener's zbus 5 serialization stack; replacement is in zbus 6. Remove when released opener migrates. |
 | [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | `zvariant_derive` 5.15.0 | Build-time derives for that serialization stack. Remove when released opener migrates.               |
+| [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html) | `chrono` 0.4.45          | Unmaintained, no patched release. Lockfile-only via serde_with weak features; never compiled.        |
 
 Source inspection found no `VariantStrIter` or `array_iter_str` call in the
 application or inspected resolved GTK/Tauri dependents. This is a call-site
