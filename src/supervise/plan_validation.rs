@@ -745,6 +745,11 @@ fn validate_primary_worktree_execution_target(
             "execution_target.kind='primary_worktree' does not support licensed breakage, evidence-only re-audit, or generated follow-up execution"
         );
     }
+    if !assignment.worker_assignments.is_empty() {
+        bail!(
+            "execution_target.kind='primary_worktree' does not support authored worker_assignments; MACO launches authored Workers only in managed worktrees through its managed parent route and never delegates their launch to the child"
+        );
+    }
     Ok(())
 }
 

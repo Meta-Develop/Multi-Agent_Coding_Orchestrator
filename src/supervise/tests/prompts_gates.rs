@@ -908,7 +908,8 @@ fn worker_prompt_includes_execution_journal_contract() {
     assert!(prompt.contains("Do not wrap it in Markdown, a code fence, or prose"));
     assert!(prompt.contains("Worker model: worker-model"));
     assert!(prompt.contains("Worker reasoning effort: low"));
-    assert!(prompt.contains("runtime-side role-tagged usage reporting"));
+    assert!(prompt.contains("Only MACO launches this terminal worker template"));
+    assert!(!prompt.contains("runtime-native SubAgent"));
 }
 
 fn assert_native_edit_journal_reporting_contract(prompt: &str) {

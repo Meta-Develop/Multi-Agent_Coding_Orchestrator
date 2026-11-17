@@ -213,11 +213,11 @@ Runtime boundary:
 
 Required behavior:
 - First, read and follow AGENTS.md and project-local .agents instructions in this worktree. When present, specifically read .agents/skills/agent-orchestration/SKILL.md and .agents/docs/AGENT_ORCHESTRATION.md before worker delegation or mutation.
-- For an execution assignment with worker_assignments, use Codex native SubAgent/delegated-worker mechanisms only for the declared lightweight terminal worker or researcher assignments when available.
+- For an execution assignment with worker_assignments, never launch a terminal worker or researcher yourself: native SubAgent/delegated-worker mechanisms, spawn_agent, raw CLI and provider processes are forbidden. Only MACO launches authored Workers, on its managed parent route.
 - When an execution assignment authorizes launching a worker, use the generated worker prompt template verbatim and preserve its trusted shared prefix followed by its six-line TERMINAL_WORKER role metadata block.
 - For execution worker_assignments, collect required advisory child-side review-auditor evidence using the generated REVIEW_AUDITOR template verbatim; preserve its trusted shared prefix then its six-line REVIEW_AUDITOR role metadata block. Acceptance-gate auditors are parent-launched MACO/Codex CLI subprocess roles; child-launched auditors are advisory unless MACO/O2 collects them through the parent-enforced gate.
 - Do not force raw Codex CLI subprocess workers as the primary worker path.
-- If an execution assignment declares worker_assignments but no delegated-worker mechanism is available, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
+- If an execution assignment declares worker_assignments and MACO supplied no Worker results for them, stop before mutation and report the exact blocked worker task in your OrchestratorReviewReport findings and remaining_risk.
 - Workers return schema-valid WorkerReport JSON with "no_further_delegation": true.
 - WorkerReport, AuditorReport and OrchestratorReviewReport require environment_failures=[] without typed failures; otherwise accepted=false, rejected=true, status=failed. Never include secrets.
 - Worker field_guide_entries: bounded finding/context only; no date/source_run/provenance. Only the trusted parent stamps accepted audited entries.
@@ -902,13 +902,13 @@ Worker assignment context:
     } else {
         r#"
 Execution delegation contract:
-- This execution child orchestrator has declared worker_assignments. Launch every supplied terminal worker and preserve the required WorkerReport plus child-side audit evidence.
+- This execution child orchestrator has declared worker_assignments. Do not launch the supplied terminal workers yourself; only MACO launches them, on its managed parent route.
 "#
     };
     let worker_delegation_selection = if assignment.worker_assignments.is_empty() {
         "- Nested worker delegation: <not applicable: worker_assignments=[]>"
     } else {
-        "- Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support on this enclosing bridge and preserve its declared runtime, model, and effort. Prompt rendering fails closed when that bridge cannot honor the selected worker runtime. MACO's parent scheduler does not launch those terminal sessions for you; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported."
+        "- Nested worker delegation: only MACO launches the supplied terminal worker prompts, on its managed parent route. Do not launch them through native SubAgent/delegated-worker support, spawn_agent, raw CLI or provider processes. If MACO supplied no Worker results, stop before mutation and report the blocked worker tasks in findings and remaining_risk."
     };
     let nested_prompt_templates_section = auditor_prompt
         .as_ref()
@@ -1603,7 +1603,7 @@ Declared role selection:
 - Worker runtime: {worker_launch_runtime}
 - Worker model: {worker_model}
 - Worker reasoning effort: {worker_reasoning_effort}
-- The O1 must launch this supplied terminal worker template through runtime-native SubAgent on its bridge; preserve runtime/model/effort. No automatic parent launch; runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported.
+- Only MACO launches this terminal worker template, on its managed parent route; an O1 must not launch it through native SubAgent, spawn_agent, raw CLI or provider processes. Preserve the declared runtime, model and effort.
 
 - Use the worker report schema path: {schema_path}
 
@@ -2740,18 +2740,22 @@ mod regression_tests {
     }
 
     #[test]
-    fn supplied_worker_templates_require_runtime_native_subagent_launch() {
+    fn supplied_worker_templates_forbid_child_launches() {
         let (worker, child, _, _) =
             fixed_prompt_fixture().expect("render the fixed prompt fixture");
         let contradictory = "MACO does not launch a separate worker process";
         assert!(!worker.contains(contradictory));
         assert!(!child.contains(contradictory));
         assert!(worker.contains(
-            "The O1 must launch this supplied terminal worker template through runtime-native SubAgent"
+            "Only MACO launches this terminal worker template, on its managed parent route"
         ));
         assert!(child.contains(
-            "Launch each supplied terminal worker prompt through runtime-native SubAgent/delegated-worker support"
+            "Nested worker delegation: only MACO launches the supplied terminal worker prompts"
         ));
+        for prompt in [&worker, &child] {
+            assert!(!prompt.contains("runtime-native SubAgent"));
+            assert!(!prompt.contains("use Codex native SubAgent"));
+        }
     }
 
     #[test]
@@ -2773,7 +2777,10 @@ mod regression_tests {
         assert!(prompt
             .contains("include at least one accepted read-only AuditorReport in audit_reports"));
         assert!(prompt.contains("- Worker runtime: codex"));
-        assert!(prompt.contains("runtime-side role-tagged usage reporting is required before worker execution, usage, or cost can be reported"));
+        assert!(prompt.contains(
+            "Only MACO launches this terminal worker template, on its managed parent route"
+        ));
+        assert!(!prompt.contains("runtime-native SubAgent"));
         Ok(())
     }
 

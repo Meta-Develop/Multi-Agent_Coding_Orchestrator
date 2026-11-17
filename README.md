@@ -230,8 +230,9 @@ The current implementation covers a local-first command-line slice:
   backstop for this higher default: a trip stops pending admissions and drains
   active assignments without weakening the resource or claim gates. Each child
   is instructed to read `AGENTS.md` and project-local `.agents` guidance before
-  acting, use Codex native SubAgent/delegated-worker mechanisms for terminal
-  worker/researcher assignments when available, preserve the O1/O2 subprocess
+  acting, never launch terminal worker or researcher assignments itself
+  (only MACO launches authored Workers, on its managed parent route),
+  preserve the O1/O2 subprocess
   launch boundary of the outer verified MACO sandbox with verified systemd
   cgroup ownership evidence plus the fixed `maco_external_codex` inner
   permission profile, enable goals and multi-agent support only for the
@@ -4011,8 +4012,9 @@ features are enabled only for the supervisor role; inner model-generated
 network access remains disabled. Nested O2/O1 subprocess chains must go through
 the same validated MACO launch path instead of invoking a raw Codex process or
 selecting a broader sandbox mode. Within that boundary, an O1 assigned a
-managed child worktree uses native workspace-write and launches supplied
-terminal worker templates through runtime-native SubAgent support; it does not
+managed child worktree uses native workspace-write and never launches the
+supplied terminal worker templates itself; only MACO launches authored
+Workers, on its managed parent route. It does not
 switch to app-server merely because an optional duplex reviewer is present.
 Before each such writable launch, the parent revalidates the managed disposable
 worktree binding, the exact authenticated held-claim token and paths, and the
@@ -4075,11 +4077,12 @@ not claim verified evidence. These tests validate the bounded duplex
 primary-review path; managed-worktree coverage instead exercises native
 workspace-write launch and does not claim universal action interception.
 
-For worker assignments, child orchestrators launch the supplied terminal
-worker templates through Codex native SubAgent/delegated-worker mechanisms so
-the project manager/worker boundary is preserved. If no delegated-worker
-mechanism is available, the child stops before mutation and reports the exact
-blocked worker task. For child assignments with workers,
+For worker assignments, child orchestrators never launch the supplied terminal
+worker templates themselves: only MACO launches authored Workers, on its
+managed parent route, and a plan that combines authored Workers with a
+`primary_worktree` execution target is refused at plan validation. If MACO
+supplied no Worker results, the child stops before mutation and reports the
+exact blocked worker task. For child assignments with workers,
 the retained supervisor runner requires structured terminal audit evidence before
 accepting the child report: the parent launches a read-only `REVIEW_AUDITOR`
 subprocess and requires an accepted AuditorReport with `role=auditor`,
