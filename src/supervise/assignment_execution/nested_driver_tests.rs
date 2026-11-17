@@ -2053,6 +2053,12 @@ fn exercise_fixture_continuation(
                 json!(["forged", "worker"]),
                 json!(["worker"]),
             ] {
+                // The provider projection only lists the completed Worker ids
+                // (#1050); the authoritative schema and the supervisor's exact
+                // parse refuse a reordered, repeated or missing list.
+                if !authoritative && ids != json!(["forged", "worker"]) {
+                    continue;
+                }
                 let mut wrong = instance.clone();
                 wrong["completed_worker_ids"] = ids;
                 assert!(schemas.validate(&wrong, index).is_err());

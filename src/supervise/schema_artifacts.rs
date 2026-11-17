@@ -351,6 +351,29 @@ pub(super) fn write_parent_initial_yield_schemas(
 mod parent_initial_yield_schema_tests {
     use super::*;
 
+    #[test]
+    fn codex_projection_lists_array_const_items_as_an_enum() {
+        // The provider refuses an array-valued const (#1050); the projection
+        // keeps the listed strings and drops the const.
+        let mut schema = json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["ids", "version"],
+            "properties": {
+                "ids": {"type": "array", "items": {"type": "string"}, "const": ["w2", "w1"]},
+                "version": {"type": "integer", "const": 2}
+            }
+        });
+        make_codex_response_format_compatible(&mut schema).expect("project the schema");
+        validate_codex_response_format_schema(&schema).expect("valid Codex projection");
+        let ids = &schema["properties"]["ids"];
+        assert!(ids.get("const").is_none(), "{ids}");
+        assert_eq!(ids["type"], "array");
+        assert_eq!(ids["items"]["type"], "string");
+        assert_eq!(ids["items"]["enum"], json!(["w2", "w1"]));
+        assert_eq!(schema["properties"]["version"]["const"], 2);
+    }
+
     fn delegating_parent(worker_ids: &[&str]) -> OrchestratorAssignment {
         OrchestratorAssignment {
             assignment_shape: None,
@@ -3510,6 +3533,23 @@ fn make_codex_response_format_compatible(schema: &mut serde_json::Value) -> Resu
         if let Some(schema_type) = object.get("const").map(codex_const_json_type) {
             object.insert("type".to_string(), json!(schema_type));
         }
+    }
+    // The provider's response-format validator refuses an array-valued const
+    // (#1050). Project a nonempty all-string array const as an array of those
+    // strings; the authoritative schema and the supervisor's exact parse still
+    // require the same ordered array.
+    if let Some(values) = object
+        .get("const")
+        .and_then(serde_json::Value::as_array)
+        .filter(|values| !values.is_empty() && values.iter().all(serde_json::Value::is_string))
+        .cloned()
+    {
+        object.remove("const");
+        object.insert("type".to_string(), json!("array"));
+        object.insert(
+            "items".to_string(),
+            json!({"type": "string", "enum": values}),
+        );
     }
     for unsupported in [
         "$schema",
