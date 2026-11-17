@@ -16,7 +16,7 @@ pub(super) fn run(
     let mut payload = json!({"case":case});
     // The second-cycle case runs two managed parent cycles of two Workers each,
     // with source attempts 1 and 3 (#1050); every other case runs one cycle.
-    let second_cycle = case == "isolated-second-cycle";
+    let second_cycle = case.starts_with("isolated-second-cycle");
     let held_workers = workers.lock().unwrap().len();
     let initial_attempt = if second_cycle { held_workers + 1 } else { 1 };
     let final_source_attempt = if second_cycle {
@@ -70,12 +70,16 @@ pub(super) fn run(
         parent.remaining_risk = "offline managed process fixture".into();
         parent.audit_reports.clear();
         parent.review_lens_aggregate = None;
-        if case.ends_with("rejected-review") {
+        if case.ends_with("rejected-review")
+            || (case == "isolated-second-cycle-parent-rejected" && final_source_attempt == 1)
+        {
             parent.accepted = false;
             parent.rejected = true;
             parent.status = ReviewStatus::Failed;
         }
-        if case == "isolated-collector-rejected" || (second_cycle && final_source_attempt == 1) {
+        if case == "isolated-collector-rejected"
+            || (case == "isolated-second-cycle" && final_source_attempt == 1)
+        {
             parent.gate_denials.push(GateDenial::new(
                 "self-authored-fixture",
                 GateDenialReason::ClaimConflict,
@@ -201,8 +205,8 @@ pub(super) fn exercise(
     // preflight's pending token so terminal cleanup can detect double releases.
     outcome.claim_tokens.push(preflight.claim.token);
     let schemas = &context.dirs.schemas;
-    if case == "isolated-second-cycle" {
-        return exercise_second_cycle(context, preflight, outcome, prepared, calls);
+    if case.starts_with("isolated-second-cycle") {
+        return exercise_second_cycle(context, preflight, outcome, prepared, calls, case);
     }
     if case == "isolated-initial-import-failure" {
         let destination = context
@@ -384,10 +388,10 @@ pub(super) fn exercise(
                     }));
                 }
             } else {
-                assert!(
-                    format!("{:#}", result.err().context("rejected parent integrated")?)
-                        .contains("integration is not authorized")
-                );
+                // A parent that rejects its own Worker set is collected as a
+                // failed attempt so the gate loop can correct it (#1050).
+                let collected = result.context("rejected parent was not collected")?;
+                assert!(report_failed(&collected.attempt_report));
             }
             assert_eq!(
                 fs::read_to_string(preflight.worktree.path.join("src/lib.rs"))?,
@@ -680,15 +684,18 @@ pub(super) fn exercise(
 }
 
 /// Drives two managed parent cycles as the gate loop does with one gate
-/// correction (max_attempts 2): a collector-rejected first cycle on source
-/// attempt 1, then a corrected second cycle on source attempt 3 whose isolated
-/// Workers get fresh identities (#1050).
+/// correction (max_attempts 2): a first cycle on source attempt 1 that the
+/// collector rejects (case `isolated-second-cycle`) or that the parent rejects
+/// itself (case `isolated-second-cycle-parent-rejected`), then a corrected
+/// second cycle on source attempt 3 whose isolated Workers get fresh
+/// identities (#1050).
 fn exercise_second_cycle(
     context: &AssignmentExecutionContext<'_, '_>,
     preflight: &AssignmentExecutionPreflight<'_>,
     outcome: &mut AssignmentExecutionOutcome,
     prepared: Box<PreparedChildAttempt<'_>>,
     calls: &Mutex<Vec<String>>,
+    case: &str,
 ) -> Result<()> {
     let schemas = &context.dirs.schemas;
     let run_id = context.options.run_id.as_str();
@@ -711,12 +718,14 @@ fn exercise_second_cycle(
         assert!(report_failed(&first.attempt_report));
         first.attempt_report.findings.clone()
     };
-    assert!(
-        first_findings.iter().any(|finding| finding
-            .message
-            .contains("self-assert supervisor-owned gate correction evidence")),
-        "{first_findings:?}"
-    );
+    if case == "isolated-second-cycle" {
+        assert!(
+            first_findings.iter().any(|finding| finding
+                .message
+                .contains("self-assert supervisor-owned gate correction evidence")),
+            "{first_findings:?}"
+        );
+    }
     assert_eq!(outcome.released_claims.len(), 2);
     assert_eq!(
         current_head_oid(&preflight.worktree.path)?,
@@ -1081,6 +1090,25 @@ fn managed_parent_process_isolated_second_cycle_uses_fresh_worker_identities() -
         "managed_parent_process_isolated_second_cycle_uses_fresh_worker_identities"
     );
     super::nested_driver_tests::driver_fixture("managed-cycle-process-isolated-second-cycle")
+}
+
+#[test]
+fn managed_parent_process_isolated_parent_rejection_runs_second_cycle() -> Result<()> {
+    skip_without_contained_default_linker!(
+        "managed_parent_process_isolated_parent_rejection_runs_second_cycle"
+    );
+    // The parent-rejected path overflowed the default 2 MiB test-thread stack
+    // of a debug build in CI (#1050), so this case runs on a 256 MiB stack.
+    std::thread::Builder::new()
+        .name("parent-rejection-second-cycle".into())
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            super::nested_driver_tests::driver_fixture(
+                "managed-cycle-process-isolated-second-cycle-parent-rejected",
+            )
+        })?
+        .join()
+        .map_err(|_| anyhow!("parent-rejected second-cycle fixture thread panicked"))?
 }
 
 #[test]
