@@ -3140,6 +3140,19 @@ pub struct WorktreeWritableAdmission {
     pub native_sandbox: NativeSandboxAdmission,
 }
 
+/// Whether `worktree_id` is the managed worktree that attempt `attempt` of
+/// `assignment_id` may write in: the assignment's own worktree, or from attempt 2
+/// on the fresh sibling `<assignment_id>.attempt-<attempt>` that an isolated
+/// Worker of a later managed parent cycle holds (#1050).
+pub(crate) fn managed_worktree_binds_assignment(
+    worktree_id: &str,
+    assignment_id: &str,
+    attempt: usize,
+) -> bool {
+    worktree_id == assignment_id
+        || (attempt > 1 && worktree_id == format!("{assignment_id}.attempt-{attempt}"))
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct EnvironmentVersion {
@@ -4506,7 +4519,11 @@ impl ExternalAgentCommand {
                     && admission.assignment_id == selected.assignment_id
                     && admission.target == WritableLaunchTarget::ManagedChildWorktree
                     && admission.worktree.kind == ManagedWorktreeAdmissionKind::ManagedDisposable
-                    && admission.worktree.worktree_id == selected.assignment_id
+                    && managed_worktree_binds_assignment(
+                        &admission.worktree.worktree_id,
+                        &selected.assignment_id,
+                        admission.attempt,
+                    )
                     && admission.claims.state == HeldPathClaimsAdmissionState::Held
                     && admission.native_sandbox.runtime == runtime
                     && admission.native_sandbox.workspace_access == WorkspaceAccess::ReadWrite

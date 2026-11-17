@@ -431,7 +431,12 @@ fn worktree_writable_admission_record(
     {
         bail!("writable child launch has an unsupported workspace target");
     }
-    if worktree.name != assignment_id || command.cwd != worktree.path {
+    if !crate::external_agent::managed_worktree_binds_assignment(
+        &worktree.name,
+        assignment_id,
+        attempt,
+    ) || command.cwd != worktree.path
+    {
         bail!(
             "writable child launch is not bound to assignment '{}' managed worktree",
             assignment_id
@@ -15115,6 +15120,41 @@ done
         )
         .expect_err("a mismatched worktree binding must fail closed");
         assert!(format!("{worktree_error:#}").contains("managed worktree"));
+
+        // A later managed parent cycle's isolated Worker writes in its fresh
+        // sibling `<id>.attempt-<p>` at Worker attempt p (#1050).
+        let cycle_worktree = WorktreeRecord {
+            name: "child-a.attempt-3".to_string(),
+            ..worktree.clone()
+        };
+        let cycle_admission = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            3,
+            &cycle_worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
+        )
+        .expect("a later cycle's sibling worktree binds its Worker attempt")
+        .expect("the sibling worktree produces admission evidence");
+        assert_eq!(cycle_admission.worktree.worktree_id, "child-a.attempt-3");
+        assert_eq!(cycle_admission.attempt, 3);
+        let other_attempt = worktree_writable_admission_record(
+            "child-a",
+            &assigned_paths,
+            2,
+            &cycle_worktree,
+            &claim,
+            std::slice::from_ref(&claim),
+            &command,
+            SupervisorRuntime::Codex,
+            AssignmentPhase::Execution,
+        )
+        .expect_err("a sibling of another attempt must fail closed");
+        assert!(format!("{other_attempt:#}").contains("managed worktree"));
 
         // Fake's registered static writable-unsupported row isolates the native-writable
         // factor without the managed-account gate Cursor now requires first.

@@ -349,14 +349,18 @@ impl<'a> AssignmentAttemptAuthority<'a> {
             bail!("assignment admission authority has been revoked");
         }
         if self.worktree != self.lease.record()
-            || self.worktree.name != self.parent.id
+            || !crate::external_agent::managed_worktree_binds_assignment(
+                &self.worktree.name,
+                &self.parent.id,
+                self.attempt,
+            )
             || self.claim.agent_id != self.parent.id
             || self.claim.paths != self.parent.assigned_paths
         {
             bail!("assignment admission resource owner binding changed");
         }
         self.manager
-            .verify_write_execution_lease(&self.parent.id, self.lease)?;
+            .verify_write_execution_lease(&self.worktree.name, self.lease)?;
         if !self.sync_store.status_snapshot()?.iter().any(|held| {
             held.claim == *self.claim && held.owner_run_id.as_deref() == Some(self.run_id.as_str())
         }) {
