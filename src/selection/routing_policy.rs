@@ -43,6 +43,11 @@ pub struct TreeRoutingPolicy {
     pub min_independent_groups: usize,
     pub max_workers: usize,
     pub max_depth: usize,
+    /// Optional operator bound on authored Workers per Execution coordinator
+    /// (#830). When set, goal/spec coordinated lowering applies the
+    /// coordination-depth decision; when absent, lowering is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_workers_per_coordinator: Option<usize>,
 }
 
 /// Adapter protocol, not model quality or an assertion of vendor-native tools.
@@ -624,6 +629,9 @@ fn validate_tree(tree: &TreeRoutingPolicy) -> Result<()> {
         || tree.max_workers == 0
         || tree.max_depth == 0
         || tree.min_independent_groups == 0
+        || tree
+            .max_workers_per_coordinator
+            .is_some_and(|bound| bound < 2 || bound > tree.max_workers)
     {
         bail!("routing tree policy has invalid thresholds or limits");
     }
@@ -1093,6 +1101,30 @@ mod tests {
         );
         features.risk = 10_001;
         assert!(evaluate_task_grain(&features, &policy.tree).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn per_coordinator_bound_is_optional_and_validated() -> Result<()> {
+        let policy: LoadedRoutingPolicy = serde_json::from_str(DEFAULT_POLICY)?;
+        policy.validate()?;
+        assert_eq!(policy.tree.max_workers_per_coordinator, None);
+        let normalized = serde_json::to_vec(&policy)?;
+        assert!(!String::from_utf8_lossy(&normalized).contains("max_workers_per_coordinator"));
+
+        let bounded = |bound: usize| {
+            let mut value = serde_json::from_str::<serde_json::Value>(DEFAULT_POLICY).unwrap();
+            value["tree"]["max_workers_per_coordinator"] = serde_json::json!(bound);
+            value.to_string()
+        };
+        let repo = tempfile::tempdir()?;
+        for refused in [1, policy.tree.max_workers + 1] {
+            std::fs::write(repo.path().join(ROUTING_POLICY_FILE), bounded(refused))?;
+            assert!(load_routing_policy(repo.path()).is_err());
+        }
+        std::fs::write(repo.path().join(ROUTING_POLICY_FILE), bounded(2))?;
+        let frozen = load_routing_policy(repo.path())?;
+        assert_eq!(frozen.policy.tree.max_workers_per_coordinator, Some(2));
         Ok(())
     }
 }
