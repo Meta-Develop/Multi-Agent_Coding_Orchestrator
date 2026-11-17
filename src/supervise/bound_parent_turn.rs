@@ -606,6 +606,13 @@ impl IsolatedWorkerAttemptEvidence {
     pub(super) fn worker_attempt(&self) -> usize {
         self.worker_attempt
     }
+
+    /// The managed worktree and lease identity of this Worker's cycle: the
+    /// authored Worker id in the first cycle and `<id>.attempt-<p>` in a later
+    /// cycle with parent attempt p (#1050).
+    pub(super) fn worktree_id(&self) -> String {
+        self.authority.worktree_id()
+    }
     pub(super) fn candidate_snapshots(
         &self,
     ) -> (&PrimaryWorktreeSnapshot, &PrimaryWorktreeSnapshot) {

@@ -119,9 +119,14 @@ fn retain_candidate(
     if before.inspection_problem().is_some() {
         bail!("isolated candidate snapshot is incomplete");
     }
+    // A later cycle's Worker holds the lease of its fresh sibling worktree (#1050).
+    let worktree_id = super::bound_parent_turn::isolated_worker_worktree_id(
+        &preflight.assignment.id,
+        parent_attempt,
+    );
     let candidate = crate::merge::capture_exact_base_worktree_with_write_lease(
         context.repo,
-        &preflight.assignment.id,
+        &worktree_id,
         &preflight.assignment.assigned_paths,
         preflight
             .worktree_write_lease

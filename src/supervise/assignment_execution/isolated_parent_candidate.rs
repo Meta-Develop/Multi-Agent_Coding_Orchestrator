@@ -22,7 +22,7 @@ impl IsolatedParentCandidate {
         for worker in workers {
             let captured = crate::merge::capture_exact_base_worktree_with_write_lease(
                 context.repo,
-                &worker.report().id,
+                &worker.worktree_id(),
                 &worker.report().assigned_paths,
                 worker.lease(),
                 preflight.child_base_head,

@@ -5634,7 +5634,7 @@ fn prepare_managed_parent_isolated_final_attempt<'a>(
             id.clone(),
             super::acceptance::WorkerJournalWorktreeBinding::from_write_lease(
                 context.manager,
-                &id,
+                &worker.worktree_id(),
                 worker.lease(),
                 worker
                     .candidate_snapshots()
@@ -5768,7 +5768,7 @@ fn integrate_accepted_isolated_workers(
         }
         let captured = crate::merge::capture_exact_base_worktree_with_write_lease(
             context.repo,
-            &worker.report().id,
+            &worker.worktree_id(),
             &worker.report().assigned_paths,
             worker.lease(),
             source_head,
@@ -5794,7 +5794,7 @@ fn integrate_accepted_isolated_workers(
     for (worker, captured) in candidates {
         context
             .manager
-            .verify_write_execution_lease(&worker.report().id, worker.lease())?;
+            .verify_write_execution_lease(&worker.worktree_id(), worker.lease())?;
         if context.cancellation.is_cancelled()
             || primary_worktree_snapshot(worker.lease().path(), context.execution_runtime)?
                 != *worker.candidate_snapshots().1
