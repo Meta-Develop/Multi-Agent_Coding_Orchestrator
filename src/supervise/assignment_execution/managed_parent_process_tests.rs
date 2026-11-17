@@ -716,6 +716,10 @@ fn exercise_second_cycle(
         )
         .context("first managed parent cycle")?;
         assert!(report_failed(&first.attempt_report));
+        assert!(
+            !outcome.assignment_failed,
+            "a verified-clean rejected parent cycle must stay correctable"
+        );
         first.attempt_report.findings.clone()
     };
     if case == "isolated-second-cycle" {
@@ -766,6 +770,10 @@ fn exercise_second_cycle(
         &schemas.join("auditor-report.schema.json"),
     )
     .context("second managed parent cycle")?;
+    assert!(
+        !outcome.assignment_failed,
+        "a self-corrected second cycle must leave the assignment succeeded"
+    );
     assert!(
         !report_failed(&collected.attempt_report),
         "{:?}",

@@ -450,7 +450,13 @@ fn collect_isolated_parent_cycle<'budget>(
         held.retain_on_drop = false;
         return result;
     }
-    outcome.assignment_failed = true;
+    // A rejected Ok report whose refusal cleanup succeeds below is an ordinary
+    // correctable parent rejection: the attempt gate decides between a corrective
+    // cycle and a terminal failed report, and a terminal failed report still fails
+    // the run through the published child report (#1050).
+    if result.is_err() {
+        outcome.assignment_failed = true;
+    }
     let never_entered = release_state.load(std::sync::atomic::Ordering::Acquire) == 0;
     if !final_panicked && (never_entered || verified_final_capture) {
         let cleanup = completed
@@ -478,6 +484,7 @@ fn collect_isolated_parent_cycle<'budget>(
     }
     // Source drift, cancellation refusal, or unknown returned capture never
     // relaxes release. Rejected Ok reports use this same verified cleanup path.
+    outcome.assignment_failed = true;
     context.cancellation.cancel();
     outcome.external_containment_failed = true;
     result
