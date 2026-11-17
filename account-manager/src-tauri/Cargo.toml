@@ -88,3 +88,11 @@ package = "zvariant_derive"
 version = "5.15.0"
 reason = "Build-time derives for the opener zbus 5 serialization stack; no patched standalone crate exists."
 removal = "Remove when a released opener uses zbus 6 or removes this dependency."
+
+[[package.metadata.desktop-advisories]]
+id = "RUSTSEC-2026-0543"
+package = "chrono"
+version = "0.4.45"
+scope = "lockfile"
+reason = "Unmaintained (informational; all versions affected, no patched release). The desktop lockfile lists chrono only because serde_with 3.22.0 names its optional chrono dependency in weak std and alloc features; tauri-utils 2.10.2 uses serde_with without the chrono feature, so no desktop build compiles chrono and the feature-resolved cargo deny graph does not contain it."
+removal = "Remove when the desktop lockfile no longer lists chrono. If a dependency enables chrono, cargo deny reports this advisory and the exception needs review."
