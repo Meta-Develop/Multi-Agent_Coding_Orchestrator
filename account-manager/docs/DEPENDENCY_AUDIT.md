@@ -22,7 +22,7 @@ three checks. `--check-only` validates exception scope without network access.
 
 ## Remaining upstream constraints
 
-Five desktop-only advisories have no compatible patched release in the current
+Six desktop-only advisories have no compatible patched release in the current
 Tauri stack. An unqualified audit of the desktop lockfile still reports them;
 the policy passes with these explicit dispositions, not with zero advisories.
 Their exact versions, rationale and removal conditions are in
@@ -38,6 +38,7 @@ packages and differences between the manifest and the deny ignore list.
 | [RUSTSEC-2026-0371](https://rustsec.org/advisories/RUSTSEC-2026-0371.html) | `zbus_names` 4.3.4       | Opener 2.7.2 requires zbus 5; name types moved into zbus 6. Remove when released opener migrates.    |
 | [RUSTSEC-2026-0370](https://rustsec.org/advisories/RUSTSEC-2026-0370.html) | `zvariant` 5.15.0        | Opener's zbus 5 serialization stack; replacement is in zbus 6. Remove when released opener migrates. |
 | [RUSTSEC-2026-0372](https://rustsec.org/advisories/RUSTSEC-2026-0372.html) | `zvariant_derive` 5.15.0 | Build-time derives for that serialization stack. Remove when released opener migrates.               |
+| [RUSTSEC-2026-0543](https://rustsec.org/advisories/RUSTSEC-2026-0543.html) | `chrono` 0.4.45          | Unmaintained; no patched release. Reached via tauri-utils serde_with. Remove when Tauri drops it.    |
 
 Source inspection found no `VariantStrIter` or `array_iter_str` call in the
 application or inspected resolved GTK/Tauri dependents. This is a call-site
