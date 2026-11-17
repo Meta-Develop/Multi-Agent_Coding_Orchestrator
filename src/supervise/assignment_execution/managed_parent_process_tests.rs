@@ -565,8 +565,17 @@ pub(super) fn exercise(
                             MAX_SUPERVISOR_REPORT_BYTES,
                         )
                     })?;
-                    let captured =
+                    let mut captured =
                         read_worker_report(Some(&bytes), Path::new("worker.json"))?.report;
+                    // MACO binds each reported command to its journal record (#1075);
+                    // everything else reaches acceptance exactly as captured.
+                    for (raw, accepted) in
+                        captured.commands_run.iter_mut().zip(&report.commands_run)
+                    {
+                        if raw.journal_record.is_none() {
+                            raw.journal_record = accepted.journal_record.clone();
+                        }
+                    }
                     assert_eq!(
                         *report, captured,
                         "accepted Worker report differs from the capture"

@@ -3157,7 +3157,12 @@ pub(super) fn validate_worker_execution_journal_evidence(
             );
             blocking_messages.push((message, vec![journal.evidence_relative_path.clone()]));
         }
-        // Complete evidence the Worker left out of its own journal (#1053).
+        // Bind reported commands to their journal records (#1075), then complete
+        // the evidence the Worker left out of its own journal (#1053).
+        bind_reported_journal_commands(&mut worker_report.commands_run, entries);
+        if assignment.role == AgentRole::Worker {
+            bind_reported_journal_commands(&mut report.commands_run, entries);
+        }
         let appended = append_omitted_journal_commands(&mut worker_report.commands_run, entries);
         if !appended.is_empty() {
             if assignment.role == AgentRole::Worker && !report.commands_run.is_empty() {
@@ -3403,6 +3408,66 @@ fn canonicalize_journal_command_references(
     problems
 }
 
+/// The commands_run status of a completed or failed journal record; `None` for
+/// started records, native-edit observations and records without an observation.
+/// A completed record with a nonzero exit code is a failed command.
+fn journal_entry_command_status(entry: &WorkerExecutionJournalEntry) -> Option<ReviewStatus> {
+    let observation = entry.observation.as_ref()?;
+    match observation.phase {
+        WorkerJournalObservationPhase::Completed => match observation.exit_code {
+            Some(0) | None => Some(ReviewStatus::Succeeded),
+            Some(_) => Some(ReviewStatus::Failed),
+        },
+        WorkerJournalObservationPhase::Failed => Some(ReviewStatus::Failed),
+        WorkerJournalObservationPhase::Started | WorkerJournalObservationPhase::NativeEdit => None,
+    }
+}
+
+/// Binds every reported commands_run entry without a `journal_record` to the
+/// first unclaimed completed or failed record of the Worker's execution journal
+/// with the same argv, cwd and status, in journal order (#1075). A reported
+/// command is then judged like the same command left out of the report, which
+/// `append_omitted_journal_commands` appends with a reference. References the
+/// Worker supplied are never changed.
+fn bind_reported_journal_commands(
+    commands: &mut [CommandRunRecord],
+    entries: &[WorkerExecutionJournalEntry],
+) {
+    let mut claimed = vec![false; entries.len()];
+    for reference in commands
+        .iter()
+        .filter_map(|record| record.journal_record.as_ref())
+    {
+        let index = usize::try_from(reference.line)
+            .ok()
+            .and_then(|line| line.checked_sub(1));
+        if let Some(index) = index.filter(|index| *index < entries.len()) {
+            claimed[index] = true;
+        }
+    }
+    for record in commands
+        .iter_mut()
+        .filter(|record| record.journal_record.is_none())
+    {
+        let Some(index) = entries.iter().zip(&claimed).position(|(entry, taken)| {
+            !*taken
+                && entry.command == record.command
+                && entry.cwd == record.cwd
+                && journal_entry_command_status(entry).as_ref() == Some(&record.status)
+        }) else {
+            continue;
+        };
+        let Ok(line) = u64::try_from(index + 1) else {
+            continue;
+        };
+        claimed[index] = true;
+        record.journal_record = Some(JournalRecordReference {
+            line,
+            start_timestamp: entries[index].start_timestamp.clone(),
+        });
+    }
+}
+
 /// Appends one commands_run entry for every completed or failed record of the
 /// Worker's own execution journal that no reported entry matches (#1053).
 /// A reported journal_record reference claims its record; the remaining
@@ -3432,18 +3497,11 @@ fn append_omitted_journal_commands(
     }
     let mut appended = Vec::new();
     for (index, entry) in entries.iter().enumerate() {
-        let Some(observation) = entry.observation.as_ref() else {
+        let Some(status) = journal_entry_command_status(entry) else {
             continue;
         };
-        let status = match observation.phase {
-            WorkerJournalObservationPhase::Completed => match observation.exit_code {
-                Some(0) | None => ReviewStatus::Succeeded,
-                Some(_) => ReviewStatus::Failed,
-            },
-            WorkerJournalObservationPhase::Failed => ReviewStatus::Failed,
-            WorkerJournalObservationPhase::Started | WorkerJournalObservationPhase::NativeEdit => {
-                continue
-            }
+        let Some(observation) = entry.observation.as_ref() else {
+            continue;
         };
         if claimed[index] {
             continue;
