@@ -1,10 +1,13 @@
-//! Third slice of #830: every emitted supervisor plan carries a shadow depth
-//! decision computed from the plan shape.
+//! Third slice of #830: every emitted supervisor plan carries a coordination
+//! depth decision computed from the plan shape.
 //!
-//! Shadow means the decision is recorded for calibration but does not change
-//! the plan shape, the schedule or execution; applying it is a later #830
-//! slice. The work-token estimate is a per-work-unit prior, recorded in the
-//! output.
+//! Two modes are recorded. `shadow` means the decision is recorded for
+//! calibration only and does not change the plan shape, the schedule or
+//! execution. `applied` means the decision was computed under the operator's
+//! per-coordinator Worker bound, which goal/spec coordinated lowering applies
+//! to the emitted plan. Other plan shapes record the same decision for
+//! calibration. The work-token estimate is a per-work-unit prior, recorded in
+//! the output.
 
 use super::*;
 use crate::optimizer::depth_decision::{
@@ -16,12 +19,16 @@ use std::collections::HashSet;
 /// Prior tokens of executable work assumed per work unit.
 pub(super) const PLAN_DEPTH_TOKENS_PER_WORK_UNIT: u64 = 200_000;
 
-/// Shadow coordination-depth decision recorded in every emitted supervisor plan.
+/// Coordination-depth decision recorded in every emitted supervisor plan.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PlanDepthDecision {
-    /// Always `shadow`: the decision does not change the plan.
+    /// `shadow` when the decision is calibration-only, or `applied` when it
+    /// was computed under the operator's per-coordinator Worker bound and
+    /// goal/spec coordinated lowering applies it.
     pub mode: String,
-    /// Always `plan_shape_prior`: the inputs come from the plan shape.
+    /// `plan_shape_prior` for the shadow prior, or
+    /// `plan_shape_worker_capacity_prior` when one work unit fills one
+    /// Worker's capacity under the operator's bound.
     pub input_source: String,
     /// The per-work-unit token prior used for the estimate.
     pub tokens_per_work_unit: u64,
@@ -31,12 +38,16 @@ pub struct PlanDepthDecision {
     pub record: DepthDecisionRecord,
 }
 
-/// Compute the shadow depth decision for one supervisor plan.
+/// Compute the depth decision for one supervisor plan.
 ///
-/// Reads only its arguments: no clock, environment or file access.
+/// Reads only its arguments: no clock, environment or file access. With
+/// `None` the decision is the shadow calibration record. With `Some(p)` the
+/// decision was computed under the operator's per-coordinator Worker bound,
+/// which goal/spec coordinated lowering applies.
 pub(super) fn plan_depth_decision(
     plan: &SupervisorPlan,
     schedule: &[AssignmentScheduleEntry],
+    max_workers_per_coordinator: Option<usize>,
 ) -> Result<PlanDepthDecision> {
     let parent_ids: HashSet<&str> = schedule
         .iter()
@@ -57,10 +68,25 @@ pub(super) fn plan_depth_decision(
         })
         .sum();
     let work_units = u32::try_from(work_units_total.max(1)).unwrap_or(u32::MAX);
-    let estimated_work_tokens = (work_units as u64).saturating_mul(PLAN_DEPTH_TOKENS_PER_WORK_UNIT);
-    let max_child_assignments = u32::try_from(plan.max_child_assignments)
-        .unwrap_or(u32::MAX)
-        .max(1);
+    let (mode, input_source, tokens_per_work_unit, max_child_assignments) =
+        match max_workers_per_coordinator {
+            None => (
+                "shadow",
+                "plan_shape_prior",
+                PLAN_DEPTH_TOKENS_PER_WORK_UNIT,
+                u32::try_from(plan.max_child_assignments)
+                    .unwrap_or(u32::MAX)
+                    .max(1),
+            ),
+            // One workstream fills one Worker's capacity under the bound.
+            Some(p) => (
+                "applied",
+                "plan_shape_worker_capacity_prior",
+                DepthCostModel::uncalibrated_prior().worker_capacity_tokens,
+                u32::try_from(p).unwrap_or(u32::MAX).max(1),
+            ),
+        };
+    let estimated_work_tokens = (work_units as u64).saturating_mul(tokens_per_work_unit);
     let depth_ceiling = plan.max_depth.clamp(1, ABSOLUTE_DEPTH_CAP);
     let input = DepthDecisionInput {
         work_units,
@@ -75,9 +101,9 @@ pub(super) fn plan_depth_decision(
     )
     .context("failed to decide coordination depth")?;
     Ok(PlanDepthDecision {
-        mode: "shadow".to_string(),
-        input_source: "plan_shape_prior".to_string(),
-        tokens_per_work_unit: PLAN_DEPTH_TOKENS_PER_WORK_UNIT,
+        mode: mode.to_string(),
+        input_source: input_source.to_string(),
+        tokens_per_work_unit,
         plan_coordination_depth: coordination_topology_from_plan(plan, schedule)
             .derived_coordination_depth,
         record,
@@ -101,8 +127,12 @@ mod tests {
             ]
         }"#;
         let loaded = parse_supervisor_plan_with_consultant(document).expect("single plan");
-        let decision = plan_depth_decision(&loaded.plan, &loaded.plan_metadata.assignment_schedule)
-            .expect("depth decision");
+        let decision = plan_depth_decision(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+            None,
+        )
+        .expect("depth decision");
         assert_eq!(
             decision.record.input,
             DepthDecisionInput {
@@ -148,8 +178,12 @@ mod tests {
             ]
         }"#;
         let loaded = parse_supervisor_plan_with_consultant(document).expect("three-unit plan");
-        let decision = plan_depth_decision(&loaded.plan, &loaded.plan_metadata.assignment_schedule)
-            .expect("depth decision");
+        let decision = plan_depth_decision(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+            None,
+        )
+        .expect("depth decision");
         assert_eq!(
             decision.record.input,
             DepthDecisionInput {
@@ -206,8 +240,12 @@ mod tests {
             }]
         }"#;
         let loaded = parse_supervisor_plan_with_consultant(document).expect("nested plan");
-        let decision = plan_depth_decision(&loaded.plan, &loaded.plan_metadata.assignment_schedule)
-            .expect("depth decision");
+        let decision = plan_depth_decision(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+            None,
+        )
+        .expect("depth decision");
         assert_eq!(
             decision.record.input,
             DepthDecisionInput {
@@ -248,8 +286,12 @@ mod tests {
             }]
         }"#;
         let loaded = parse_supervisor_plan_with_consultant(document).expect("worker plan");
-        let decision = plan_depth_decision(&loaded.plan, &loaded.plan_metadata.assignment_schedule)
-            .expect("depth decision");
+        let decision = plan_depth_decision(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+            None,
+        )
+        .expect("depth decision");
         assert_eq!(decision.record.input.work_units, 3);
         assert_eq!(decision.record.input.depth_ceiling, 2);
         assert_eq!(
@@ -259,6 +301,49 @@ mod tests {
                 workers: 2,
                 coordinators: 1,
                 cost_tokens: 920_000,
+            }
+        );
+    }
+
+    #[test]
+    fn per_coordinator_bound_applies_worker_capacity_prior() {
+        let document = r#"{
+            "version": 1,
+            "task": "three units",
+            "max_depth": 3,
+            "max_child_assignments": 4,
+            "assignments": [
+                {"id": "a", "phase": "execution", "assigned_paths": ["src/a.rs"]},
+                {"id": "b", "phase": "execution", "assigned_paths": ["src/b.rs"]},
+                {"id": "c", "phase": "execution", "assigned_paths": ["src/c.rs"]}
+            ]
+        }"#;
+        let loaded = parse_supervisor_plan_with_consultant(document).expect("three-unit plan");
+        let decision = plan_depth_decision(
+            &loaded.plan,
+            &loaded.plan_metadata.assignment_schedule,
+            Some(2),
+        )
+        .expect("depth decision");
+        assert_eq!(
+            decision.record.input,
+            DepthDecisionInput {
+                work_units: 3,
+                estimated_work_tokens: 1_200_000,
+                max_child_assignments: 2,
+                depth_ceiling: 3,
+            }
+        );
+        assert_eq!(decision.mode, "applied");
+        assert_eq!(decision.input_source, "plan_shape_worker_capacity_prior");
+        assert_eq!(decision.tokens_per_work_unit, 400_000);
+        assert_eq!(
+            decision.record.decision,
+            DepthDecision::Selected {
+                depth: 3,
+                workers: 3,
+                coordinators: 3,
+                cost_tokens: 1_980_000,
             }
         );
     }
@@ -296,8 +381,12 @@ mod tests {
         assert_eq!(emitted["depth_decision"]["record"]["decision"]["depth"], 2);
         assert!(emitted["coordination_topology"].is_object());
         let expected = serde_json::to_value(
-            plan_depth_decision(&loaded.plan, &loaded.plan_metadata.assignment_schedule)
-                .expect("depth decision"),
+            plan_depth_decision(
+                &loaded.plan,
+                &loaded.plan_metadata.assignment_schedule,
+                None,
+            )
+            .expect("depth decision"),
         )
         .expect("serialize depth decision");
         assert_eq!(emitted["depth_decision"], expected);

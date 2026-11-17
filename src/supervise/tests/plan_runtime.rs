@@ -2736,6 +2736,242 @@ fn plain_text_policy_and_script_task_emits_workstreams() {
     );
 }
 
+fn write_per_coordinator_bound_policy(repo: &std::path::Path) {
+    let mut policy = serde_json::from_str::<serde_json::Value>(include_str!(
+        "../../selection/data/routing-policy.json"
+    ))
+    .expect("bundled routing policy");
+    policy["tree"]["max_workers_per_coordinator"] = json!(2);
+    fs::write(
+        repo.join(crate::selection::routing_policy::ROUTING_POLICY_FILE),
+        serde_json::to_string(&policy).expect("serialize bounded policy"),
+    )
+    .expect("write bounded routing policy");
+}
+
+fn coordinated_fixture_paths() -> Vec<&'static str> {
+    vec![
+        ".agents/skills/agent-orchestration/SKILL.md",
+        ".agents/skills/agent-orchestration/reference.md",
+        ".agents/scripts/o2-autopilot",
+        ".agents/scripts/o2-audit-trail",
+    ]
+}
+
+fn write_coordinated_fixture(repo: &std::path::Path) {
+    Repository::init(repo).expect("initialize repository");
+    fs::create_dir_all(repo.join(".agents/skills/agent-orchestration")).expect("create skills");
+    fs::create_dir_all(repo.join(".agents/scripts")).expect("create scripts");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/SKILL.md"),
+        "# Orchestration\n",
+    )
+    .expect("write skill");
+    fs::write(
+        repo.join(".agents/skills/agent-orchestration/reference.md"),
+        "# Reference\n",
+    )
+    .expect("write reference");
+    fs::write(repo.join(".agents/scripts/o2-autopilot"), "#!/bin/sh\n").expect("write script");
+    fs::write(repo.join(".agents/scripts/o2-audit-trail"), "#!/bin/sh\n")
+        .expect("write helper script");
+}
+
+fn coordinated_task_file(temp: &std::path::Path, paths: &[&str]) -> std::path::PathBuf {
+    let task_file = temp.join("task.md");
+    let task = paths
+        .iter()
+        .map(|path| format!("- Update `{path}`.\n"))
+        .collect::<String>();
+    fs::write(&task_file, task).expect("write task");
+    task_file
+}
+
+fn assert_unbounded_coordinated_baseline(document: &serde_json::Value, expected_workers: usize) {
+    let assignments = document["assignments"].as_array().expect("assignments");
+    assert_eq!(assignments.len(), 1);
+    let parent = &assignments[0];
+    assert!(parent["id"]
+        .as_str()
+        .expect("coordinator id")
+        .starts_with("coordinated-execution-"));
+    assert_eq!(parent["phase"], "execution");
+    assert_eq!(parent["role"], "child_orchestrator");
+    assert_eq!(parent["role_category"], "delegating_coordinator");
+    let workers = parent["worker_assignments"]
+        .as_array()
+        .expect("coordinated workers");
+    assert_eq!(workers.len(), expected_workers);
+    for worker in workers {
+        assert_eq!(worker["role"], "worker");
+        assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+    }
+}
+
+#[test]
+fn per_coordinator_bound_keeps_two_workstreams_in_one_coordinator() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let paths = coordinated_fixture_paths()[..2].to_vec();
+    write_coordinated_fixture(&repo);
+    let task_file = coordinated_task_file(temp.path(), &paths);
+
+    let unbounded =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("plan without the bound");
+    assert_unbounded_coordinated_baseline(&unbounded, 2);
+    write_per_coordinator_bound_policy(&repo);
+    let bounded =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("plan with the bound");
+    assert_eq!(bounded["assignments"], unbounded["assignments"]);
+    assert_eq!(
+        bounded["assignment_schedule"],
+        unbounded["assignment_schedule"]
+    );
+    let decision = &bounded["depth_decision"];
+    assert_eq!(decision["mode"], "applied");
+    assert_eq!(decision["record"]["decision"]["kind"], "selected");
+    assert_eq!(decision["record"]["decision"]["depth"], 2);
+    assert_eq!(decision["record"]["decision"]["workers"], 2);
+    assert_eq!(decision["record"]["decision"]["coordinators"], 1);
+}
+
+#[test]
+fn per_coordinator_bound_nests_four_workstreams_under_a_planning_root() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let paths = coordinated_fixture_paths();
+    write_coordinated_fixture(&repo);
+    let task_file = coordinated_task_file(temp.path(), &paths);
+
+    let unbounded =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("plan without the bound");
+    assert_unbounded_coordinated_baseline(&unbounded, 4);
+    write_per_coordinator_bound_policy(&repo);
+
+    let document =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("plan nested tree");
+    let assignments = document["assignments"].as_array().expect("assignments");
+    assert_eq!(assignments.len(), 3);
+    let root = &assignments[0];
+    let root_id = root["id"].as_str().expect("planning root id");
+    let root_hash = root_id
+        .strip_prefix("coordinated-planning-")
+        .expect("planning root prefix");
+    assert_eq!(root_hash.len(), 16);
+    assert!(root_hash
+        .chars()
+        .all(|ch| matches!(ch, '0'..='9' | 'a'..='f')));
+    assert_eq!(root["phase"], "planning");
+    assert_eq!(root["role"], "child_orchestrator");
+    assert_eq!(root["role_category"], "delegating_coordinator");
+    assert_eq!(root["worker_assignments"], json!([]));
+    let root_paths = root["assigned_paths"].as_array().expect("root paths");
+    assert_eq!(root_paths.len(), 4);
+    let root_task = root["task"].as_str().expect("planning root task");
+    assert!(root_task.contains("Read-only planning gate"));
+    assert!(root["notes"]
+        .as_str()
+        .expect("root notes")
+        .contains("parent-gated"));
+    let coordinator_ids: Vec<String> = (1..=2)
+        .map(|index| format!("coordinated-execution-{root_hash}-{index}"))
+        .collect();
+    for (coordinator, coordinator_id) in assignments[1..].iter().zip(&coordinator_ids) {
+        assert_eq!(coordinator["id"], json!(coordinator_id));
+        assert_eq!(coordinator["phase"], "execution");
+        assert_eq!(coordinator["role"], "child_orchestrator");
+        assert_eq!(coordinator["role_category"], "delegating_coordinator");
+        let workers = coordinator["worker_assignments"]
+            .as_array()
+            .expect("workers");
+        assert_eq!(workers.len(), 2);
+        for worker in workers {
+            assert_eq!(worker["role"], "worker");
+            assert_eq!(worker["role_category"], "non_delegating_terminal_worker");
+        }
+    }
+    let first_workers = assignments[1]["worker_assignments"]
+        .as_array()
+        .expect("first coordinator workers");
+    let second_workers = assignments[2]["worker_assignments"]
+        .as_array()
+        .expect("second coordinator workers");
+    assert_eq!(
+        first_workers[0]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/SKILL.md"])
+    );
+    assert_eq!(
+        first_workers[1]["assigned_paths"],
+        json!([".agents/skills/agent-orchestration/reference.md"])
+    );
+    assert_eq!(
+        second_workers[0]["assigned_paths"],
+        json!([".agents/scripts/o2-autopilot"])
+    );
+    assert_eq!(
+        second_workers[1]["assigned_paths"],
+        json!([".agents/scripts/o2-audit-trail"])
+    );
+    assert_eq!(
+        assignments[1]["assigned_paths"],
+        json!([
+            ".agents/skills/agent-orchestration/SKILL.md",
+            ".agents/skills/agent-orchestration/reference.md"
+        ])
+    );
+    assert_eq!(
+        assignments[2]["assigned_paths"],
+        json!([
+            ".agents/scripts/o2-audit-trail",
+            ".agents/scripts/o2-autopilot"
+        ])
+    );
+    let schedule = document["assignment_schedule"]
+        .as_array()
+        .expect("schedule");
+    assert_eq!(schedule.len(), 3);
+    assert_eq!(schedule[0]["assignment_id"], json!(root_id));
+    assert_eq!(schedule[0]["parent_assignment_id"], json!(null));
+    assert_eq!(schedule[0]["depth"], 2);
+    assert_eq!(schedule[0]["flattened_index"], 0);
+    for (entry, coordinator_id) in schedule[1..].iter().zip(&coordinator_ids) {
+        assert_eq!(entry["assignment_id"], json!(coordinator_id));
+        assert_eq!(entry["parent_assignment_id"], json!(root_id));
+        assert_eq!(entry["depth"], 3);
+    }
+    assert_eq!(schedule[1]["flattened_index"], 1);
+    assert_eq!(schedule[2]["flattened_index"], 2);
+    assert_eq!(document["max_depth"], 4);
+    let decision = &document["depth_decision"];
+    assert_eq!(decision["mode"], "applied");
+    assert_eq!(decision["record"]["decision"]["kind"], "selected");
+    assert_eq!(decision["record"]["decision"]["depth"], 3);
+    assert_eq!(decision["record"]["decision"]["workers"], 4);
+    assert_eq!(decision["record"]["decision"]["coordinators"], 3);
+    let repeated =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("repeat nested plan");
+    assert_eq!(repeated, document);
+}
+
+#[test]
+fn per_coordinator_bound_refuses_a_single_worker_coordinator() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let repo = temp.path().join("repo");
+    let paths = coordinated_fixture_paths()[..3].to_vec();
+    write_coordinated_fixture(&repo);
+    let task_file = coordinated_task_file(temp.path(), &paths);
+
+    let unbounded =
+        supervisor_plan_document_from_task_file(&repo, &task_file).expect("plan without the bound");
+    assert_unbounded_coordinated_baseline(&unbounded, 3);
+    write_per_coordinator_bound_policy(&repo);
+
+    let error = supervisor_plan_document_from_task_file(&repo, &task_file)
+        .expect_err("single-Worker coordinator must fail");
+    let error = format!("{error:#}");
+    assert!(error.contains("a nested Execution coordinator needs at least two Workers"));
+}
+
 #[test]
 fn plain_text_gitignored_policy_path_emits_workstream() {
     let temp = tempfile::tempdir().expect("tempdir");

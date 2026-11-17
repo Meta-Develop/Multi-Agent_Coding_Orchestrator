@@ -503,12 +503,26 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         (false, false)
     };
     if coordinated_workers {
+        let frozen =
+            resolved_routing_policy.context("coordinated lowering lost its frozen policy")?;
+        if let Some(max_workers_per_coordinator) = frozen.policy.tree.max_workers_per_coordinator {
+            return lower_depth_applied_coordinated_proposal(
+                goal,
+                spec,
+                task_file,
+                proposal,
+                frozen,
+                task_routing_assessment,
+                repo,
+                max_workers_per_coordinator,
+            );
+        }
         return lower_coordinated_execution_proposal(
             goal,
             spec,
             task_file,
             proposal,
-            resolved_routing_policy.context("coordinated lowering lost its frozen policy")?,
+            frozen,
             task_routing_assessment,
             repo,
         );
@@ -820,6 +834,302 @@ fn lower_coordinated_execution_proposal(
         review_lens_correlation: Default::default(),
         review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
         assignments: vec![parent],
+    };
+    let metadata = SupervisorPlanMetadata {
+        spec_fragment_ids,
+        spec_fragment_ids_by_assignment: fragments_by_assignment,
+        assignment_schedule: schedule,
+        run_budget: conservative_generated_role_budget(),
+        path_proposal: proposal.diagnostics,
+        resolved_routing_policy: Some(frozen),
+        task_routing_assessment,
+        ..SupervisorPlanMetadata::default()
+    };
+    let (plan, plan_metadata) = validate_supervisor_plan_in_repo(plan, metadata, repo)?;
+    Ok(LoadedSupervisorPlan {
+        plan,
+        consultant: SupervisorConsultantPlan::default(),
+        assignment_metadata: AssignmentMetadata::new(),
+        plan_metadata,
+    })
+}
+
+/// Goal/spec coordinated lowering under the operator's per-coordinator Worker
+/// bound (#830): the coordination-depth decision selects the plan shape.
+///
+/// Depth 2 keeps the single coordinated Execution parent byte-identical to the
+/// unbounded plan; depth 3 nests Execution coordinators under one read-only
+/// Planning root.
+#[allow(clippy::too_many_arguments)]
+fn lower_depth_applied_coordinated_proposal(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    proposal: planning::TaskDecompositionProposal,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+    task_routing_assessment: Option<TaskRoutingAssessment>,
+    repo: Option<&Path>,
+    max_workers_per_coordinator: usize,
+) -> Result<LoadedSupervisorPlan> {
+    let workstream_count = proposal.assignments.len();
+    let worker_capacity_tokens =
+        crate::optimizer::depth_decision::DepthCostModel::uncalibrated_prior()
+            .worker_capacity_tokens;
+    let depth_ceiling = u8::try_from(frozen.policy.tree.max_depth.saturating_sub(1))
+        .unwrap_or(3)
+        .clamp(1, 3);
+    let input = crate::optimizer::depth_decision::DepthDecisionInput {
+        work_units: u32::try_from(workstream_count)
+            .context("coordinated workstream count overflowed the depth decision")?,
+        estimated_work_tokens: u64::try_from(workstream_count)
+            .unwrap_or(u64::MAX)
+            .saturating_mul(worker_capacity_tokens),
+        max_child_assignments: u32::try_from(max_workers_per_coordinator).unwrap_or(u32::MAX),
+        depth_ceiling,
+    };
+    let record = crate::optimizer::depth_decision::decide_depth(
+        &input,
+        &crate::optimizer::depth_decision::DepthCostModel::uncalibrated_prior(),
+        &crate::optimizer::EvaluationFunction::shipped_default(),
+    )?;
+    match &record.decision {
+        crate::optimizer::depth_decision::DepthDecision::Refused { reason } => bail!(
+            "coordinated proposal refused by the applied coordination-depth decision: {reason}"
+        ),
+        crate::optimizer::depth_decision::DepthDecision::Selected { depth: 1, .. } => bail!(
+            "coordinated proposal refused by the applied coordination-depth decision: depth 1 cannot hold coordinated workstreams"
+        ),
+        crate::optimizer::depth_decision::DepthDecision::Selected { workers, .. }
+            if *workers != u64::try_from(workstream_count).unwrap_or(u64::MAX) =>
+        {
+            bail!(
+                "coordinated proposal refused by the applied coordination-depth decision: merging workstreams is not supported (decision holds {workers} Workers for {workstream_count} workstreams)"
+            )
+        }
+        crate::optimizer::depth_decision::DepthDecision::Selected { depth: 2, .. } => {
+            lower_coordinated_execution_proposal(
+                goal,
+                spec,
+                task_file,
+                proposal,
+                frozen,
+                task_routing_assessment,
+                repo,
+            )
+        }
+        crate::optimizer::depth_decision::DepthDecision::Selected { depth: 3, .. } => {
+            lower_nested_coordinated_execution_proposal(
+                goal,
+                spec,
+                task_file,
+                proposal,
+                frozen,
+                task_routing_assessment,
+                repo,
+                max_workers_per_coordinator,
+            )
+        }
+        crate::optimizer::depth_decision::DepthDecision::Selected { depth, .. } => bail!(
+            "coordinated proposal refused by the applied coordination-depth decision: depth {depth} exceeds the one nested coordinator level"
+        ),
+    }
+}
+
+/// Depth-3 applied lowering: one read-only Planning root scheduling contiguous
+/// groups of Workers under Execution coordinators.
+#[allow(clippy::too_many_arguments)]
+fn lower_nested_coordinated_execution_proposal(
+    goal: &str,
+    spec: &str,
+    task_file: Option<PathBuf>,
+    proposal: planning::TaskDecompositionProposal,
+    frozen: crate::selection::routing_policy::FrozenRoutingPolicy,
+    task_routing_assessment: Option<TaskRoutingAssessment>,
+    repo: Option<&Path>,
+    max_workers_per_coordinator: usize,
+) -> Result<LoadedSupervisorPlan> {
+    let worker_count = proposal.assignments.len();
+    if worker_count > frozen.policy.tree.max_workers || 4 > frozen.policy.tree.max_depth {
+        bail!("coordinated Execution tree exceeds the frozen routing limits");
+    }
+    let coordinator_count = worker_count.div_ceil(max_workers_per_coordinator);
+    let base_group_size = worker_count / coordinator_count;
+    let larger_groups = worker_count % coordinator_count;
+    if base_group_size < 2 {
+        bail!(
+            "a nested Execution coordinator needs at least two Workers (bound {max_workers_per_coordinator}, workstreams {worker_count})"
+        );
+    }
+    let task = combined_goal_spec(goal, spec);
+    let task_hash = crate::artifacts::state_auth::sha256_hex(task.as_bytes());
+    let mut id_suffix = String::new();
+    let (planning_id, coordinator_ids) = loop {
+        let planning_id = format!("coordinated-planning-{}{}", &task_hash[..16], id_suffix);
+        let coordinator_ids = (1..=coordinator_count)
+            .map(|index| {
+                format!(
+                    "coordinated-execution-{}{}-{index}",
+                    &task_hash[..16],
+                    id_suffix
+                )
+            })
+            .collect::<Vec<_>>();
+        if !proposal
+            .assignments
+            .iter()
+            .any(|worker| worker.id == planning_id || coordinator_ids.contains(&worker.id))
+        {
+            break (planning_id, coordinator_ids);
+        }
+        id_suffix.push_str("-parent");
+    };
+    let spec_fragment_ids = proposal
+        .fragments
+        .iter()
+        .map(|fragment| fragment.id.clone())
+        .collect::<Vec<_>>();
+    let mut fragments_by_assignment = BTreeMap::new();
+    let mut root_paths = BTreeSet::new();
+    let mut root_symbols = BTreeSet::new();
+    let mut root_modules = BTreeSet::new();
+    let mut workers = Vec::with_capacity(worker_count);
+    for assignment in proposal.assignments {
+        let worker_paths = assignment
+            .assigned_paths
+            .into_iter()
+            .map(crate::sync::normalize_repo_relative_path)
+            .collect::<crate::sync::Result<BTreeSet<_>>>()?;
+        root_paths.extend(worker_paths.iter().cloned());
+        root_symbols.extend(assignment.semantic_symbols.iter().cloned());
+        root_modules.extend(assignment.semantic_modules.iter().cloned());
+        fragments_by_assignment.insert(assignment.id.clone(), assignment.fragment_ids.clone());
+        workers.push(WorkerAssignment {
+            id: assignment.id,
+            role: AgentRole::Worker,
+            role_category: Some(RoleCategory::NonDelegatingTerminalWorker),
+            selection_source: None,
+            assigned_paths: worker_paths.into_iter().collect(),
+            semantic_symbols: assignment.semantic_symbols,
+            semantic_modules: assignment.semantic_modules,
+            task: Some(assignment.task),
+            environment_requirements: Vec::new(),
+            report_path: None,
+        });
+    }
+    // Contiguous groups in proposal order; the first `larger_groups` groups
+    // are one Worker larger than the rest.
+    let mut groups: Vec<Vec<usize>> = Vec::with_capacity(coordinator_count);
+    let mut start = 0;
+    for group in 0..coordinator_count {
+        let size = base_group_size + usize::from(group < larger_groups);
+        groups.push((start..start + size).collect());
+        start += size;
+    }
+    let mut coordinators = Vec::with_capacity(coordinator_count);
+    for (coordinator_id, worker_indexes) in coordinator_ids.iter().zip(&groups) {
+        let mut paths = BTreeSet::new();
+        let mut symbols = BTreeSet::new();
+        let mut modules = BTreeSet::new();
+        let mut fragments = BTreeSet::new();
+        let mut group_workers = Vec::with_capacity(worker_indexes.len());
+        for &worker_index in worker_indexes {
+            let worker = &workers[worker_index];
+            paths.extend(worker.assigned_paths.iter().cloned());
+            symbols.extend(worker.semantic_symbols.iter().cloned());
+            modules.extend(worker.semantic_modules.iter().cloned());
+            fragments.extend(
+                fragments_by_assignment
+                    .get(&worker.id)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            group_workers.push(worker.clone());
+        }
+        fragments_by_assignment.insert(
+            coordinator_id.clone(),
+            fragments.into_iter().collect::<Vec<_>>(),
+        );
+        coordinators.push(OrchestratorAssignment {
+            assignment_shape: None,
+            id: coordinator_id.clone(),
+            phase: AssignmentPhase::Execution,
+            runtime: None,
+            role: AgentRole::ChildOrchestrator,
+            role_category: Some(RoleCategory::DelegatingCoordinator),
+            selection_source: None,
+            assigned_paths: paths.into_iter().collect(),
+            semantic_symbols: symbols.into_iter().collect(),
+            semantic_modules: modules.into_iter().collect(),
+            task: Some(task.clone()),
+            worker_assignments: group_workers,
+            environment_requirements: Vec::new(),
+            licensed_breakage: None,
+            notes: Some("Execution parent selected by frozen coordinated task grain; nested scopes require live authenticated frozen grants and actual isolated captures".into()),
+            decision_refs: Vec::new(),
+        });
+    }
+    fragments_by_assignment.insert(planning_id.clone(), spec_fragment_ids.clone());
+    let planning_task = format!(
+        "Read-only planning gate for the coordinated Execution tree. Review the proposed scopes and implementation tasks without editing files or delegating implementation. Confirm whether the Execution coordinators can proceed safely.\n\nExecution task:\n{task}"
+    );
+    let planning_root = OrchestratorAssignment {
+        assignment_shape: None,
+        id: planning_id.clone(),
+        phase: AssignmentPhase::Planning,
+        runtime: None,
+        role: AgentRole::ChildOrchestrator,
+        role_category: Some(AgentRole::ChildOrchestrator.authority_category()),
+        selection_source: None,
+        assigned_paths: root_paths.into_iter().collect(),
+        semantic_symbols: root_symbols.into_iter().collect(),
+        semantic_modules: root_modules.into_iter().collect(),
+        task: Some(planning_task),
+        worker_assignments: Vec::new(),
+        environment_requirements: Vec::new(),
+        licensed_breakage: None,
+        notes: Some(
+            "Read-only coordinated planning root; its Execution coordinators are parent-gated"
+                .into(),
+        ),
+        decision_refs: Vec::new(),
+    };
+    // The Planning root schedules first; every Execution coordinator is its child.
+    let mut schedule = vec![AssignmentScheduleEntry {
+        assignment_id: planning_id.clone(),
+        parent_assignment_id: None,
+        depth: MIN_SUPERVISOR_DEPTH,
+        flattened_index: 0,
+    }];
+    for (index, coordinator_id) in coordinator_ids.iter().enumerate() {
+        schedule.push(AssignmentScheduleEntry {
+            assignment_id: coordinator_id.clone(),
+            parent_assignment_id: Some(planning_id.clone()),
+            depth: MIN_SUPERVISOR_DEPTH.saturating_add(1),
+            flattened_index: index + 1,
+        });
+    }
+    let mut assignments = Vec::with_capacity(1 + coordinator_count);
+    assignments.push(planning_root);
+    assignments.extend(coordinators);
+    let plan = SupervisorPlan {
+        version: SUPERVISOR_SCHEMA_VERSION,
+        task,
+        task_file,
+        max_depth: 4,
+        max_child_assignments: 1usize
+            .checked_add(coordinator_count)
+            .and_then(|count| count.checked_add(worker_count))
+            .context("coordinated assignment capacity overflow")?,
+        max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
+        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
+        semantic_coordination: SemanticCoordinationMode::Off,
+        role_models: BTreeMap::new(),
+        model_pricing: BTreeMap::new(),
+        review_lenses: default_supervisor_review_lenses(),
+        review_lens_correlation: Default::default(),
+        review_aggregation_policy: ReviewAggregationPolicy::AllMustAccept,
+        assignments,
     };
     let metadata = SupervisorPlanMetadata {
         spec_fragment_ids,
@@ -5139,6 +5449,10 @@ pub(super) fn supervisor_plan_value(
         serde_json::to_value(super::depth_record::plan_depth_decision(
             plan,
             &plan_metadata.assignment_schedule,
+            plan_metadata
+                .resolved_routing_policy
+                .as_ref()
+                .and_then(|frozen| frozen.policy.tree.max_workers_per_coordinator),
         )?)
         .context("failed to serialize depth decision")?,
     );

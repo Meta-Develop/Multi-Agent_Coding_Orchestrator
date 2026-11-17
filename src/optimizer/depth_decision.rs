@@ -2,9 +2,12 @@
 //!
 //! Depth `d` means `d - 1` delegating coordinator levels above one level of
 //! terminal Workers. Depth 1 is a single terminal Worker with no coordinator.
-//! Depth 2 and deeper equal the supervisor plan `max_depth` (a root assignment
-//! has depth 2, a nested child depth 3; `max_depth` 1 is not a supervisor
-//! plan). Every coordinator carries one independent read-only auditor.
+//! With plan-visible authored Workers, decision depth `d` lowers to supervisor
+//! plan `max_depth` `d + 1` (a direct Worker plan is depth 1 with `max_depth`
+//! 2, one coordinated Execution parent is depth 2 with `max_depth` 3). A child
+//! orchestrator that launches its Workers outside the plan has plan
+//! `max_depth` `d`. Every coordinator carries one independent read-only
+//! auditor.
 //!
 //! Candidate quality and cost come from an uncalibrated prior
 //! ([`DepthCostModel`]) that every record carries, so later calibration can
