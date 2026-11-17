@@ -294,6 +294,35 @@ pub(super) fn check_interrupted_result(
 }
 
 #[test]
+fn writable_launch_binds_only_the_isolated_worker_cycle_sibling() {
+    use super::bound_parent_turn::isolated_worker_worktree_id;
+    use crate::external_agent::managed_worktree_binds_assignment;
+    // The writable launch checks accept exactly this Worker's cycle sibling (#1050).
+    for attempt in [1, 3] {
+        let sibling = isolated_worker_worktree_id("worker", attempt);
+        assert!(managed_worktree_binds_assignment(
+            &sibling, "worker", attempt
+        ));
+    }
+    assert!(managed_worktree_binds_assignment("worker", "worker", 3));
+    assert!(!managed_worktree_binds_assignment(
+        "worker.attempt-3",
+        "worker",
+        5
+    ));
+    assert!(!managed_worktree_binds_assignment(
+        "worker-two.attempt-3",
+        "worker",
+        3
+    ));
+    assert!(!managed_worktree_binds_assignment(
+        "worker.attempt-1",
+        "worker",
+        1
+    ));
+}
+
+#[test]
 fn later_managed_parent_cycle_uses_fresh_isolated_worker_identity() -> Result<()> {
     use super::bound_parent_turn::isolated_worker_worktree_id;
     use super::isolated_worker_evidence::isolated_worker_journal_root;
