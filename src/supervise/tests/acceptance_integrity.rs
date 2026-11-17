@@ -2933,7 +2933,7 @@ fn journal_record_reference_completes_omitted_journal_commands() {
 
 #[cfg(target_os = "linux")]
 #[test]
-fn journal_record_reference_leaves_complete_commands_run_unchanged() {
+fn journal_record_reference_binds_complete_commands_run() {
     let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
     let (_temp, journals) = journal_record_reference_fixture("printf 'a\\n'");
     let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
@@ -2953,11 +2953,83 @@ fn journal_record_reference_leaves_complete_commands_run_unchanged() {
         &mut report,
     );
     assert!(report.accepted, "{}", finding_messages(&report));
+    // The reported command is bound to its journal record (#1075); nothing is appended.
+    record.journal_record = Some(JournalRecordReference {
+        line: entries.len() as u64,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
     assert_eq!(report.worker_reports[0].commands_run, vec![record]);
     assert!(!report.worker_reports[0]
         .findings
         .iter()
         .any(|finding| finding.message.contains("MACO appended")));
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+fn reported_journal_command_binding_excuses_direct_worker_exploratory_failure() {
+    let _error = crate::safe_state::LinuxOpenat2Error::force(libc::ENOSYS).with_statx_enosys();
+    let (_temp, mut journals) = journal_record_reference_fixture("printf 'a\\n'");
+    let WorkerExecutionJournalStatus::Loaded(entries) =
+        &mut journals.get_mut("worker-a").unwrap().status
+    else {
+        panic!("loaded")
+    };
+    // The exploratory command exited 1, like rg without a match (#1075).
+    entries
+        .last_mut()
+        .unwrap()
+        .observation
+        .as_mut()
+        .unwrap()
+        .exit_code = Some(1);
+    let entry = entries.last().unwrap().clone();
+    let reference = Some(JournalRecordReference {
+        line: entries.len() as u64,
+        start_timestamp: entry.start_timestamp.clone(),
+    });
+    let direct_report = |record: CommandRunRecord| {
+        let mut assignment = injected_assignment(true);
+        let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
+        assignment.id = worker.id.clone();
+        assignment.role = AgentRole::Worker;
+        assignment.worker_assignments.clear();
+        worker.commands_run = vec![record];
+        worker.validation_results[0].command = vec!["cargo".to_string(), "test".to_string()];
+        let mut report = direct_worker_report_envelope(worker);
+        validate_worker_execution_journal_evidence(
+            &assignment,
+            Path::new("reported-exploratory-failure.json"),
+            &journals,
+            &mut report,
+        );
+        report
+    };
+    let mut record = injected_command_record();
+    record.command = entry.command.clone();
+    record.cwd = entry.cwd.clone();
+    record.status = ReviewStatus::Failed;
+    record.exit_code = Some(1);
+
+    // The reported failure is bound in the envelope and in its nested report
+    // alike, so it does not fail the validated Worker (#1061).
+    let report = direct_report(record.clone());
+    assert!(report.accepted, "{}", finding_messages(&report));
+    assert_eq!(report.commands_run.len(), 1);
+    assert_eq!(report.commands_run[0].journal_record, reference);
+    assert_eq!(report.worker_reports[0].commands_run, report.commands_run);
+    assert!(!worker_technical_failure(&report.worker_reports[0], &[]));
+
+    // A reported status that differs from the journal record stays unbound; the
+    // journal record is appended separately, as before (#1053).
+    record.status = ReviewStatus::Succeeded;
+    record.exit_code = Some(0);
+    let report = direct_report(record);
+    let commands = &report.worker_reports[0].commands_run;
+    assert_eq!(commands.len(), 2);
+    assert_eq!(commands[0].journal_record, None);
+    assert_eq!(commands[1].journal_record, reference);
+    assert_eq!(&report.commands_run, commands);
 }
 
 #[cfg(target_os = "linux")]
@@ -3356,6 +3428,14 @@ fn worker_journal_wrapper_direct_envelope_preserves_failed_command_metadata() {
         &mut report,
     );
     record.command = entry.command.clone();
+    // The reported failed command is bound to its completed record (#1075).
+    let WorkerExecutionJournalStatus::Loaded(entries) = &journals["worker-a"].status else {
+        panic!("loaded")
+    };
+    record.journal_record = Some(JournalRecordReference {
+        line: entries.len() as u64,
+        start_timestamp: entries.last().unwrap().start_timestamp.clone(),
+    });
     // The unreported completed record at line 2 is appended (#1053); the
     // reported failed command keeps its metadata and is not duplicated.
     assert_eq!(report.commands_run.len(), 2);
