@@ -171,6 +171,24 @@ fn primary_execution_target_rejects_missing_broad_and_git_scopes() {
 }
 
 #[test]
+fn primary_execution_target_refuses_authored_worker_assignments() {
+    let assignment = primary_assignment(true);
+    assert!(!assignment.worker_assignments.is_empty());
+    let error = validate_supervisor_plan(
+        injected_plan(assignment, 0),
+        SupervisorPlanMetadata {
+            execution_target: Some(primary_target()),
+            ..SupervisorPlanMetadata::default()
+        },
+    )
+    .expect_err("authored Workers cannot run in the primary checkout");
+    assert!(
+        format!("{error:#}").contains("does not support authored worker_assignments"),
+        "unexpected primary-worker refusal: {error:#}"
+    );
+}
+
+#[test]
 fn dirty_primary_scope_refuses_before_dispatch_and_releases_claim() {
     skip_without_containment!();
     let (temp, repo) = injected_primary_repository();
