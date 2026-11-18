@@ -695,7 +695,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
             assignment_capacity.max(DEFAULT_MAX_CHILD_ASSIGNMENTS)
         },
         max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        max_gate_corrections: GENERATED_PLAN_MAX_GATE_CORRECTIONS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
@@ -825,7 +825,7 @@ fn lower_coordinated_execution_proposal(
             .checked_add(1)
             .context("coordinated assignment capacity overflow")?,
         max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        max_gate_corrections: GENERATED_PLAN_MAX_GATE_CORRECTIONS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
@@ -1121,7 +1121,7 @@ fn lower_nested_coordinated_execution_proposal(
             .and_then(|count| count.checked_add(worker_count))
             .context("coordinated assignment capacity overflow")?,
         max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        max_gate_corrections: GENERATED_PLAN_MAX_GATE_CORRECTIONS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
@@ -3490,7 +3490,7 @@ fn supervisor_plan_and_consultant_from_provider_session(
         max_depth: actual_max_depth,
         max_child_assignments: actual_assignment_count,
         max_child_retries: DEFAULT_MAX_CHILD_RETRIES,
-        max_gate_corrections: DEFAULT_MAX_GATE_CORRECTIONS,
+        max_gate_corrections: GENERATED_PLAN_MAX_GATE_CORRECTIONS,
         child_timeout_seconds: DEFAULT_CHILD_TIMEOUT_SECONDS,
         semantic_coordination: SemanticCoordinationMode::Off,
         role_models: BTreeMap::new(),
@@ -8137,7 +8137,7 @@ pub(super) mod generated_terminal_worker_tests {
         );
         assert_eq!(
             loaded.plan.max_gate_corrections,
-            DEFAULT_MAX_GATE_CORRECTIONS
+            GENERATED_PLAN_MAX_GATE_CORRECTIONS
         );
         loaded.plan.role_models.insert(
             AgentRole::Worker,
