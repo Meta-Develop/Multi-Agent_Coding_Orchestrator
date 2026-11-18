@@ -138,9 +138,8 @@ Prerequisites:
   neither is available, selection fails closed; older Sol and Luna are not
   fallbacks. `gpt-6-astra`, `gpt-6.2-astra` and the Terra family remain
   prohibited for every role. App-server launches retain an exact protocol
-  qualification gate that currently admits 0.144.4 and 0.162.0, so a newer CLI
-  whose catalog offers `gpt-6.2-sol` also needs protocol qualification; until
-  then use 0.162.0, whose catalog offers `gpt-6.1-sol`.
+  qualification gate that currently admits 0.144.4, 0.162.0 and 0.169.1; any
+  other version fails closed until it is qualified.
   The 0.162.0 adapter validates asynchronous `account/updated` notices during
   startup and inference, timestamped moderation metadata, request-resolution
   notices, and `turn/started` arriving before its response. These notifications
@@ -153,6 +152,17 @@ Prerequisites:
   canonical file must be a root-owned, executable, non-symlink regular file,
   not group- or world-writable, with non-symlink ancestors. Run
   `--version` on whichever of those three paths exists.
+- To use a newer root-installed CLI for one MACO installation without
+  changing the system default, root may write the pin file
+  `/etc/maco/trusted-codex` containing exactly one absolute path (for
+  example `/usr/lib/codex-0.169.1/bin/codex`) and one optional trailing
+  newline. The pin file must be a root-owned, non-symlink regular file of
+  at most 4096 bytes that is not group- or world-writable, with
+  root-owned, non-writable, non-symlink ancestors. Logical `codex` then
+  resolves to that path; its canonical file must be named `codex` and
+  pass the checks above. An invalid pin fails closed and never falls back
+  to the fixed paths. Remove the file to return to the fixed paths. MACO
+  builds without pin support ignore the file and keep the fixed paths.
 - For the Codex-only command below, pass the canonical trusted file as
   `--runtime-bin`. Logical `--codex-bin codex` is also supported for ordinary
   routing; an absolute path must canonicalize to the same trusted file.
