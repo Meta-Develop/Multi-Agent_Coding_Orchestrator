@@ -1814,6 +1814,8 @@ fn writable_app_server_accepts_only_the_exact_audited_codex_version() {
         .expect("audited Codex app-server version");
     validate_duplex_app_server_version(EnvironmentVersion::new(0, 162, 0))
         .expect("captured Codex 0.162.0 app-server protocol");
+    validate_duplex_app_server_version(EnvironmentVersion::new(0, 169, 1))
+        .expect("audited Codex 0.169.1 app-server schema");
     for version in [
         EnvironmentVersion::new(0, 144, 3),
         EnvironmentVersion::new(0, 144, 5),
@@ -1821,6 +1823,9 @@ fn writable_app_server_accepts_only_the_exact_audited_codex_version() {
         EnvironmentVersion::new(0, 161, 0),
         EnvironmentVersion::new(0, 162, 1),
         EnvironmentVersion::new(0, 163, 0),
+        EnvironmentVersion::new(0, 169, 0),
+        EnvironmentVersion::new(0, 169, 2),
+        EnvironmentVersion::new(0, 170, 0),
     ] {
         let error = validate_duplex_app_server_version(version)
             .expect_err("unaudited app-server version must fail closed");

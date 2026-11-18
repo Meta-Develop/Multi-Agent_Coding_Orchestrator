@@ -30,6 +30,7 @@ const STARTUP_INFORMATION_MAX_BYTES: usize = 16 * 1024;
 const THREAD_STATUS_MAX_MESSAGES: usize = 32;
 const ACCOUNT_RATE_LIMIT_MAX_MESSAGES: usize = 4096;
 const ACCOUNT_UPDATE_MAX_MESSAGES: usize = 64;
+const THREAD_STATE_NOTICE_MAX_MESSAGES: usize = 64;
 const MODERATION_METADATA_MAX_MESSAGES: usize = 4096;
 const WARNING_MAX_MESSAGES: usize = 64;
 const RETRY_NOTICE_MAX_MESSAGES: usize = 16;
@@ -283,6 +284,9 @@ enum RetryErrorInfo {
         #[serde(rename = "turnKind")]
         turn_kind: RetryTurnKind,
     },
+    ModelNotFound,
+    PolicyCapacityUnavailable,
+    InferenceHookDenied,
     Other,
 }
 
@@ -348,7 +352,8 @@ struct AccountUpdatedParams {
     plan_type: Option<AccountPlanType>,
 }
 
-// Enumerations from 0.162.0's generated AccountUpdatedNotification schema.
+// Enumerations from the generated AccountUpdatedNotification schemas of
+// codex-cli 0.162.0 and 0.169.1.
 #[derive(serde::Deserialize)]
 #[serde(rename_all = "camelCase")]
 enum AccountAuthMode {
@@ -382,6 +387,8 @@ enum AccountPlanType {
     Edu,
     EduPlus,
     EduPro,
+    Sci,
+    SciPlus,
     Unknown,
 }
 
@@ -391,6 +398,122 @@ fn valid_account_updated(line: &[u8]) -> bool {
             serde_json::from_slice::<AccountUpdated>(line),
             Ok(AccountUpdated { method, .. }) if method == "account/updated"
         )
+}
+
+// codex-cli 0.169.1 defines the thread/readState/changed and
+// thread/section/changed notifications. They are retained in raw capture only
+// and are never used as model, usage, read, or completion evidence.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadReadStateChanged {
+    method: String,
+    params: ThreadReadStateChangedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThreadReadStateChangedParams {
+    thread_id: String,
+    read_state: ThreadReadState,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThreadReadState {
+    revision: String,
+    #[serde(default)]
+    first_unread: Option<ThreadFirstUnread>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+enum ThreadFirstUnread {
+    ThreadStart,
+    Turn {
+        #[serde(rename = "turnId")]
+        turn_id: String,
+    },
+}
+
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ThreadSectionChanged {
+    method: String,
+    params: ThreadSectionChangedParams,
+    #[serde(default, rename = "emittedAtMs")]
+    emitted_at_ms: Option<i64>,
+}
+
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ThreadSectionChangedParams {
+    thread_id: String,
+    section_id: Option<String>,
+}
+
+// Serde cannot enforce deny_unknown_fields on the buffered content of an
+// internally tagged enum, so the raw firstUnread keys are checked here.
+fn valid_thread_first_unread(value: &Value) -> bool {
+    let Value::Object(map) = value else {
+        return matches!(value, Value::Null);
+    };
+    match map.get("type").and_then(Value::as_str) {
+        Some("threadStart") => map.len() == 1,
+        Some("turn") => {
+            map.len() == 2
+                && map
+                    .get("turnId")
+                    .is_some_and(|turn_id| turn_id.as_str().is_some_and(|s| !s.is_empty()))
+        }
+        _ => false,
+    }
+}
+
+fn valid_thread_state_notice(line: &[u8]) -> bool {
+    if line.len() > STARTUP_INFORMATION_MAX_BYTES {
+        return false;
+    }
+    let Ok(message) = serde_json::from_slice::<Value>(line) else {
+        return false;
+    };
+    match message.get("method").and_then(Value::as_str) {
+        Some("thread/readState/changed") => matches!(
+            serde_json::from_slice::<ThreadReadStateChanged>(line),
+            Ok(notice) if notice.method == "thread/readState/changed"
+                && !notice.params.thread_id.is_empty()
+                && !notice.params.read_state.revision.is_empty()
+                && message
+                    .pointer("/params/readState/firstUnread")
+                    .is_none_or(valid_thread_first_unread)
+                && notice
+                    .params
+                    .read_state
+                    .first_unread
+                    .as_ref()
+                    .is_none_or(|first| match first {
+                        ThreadFirstUnread::ThreadStart => true,
+                        ThreadFirstUnread::Turn { turn_id } => !turn_id.is_empty(),
+                    })
+        ),
+        Some("thread/section/changed") => {
+            message
+                .pointer("/params")
+                .is_some_and(|params| params.get("sectionId").is_some())
+                && matches!(
+                    serde_json::from_slice::<ThreadSectionChanged>(line),
+                    Ok(notice) if notice.method == "thread/section/changed"
+                        && !notice.params.thread_id.is_empty()
+                        && notice
+                            .params
+                            .section_id
+                            .as_ref()
+                            .is_none_or(|section_id| !section_id.is_empty())
+                )
+        }
+        _ => false,
+    }
 }
 
 #[derive(serde::Deserialize)]
@@ -1438,6 +1561,7 @@ struct ProtocolState {
     server_request_ids: BTreeSet<RequestId>,
     resolved_server_request_ids: BTreeSet<RequestId>,
     account_update_notices: usize,
+    thread_state_notices: usize,
     next_request_id: u64,
     command_snapshot: Option<CommandExecutionSnapshot>,
 }
@@ -1459,6 +1583,7 @@ impl ProtocolState {
             server_request_ids: BTreeSet::new(),
             resolved_server_request_ids: BTreeSet::new(),
             account_update_notices: 0,
+            thread_state_notices: 0,
             next_request_id: 1,
             command_snapshot: None,
         })
@@ -1567,6 +1692,25 @@ impl ProtocolState {
                     return Err(AppServerError::Malformed {
                         phase,
                         message: "account update notification is malformed or exceeded its bound"
+                            .to_string(),
+                    });
+                }
+                continue;
+            }
+            if matches!(
+                phase,
+                "account/read" | "thread/start" | "turn/start" | "turn"
+            ) && matches!(
+                message.get("method").and_then(Value::as_str),
+                Some("thread/readState/changed") | Some("thread/section/changed")
+            ) {
+                self.thread_state_notices += 1;
+                if !valid_thread_state_notice(&line)
+                    || self.thread_state_notices > THREAD_STATE_NOTICE_MAX_MESSAGES
+                {
+                    return Err(AppServerError::Malformed {
+                        phase,
+                        message: "thread state notification is malformed or exceeded its bound"
                             .to_string(),
                     });
                 }
@@ -4683,6 +4827,154 @@ mod tests {
         ));
         let mut unknown = notice;
         unknown["method"] = json!("account/unknown");
+        let mut messages = command_observation_messages();
+        messages.insert(4, unknown);
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Unexpected { .. })
+        ));
+    }
+
+    #[test]
+    fn codex_0169_account_updates_accept_sci_plan_types() {
+        for plan_type in ["sci", "sci_plus"] {
+            let notice = json!({
+                "method": "account/updated",
+                "params": {"authMode": "chatgpt", "planType": plan_type}
+            });
+            assert!(
+                valid_account_updated(&serde_json::to_vec(&notice).unwrap()),
+                "{plan_type}"
+            );
+            let mut messages = command_observation_messages();
+            messages.insert(1, notice);
+            assert!(
+                run_command_observation_messages(messages).is_ok(),
+                "{plan_type}"
+            );
+        }
+        let invented = json!({
+            "method": "account/updated",
+            "params": {"authMode": "chatgpt", "planType": "invented"}
+        });
+        assert!(!valid_account_updated(
+            &serde_json::to_vec(&invented).unwrap()
+        ));
+    }
+
+    #[test]
+    fn codex_0169_retry_notices_accept_new_error_info() {
+        let captured =
+            "\"codexErrorInfo\":{\"responseStreamDisconnected\":{\"httpStatusCode\":null}}";
+        for info in [
+            "modelNotFound",
+            "policyCapacityUnavailable",
+            "inferenceHookDenied",
+        ] {
+            let notice = RETRY_NOTICE_CAPTURE
+                .trim()
+                .replace(captured, &format!("\"codexErrorInfo\":\"{info}\""));
+            assert!(valid_retry_notice(notice.as_bytes()), "{info}");
+        }
+        let invented = RETRY_NOTICE_CAPTURE
+            .trim()
+            .replace(captured, "\"codexErrorInfo\":\"inventedError\"");
+        assert!(!valid_retry_notice(invented.as_bytes()));
+    }
+
+    #[test]
+    fn codex_0169_thread_state_notices_are_validated_bounded_and_skipped() {
+        let read_state = json!({
+            "method": "thread/readState/changed",
+            "params": {
+                "threadId": "thread-1",
+                "readState": {
+                    "revision": "rev-1",
+                    "firstUnread": {"type": "turn", "turnId": "turn-1"}
+                }
+            }
+        });
+        let section = json!({
+            "method": "thread/section/changed",
+            "params": {"threadId": "thread-1", "sectionId": "section-1"}
+        });
+        let valid = [
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": null}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "threadStart"}}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "turn", "turnId": "turn-1"}}}}),
+            json!({"method": "thread/section/changed", "params": {"threadId": "thread-1", "sectionId": "section-1"}}),
+            json!({"method": "thread/section/changed", "params": {"threadId": "thread-1", "sectionId": null}}),
+        ];
+        let baseline = run_command_observation_messages(command_observation_messages()).unwrap();
+        for notice in &valid {
+            assert!(valid_thread_state_notice(
+                &serde_json::to_vec(notice).unwrap()
+            ));
+            for index in [1usize, 5usize] {
+                let mut messages = command_observation_messages();
+                messages.insert(index, notice.clone());
+                let outcome = run_command_observation_messages(messages).unwrap();
+                assert_eq!(outcome.status, baseline.status);
+            }
+        }
+        let mut oversized = read_state.clone();
+        oversized["params"]["readState"]["revision"] =
+            json!("x".repeat(STARTUP_INFORMATION_MAX_BYTES));
+        let invalid = [
+            json!({"id": 8, "method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "extra": true, "params": {"threadId": "thread-1", "readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "extra": true, "readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "params": {"readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "", "readState": {"revision": "rev-1"}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1"}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": 7}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "invented"}}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "turn"}}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "threadStart", "turnId": "turn-1"}}}}),
+            json!({"method": "thread/readState/changed", "params": {"threadId": "thread-1", "readState": {"revision": "rev-1", "firstUnread": {"type": "turn", "turnId": "turn-1", "extra": true}}}}),
+            json!({"method": "thread/section/changed", "params": {"threadId": "thread-1"}}),
+            json!({"method": "thread/section/changed", "params": {"threadId": "thread-1", "sectionId": 17}}),
+            oversized,
+        ];
+        for notice in &invalid {
+            assert!(!valid_thread_state_notice(
+                &serde_json::to_vec(notice).unwrap()
+            ));
+            let mut messages = command_observation_messages();
+            messages.insert(5, notice.clone());
+            assert!(matches!(
+                run_command_observation_messages(messages),
+                Err(AppServerError::Malformed { .. })
+            ));
+        }
+        let mut messages = command_observation_messages();
+        messages.insert(0, read_state.clone());
+        assert!(matches!(
+            run_command_observation_messages(messages),
+            Err(AppServerError::Unexpected { .. })
+        ));
+        for (count, allowed) in [
+            (THREAD_STATE_NOTICE_MAX_MESSAGES, true),
+            (THREAD_STATE_NOTICE_MAX_MESSAGES + 1, false),
+        ] {
+            let mut messages = command_observation_messages();
+            messages.insert(1, read_state.clone());
+            let rest: Vec<Value> = (0..count - 1)
+                .map(|index| {
+                    if index % 2 == 0 {
+                        section.clone()
+                    } else {
+                        read_state.clone()
+                    }
+                })
+                .collect();
+            messages.splice(5..5, rest);
+            assert_eq!(run_command_observation_messages(messages).is_ok(), allowed);
+        }
+        let mut unknown = read_state.clone();
+        unknown["method"] = json!("thread/unknown/changed");
         let mut messages = command_observation_messages();
         messages.insert(4, unknown);
         assert!(matches!(
