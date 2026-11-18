@@ -893,6 +893,8 @@ pub(crate) fn supervisor_catalog_preflight_refuse_sealed_executable_resolution_d
 thread_local! {
     static INJECTED_TRUSTED_CODEX_EXECUTABLE: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
+    static INJECTED_TRUSTED_CODEX_PIN_FILE: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
     static INJECTED_CODEX_AUTH_HOME: std::cell::RefCell<Option<PathBuf>> =
         const { std::cell::RefCell::new(None) };
     static CODEX_RUNTIME_MODEL_CATALOG_PROCESS_LAUNCH_ATTEMPTS: std::cell::Cell<usize> =
@@ -927,6 +929,11 @@ pub(crate) fn set_injected_trusted_codex_executable_for_test(path: Option<PathBu
 #[cfg(test)]
 fn replace_injected_trusted_codex_executable_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
     INJECTED_TRUSTED_CODEX_EXECUTABLE.with(|injected| injected.replace(path))
+}
+
+#[cfg(all(test, unix))]
+fn set_injected_trusted_codex_pin_file_for_test(path: Option<PathBuf>) -> Option<PathBuf> {
+    INJECTED_TRUSTED_CODEX_PIN_FILE.with(|injected| injected.replace(path))
 }
 
 #[cfg(test)]
@@ -1636,13 +1643,193 @@ const fn os_argument_encoding_tag() -> &'static [u8] {
 }
 
 fn trusted_codex_fixed_candidate_exists() -> bool {
-    [
+    if [
         "/run/current-system/sw/bin/codex",
         "/usr/bin/codex",
         "/bin/codex",
     ]
     .into_iter()
     .any(|candidate| Path::new(candidate).exists())
+    {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        if let Some(pin) = trusted_codex_pin_file() {
+            return fs::symlink_metadata(&pin).is_ok();
+        }
+    }
+    false
+}
+
+#[cfg(unix)]
+const TRUSTED_CODEX_PIN_FILE: &str = "/etc/maco/trusted-codex";
+
+#[cfg(unix)]
+const TRUSTED_CODEX_PIN_MAX_BYTES: u64 = 4096;
+
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrustedCodexPinFileDecision {
+    Accept,
+    RejectNotRegularFile,
+    RejectWritable,
+    RejectOwnership,
+    RejectTooLarge,
+}
+
+#[cfg(unix)]
+fn trusted_codex_pin_file_decision(
+    is_symlink: bool,
+    is_file: bool,
+    mode: u32,
+    uid: u32,
+    len: u64,
+) -> TrustedCodexPinFileDecision {
+    if is_symlink || !is_file {
+        TrustedCodexPinFileDecision::RejectNotRegularFile
+    } else if mode & 0o022 != 0 {
+        TrustedCodexPinFileDecision::RejectWritable
+    } else if uid != 0 {
+        TrustedCodexPinFileDecision::RejectOwnership
+    } else if len > TRUSTED_CODEX_PIN_MAX_BYTES {
+        TrustedCodexPinFileDecision::RejectTooLarge
+    } else {
+        TrustedCodexPinFileDecision::Accept
+    }
+}
+
+#[cfg(unix)]
+fn trusted_codex_pin_file_decision_reason(decision: TrustedCodexPinFileDecision) -> &'static str {
+    match decision {
+        TrustedCodexPinFileDecision::Accept => "accepted",
+        TrustedCodexPinFileDecision::RejectNotRegularFile => "not a non-symlink regular file",
+        TrustedCodexPinFileDecision::RejectWritable => "group- or world-writable",
+        TrustedCodexPinFileDecision::RejectOwnership => "not root-owned",
+        TrustedCodexPinFileDecision::RejectTooLarge => "larger than the maximum size",
+    }
+}
+
+#[cfg(unix)]
+fn executable_ancestor_permission_decision_reason(
+    decision: ExecutableAncestorPermissionDecision,
+) -> &'static str {
+    match decision {
+        ExecutableAncestorPermissionDecision::Accept => "accepted",
+        ExecutableAncestorPermissionDecision::RejectWritable => "group- or world-writable",
+        ExecutableAncestorPermissionDecision::RejectOwnership => "not root-owned",
+    }
+}
+
+#[cfg(unix)]
+fn parse_trusted_codex_pin(contents: &[u8]) -> Result<PathBuf> {
+    let mut bytes = contents;
+    if bytes.last() == Some(&b'\n') {
+        bytes = &bytes[..bytes.len() - 1];
+    }
+    let text = std::str::from_utf8(bytes)
+        .map_err(|_| anyhow::anyhow!("trusted Codex pin contents are not valid UTF-8"))?;
+    if text.is_empty() {
+        bail!("trusted Codex pin contents are empty");
+    }
+    if text.contains('\n') || text.contains('\r') || text.contains('\0') {
+        bail!("trusted Codex pin contents contain a line break or NUL byte");
+    }
+    if text.starts_with(char::is_whitespace) || text.ends_with(char::is_whitespace) {
+        bail!("trusted Codex pin contents start or end with whitespace");
+    }
+    let path = PathBuf::from(text);
+    if !path.is_absolute() {
+        bail!("trusted Codex pin contents are not an absolute path");
+    }
+    Ok(path)
+}
+
+#[cfg(unix)]
+fn trusted_codex_pin_target(pin: &Path) -> Result<Option<PathBuf>> {
+    let metadata = match fs::symlink_metadata(pin) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(anyhow::Error::from(error)).with_context(|| {
+                format!("failed to inspect trusted Codex pin file {}", pin.display())
+            });
+        }
+    };
+    let decision = trusted_codex_pin_file_decision(
+        metadata.file_type().is_symlink(),
+        metadata.is_file(),
+        std::os::unix::fs::PermissionsExt::mode(&metadata.permissions()),
+        std::os::unix::fs::MetadataExt::uid(&metadata),
+        metadata.len(),
+    );
+    if decision != TrustedCodexPinFileDecision::Accept {
+        bail!(
+            "trusted Codex pin file {} refused: {}",
+            pin.display(),
+            trusted_codex_pin_file_decision_reason(decision)
+        );
+    }
+    for ancestor in pin.ancestors().skip(1) {
+        let ancestor_metadata = fs::symlink_metadata(ancestor).with_context(|| {
+            format!("failed to inspect trusted Codex pin file ancestor {}", ancestor.display())
+        })?;
+        if ancestor_metadata.file_type().is_symlink() {
+            bail!(
+                "trusted Codex pin file ancestor {} refused: symlink",
+                ancestor.display()
+            );
+        }
+        let ancestor_decision = executable_ancestor_permission_decision(
+            std::os::unix::fs::PermissionsExt::mode(&ancestor_metadata.permissions()),
+            std::os::unix::fs::MetadataExt::uid(&ancestor_metadata),
+            ancestor_metadata.is_dir(),
+            true,
+        );
+        if ancestor_decision != ExecutableAncestorPermissionDecision::Accept {
+            bail!(
+                "trusted Codex pin file ancestor {} refused: {}",
+                ancestor.display(),
+                executable_ancestor_permission_decision_reason(ancestor_decision)
+            );
+        }
+    }
+    let bytes = fs::read(pin)
+        .with_context(|| format!("failed to read trusted Codex pin file {}", pin.display()))?;
+    if bytes.len() as u64 > TRUSTED_CODEX_PIN_MAX_BYTES {
+        bail!(
+            "trusted Codex pin file {} is larger than {} bytes",
+            pin.display(),
+            TRUSTED_CODEX_PIN_MAX_BYTES
+        );
+    }
+    Ok(Some(parse_trusted_codex_pin(&bytes)?))
+}
+
+#[cfg(unix)]
+fn trusted_codex_pin_file() -> Option<PathBuf> {
+    #[cfg(test)]
+    {
+        INJECTED_TRUSTED_CODEX_PIN_FILE.with(|injected| injected.borrow().clone())
+    }
+    #[cfg(not(test))]
+    {
+        Some(PathBuf::from(TRUSTED_CODEX_PIN_FILE))
+    }
+}
+
+fn trusted_codex_pin_resolution() -> Result<Option<PathBuf>> {
+    #[cfg(unix)]
+    {
+        match trusted_codex_pin_file() {
+            Some(pin) => trusted_codex_pin_target(&pin),
+            None => Ok(None),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        Ok(None)
+    }
 }
 
 fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
@@ -1651,7 +1838,14 @@ fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
         return Ok(resolved);
     }
     let require_root_owned = program == Path::new(TRUSTED_SUPERVISOR_CATALOG_CODEX_PROGRAM);
-    let candidate = if require_root_owned {
+    let pinned_target = if require_root_owned {
+        trusted_codex_pin_resolution()?
+    } else {
+        None
+    };
+    let candidate = if let Some(target) = pinned_target.as_ref() {
+        target.clone()
+    } else if require_root_owned {
         [
             "/run/current-system/sw/bin/codex",
             "/usr/bin/codex",
@@ -1678,6 +1872,22 @@ fn resolve_external_program(program: &Path, cwd: &Path) -> Result<PathBuf> {
     };
     let canonical = fs::canonicalize(&candidate)
         .with_context(|| format!("failed to canonicalize {}", candidate.display()))?;
+    #[cfg(unix)]
+    {
+        if let Some(target) = pinned_target.as_ref() {
+            if canonical.file_name() != Some(OsStr::new("codex")) {
+                bail!(
+                    "trusted Codex pin {} names {} whose canonical file name is not codex",
+                    TRUSTED_CODEX_PIN_FILE,
+                    target.display()
+                );
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = &pinned_target;
+    }
     validate_external_program_identity(&canonical, require_root_owned)?;
     Ok(canonical)
 }
@@ -9109,6 +9319,125 @@ mod nixos_identity_regression_tests {
                     !included.iter().any(|key| key == forbidden),
                     "{label}: {forbidden}"
                 );
+            }
+        }
+    }
+}
+
+#[cfg(all(test, unix))]
+mod trusted_codex_pin_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    #[test]
+    fn trusted_codex_pin_parser_accepts_exactly_one_absolute_path() {
+        let expected = PathBuf::from("/usr/lib/codex-0.169.1/bin/codex");
+        assert_eq!(
+            parse_trusted_codex_pin(b"/usr/lib/codex-0.169.1/bin/codex\n").unwrap(),
+            expected
+        );
+        assert_eq!(
+            parse_trusted_codex_pin(b"/usr/lib/codex-0.169.1/bin/codex").unwrap(),
+            expected
+        );
+        for contents in [
+            &b""[..],
+            b"\n",
+            b"codex\n",
+            b"/a/codex\n/b/codex\n",
+            b"/a/codex\n\n",
+            b"/a/codex\r\n",
+            b" /a/codex\n",
+            b"/a/codex \n",
+            b"/a/co\0dex",
+            b"/a/\xffcodex",
+        ] {
+            assert!(
+                parse_trusted_codex_pin(contents).is_err(),
+                "unexpectedly accepted {contents:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn trusted_codex_pin_file_decision_requires_a_root_owned_private_regular_file() {
+        use TrustedCodexPinFileDecision::{
+            Accept, RejectNotRegularFile, RejectOwnership, RejectTooLarge, RejectWritable,
+        };
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o644, 0, 40),
+            Accept
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o600, 0, 4096),
+            Accept
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(true, false, 0o777, 0, 40),
+            RejectNotRegularFile
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, false, 0o755, 0, 40),
+            RejectNotRegularFile
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o664, 0, 40),
+            RejectWritable
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o646, 0, 40),
+            RejectWritable
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o644, 1000, 40),
+            RejectOwnership
+        );
+        assert_eq!(
+            trusted_codex_pin_file_decision(false, true, 0o644, 0, 4097),
+            RejectTooLarge
+        );
+    }
+
+    #[test]
+    fn invalid_trusted_codex_pin_fails_closed_without_fixed_path_fallback() {
+        let temp = tempfile::tempdir().unwrap();
+        let bin = temp.path().join("bin");
+        fs::create_dir_all(&bin).unwrap();
+        let codex = bin.join("codex");
+        fs::write(&codex, b"#!/bin/sh\n").unwrap();
+        let mut permissions = fs::metadata(&codex).unwrap().permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(&codex, permissions).unwrap();
+        let pin = temp.path().join("trusted-codex");
+        fs::write(&pin, format!("{}\n", codex.display())).unwrap();
+        let mut permissions = fs::metadata(&pin).unwrap().permissions();
+        permissions.set_mode(0o666);
+        fs::set_permissions(&pin, permissions).unwrap();
+        let previous = set_injected_trusted_codex_pin_file_for_test(Some(pin));
+        let result = resolve_external_program(Path::new("codex"), temp.path());
+        set_injected_trusted_codex_pin_file_for_test(previous);
+        let error = result.unwrap_err();
+        assert!(
+            format!("{error:#}").contains("trusted Codex pin file"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn absent_trusted_codex_pin_keeps_fixed_path_resolution() {
+        let temp = tempfile::tempdir().unwrap();
+        let pin = temp.path().join("absent-pin");
+        let previous = set_injected_trusted_codex_pin_file_for_test(Some(pin));
+        let with_absent_pin = resolve_external_program(Path::new("codex"), temp.path());
+        set_injected_trusted_codex_pin_file_for_test(previous);
+        let without_pin = resolve_external_program(Path::new("codex"), temp.path());
+        match (with_absent_pin, without_pin) {
+            (Ok(with_absent_pin), Ok(without_pin)) => {
+                assert_eq!(with_absent_pin, without_pin);
+            }
+            (Err(_), Err(_)) => {}
+            (with_absent_pin, without_pin) => {
+                panic!("resolution outcomes differ: {with_absent_pin:?} vs {without_pin:?}");
             }
         }
     }
