@@ -569,6 +569,9 @@ const DEFAULT_MAX_CHILD_ASSIGNMENTS: usize = 4;
 const DEFAULT_MAX_CHILD_RETRIES: u8 = 0;
 const MAX_CHILD_RETRIES_LIMIT: u8 = 2;
 const DEFAULT_MAX_GATE_CORRECTIONS: u8 = 0;
+/// Gate corrections allowed by plans that MACO generates from a goal or spec (#1093).
+/// Hand-authored plan documents keep `DEFAULT_MAX_GATE_CORRECTIONS`.
+const GENERATED_PLAN_MAX_GATE_CORRECTIONS: u8 = 2;
 const MAX_GATE_CORRECTIONS_LIMIT: u8 = 4;
 const MAX_EVIDENCE_ONLY_REAUDITS: u8 = 2;
 pub(crate) const MAX_LICENSED_BREAKAGE_DEPENDENTS: usize = 16;

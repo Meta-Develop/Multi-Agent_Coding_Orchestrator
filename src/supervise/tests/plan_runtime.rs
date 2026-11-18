@@ -2400,7 +2400,7 @@ fn goal_spec_planning_emits_nested_workstream_hierarchies_with_workers_and_gaps(
     );
     assert_eq!(
         reparsed.plan.max_gate_corrections,
-        DEFAULT_MAX_GATE_CORRECTIONS
+        GENERATED_PLAN_MAX_GATE_CORRECTIONS
     );
     let renormalized = supervisor_plan_value(
         &reparsed.plan,
@@ -6509,7 +6509,7 @@ fn provider_planning_session_lowers_recursive_tree_and_binds_run_identity() {
         plan.review_aggregation_policy,
         ReviewAggregationPolicy::AllMustAccept
     );
-    assert_eq!(plan.max_gate_corrections, DEFAULT_MAX_GATE_CORRECTIONS);
+    assert_eq!(plan.max_gate_corrections, 2);
     assert_eq!(plan.assignments[2].id, "beta");
     assert_eq!(plan.assignments[2].phase, AssignmentPhase::Execution);
 
