@@ -241,3 +241,71 @@ fn prompt_with_structural_retry_lists_at_most_eight_truncated_problems() {
         assert!(problem.starts_with("problem-"));
     }
 }
+
+fn worker_report_json_with_validation_command(command: &str) -> String {
+    let mut value: serde_json::Value =
+        serde_json::from_str(&sample_worker_report_json_missing_finding_severity())
+            .expect("sample report JSON parses");
+    value["findings"] = serde_json::json!([]);
+    value["validation_results"] = serde_json::json!([{
+        "name": "check",
+        "status": "succeeded",
+        "command": serde_json::from_str::<serde_json::Value>(command)
+            .expect("command JSON parses"),
+    }]);
+    value.to_string()
+}
+
+#[test]
+fn worker_report_validation_command_accepts_string() {
+    let json = worker_report_json_with_validation_command("\"awk '/x/ {print FNR}' src/lib.rs\"");
+    let report = parse_report_json::<WorkerReport>(&json).expect("report parses");
+    assert_eq!(
+        report.report.validation_results[0].command,
+        vec!["awk '/x/ {print FNR}' src/lib.rs".to_string()]
+    );
+    let serialized = serde_json::to_value(&report.report.validation_results[0]).expect("serialize");
+    assert_eq!(
+        serialized["command"],
+        serde_json::json!(["awk '/x/ {print FNR}' src/lib.rs"])
+    );
+}
+
+#[test]
+fn worker_report_validation_command_keeps_argv_and_empty_forms() {
+    let argv = worker_report_json_with_validation_command("[\"cargo\", \"test\"]");
+    let report = parse_report_json::<WorkerReport>(&argv).expect("argv report parses");
+    assert_eq!(
+        report.report.validation_results[0].command,
+        vec!["cargo", "test"]
+    );
+
+    for command in ["[]", "\"   \""] {
+        let json = worker_report_json_with_validation_command(command);
+        let report = parse_report_json::<WorkerReport>(&json).expect("empty report parses");
+        assert!(report.report.validation_results[0].command.is_empty());
+    }
+
+    let mut missing: serde_json::Value =
+        serde_json::from_str(&sample_worker_report_json_missing_finding_severity())
+            .expect("sample report JSON parses");
+    missing["findings"] = serde_json::json!([]);
+    missing["validation_results"] = serde_json::json!([{
+        "name": "check",
+        "status": "succeeded",
+    }]);
+    let report =
+        parse_report_json::<WorkerReport>(&missing.to_string()).expect("missing key report parses");
+    assert!(report.report.validation_results[0].command.is_empty());
+}
+
+#[test]
+fn worker_report_validation_command_rejects_other_types() {
+    for command in ["5", "[1, 2]", "null"] {
+        let json = worker_report_json_with_validation_command(command);
+        assert!(
+            parse_report_json::<WorkerReport>(&json).is_err(),
+            "command {command} must be rejected"
+        );
+    }
+}
