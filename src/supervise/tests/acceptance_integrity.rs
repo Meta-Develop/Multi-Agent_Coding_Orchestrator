@@ -620,6 +620,47 @@ fn journal_bound_exploratory_failure_does_not_fail_validated_worker() {
 }
 
 #[test]
+fn journal_bound_rerun_without_exit_code_repairs_a_failed_validation() {
+    let assignment = injected_assignment(true);
+    let mut worker = injected_child_report(&assignment).worker_reports.remove(0);
+    let command = vec!["cargo".to_string(), "fmt".to_string()];
+    worker.validation_results[0].command = command.clone();
+    let mut failed = injected_command_record();
+    failed.command = command;
+    failed.status = ReviewStatus::Failed;
+    failed.exit_code = Some(1);
+    failed.journal_record = Some(JournalRecordReference {
+        line: 3,
+        start_timestamp: "2026-11-18T14:30:00Z".to_string(),
+    });
+    let mut rerun = failed.clone();
+    rerun.status = ReviewStatus::Succeeded;
+    rerun.exit_code = None;
+    rerun.journal_record = Some(JournalRecordReference {
+        line: 5,
+        start_timestamp: "2026-11-18T14:31:00Z".to_string(),
+    });
+
+    worker.commands_run = vec![failed.clone(), rerun.clone()];
+    assert!(!worker_technical_failure(&worker, &[]));
+
+    let mut unbound = rerun.clone();
+    unbound.journal_record = None;
+    worker.commands_run = vec![failed.clone(), unbound];
+    assert!(worker_technical_failure(&worker, &[]));
+
+    let mut elsewhere = rerun.clone();
+    elsewhere.cwd = std::path::PathBuf::from("elsewhere");
+    worker.commands_run = vec![failed.clone(), elsewhere];
+    assert!(worker_technical_failure(&worker, &[]));
+
+    let mut timed_out = rerun;
+    timed_out.timed_out = true;
+    worker.commands_run = vec![failed, timed_out];
+    assert!(worker_technical_failure(&worker, &[]));
+}
+
+#[test]
 fn worker_command_license_does_not_excuse_timeout() {
     let assignment = injected_assignment(true);
     let mut worker = injected_child_report(&assignment).worker_reports.remove(0);

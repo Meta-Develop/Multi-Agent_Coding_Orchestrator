@@ -1710,6 +1710,7 @@ pub(super) fn report_failed<T: ReportStatus>(report: &T) -> bool {
 }
 
 /// Errors and environment or sandbox failures cannot be repaired by a rerun.
+/// A journal-bound rerun records no exit code on success, so its succeeded status stands for exit 0 (#1111).
 pub(super) fn command_is_repaired_by_later_success(
     command: &CommandRunRecord,
     later_commands: &[CommandRunRecord],
@@ -1721,7 +1722,8 @@ pub(super) fn command_is_repaired_by_later_success(
             later.command == command.command
                 && later.cwd.as_os_str() == command.cwd.as_os_str()
                 && later.status == ReviewStatus::Succeeded
-                && later.exit_code == Some(0)
+                && (later.exit_code == Some(0)
+                    || (later.exit_code.is_none() && later.journal_record.is_some()))
                 && !later.timed_out
                 && later.error.is_none()
                 && later.environment_failures.is_empty()
