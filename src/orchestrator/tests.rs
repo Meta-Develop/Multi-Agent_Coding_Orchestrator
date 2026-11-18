@@ -37,6 +37,29 @@ fn assignment_cleanliness_context_preserves_failure_without_pending_changes_advi
     }
 }
 
+#[test]
+fn candidate_failure_messages_keep_the_cause_chain() {
+    let result: Result<()> = Err(anyhow::anyhow!("git command exceeded its time limit"));
+    let error = result
+        .context("failed to capture candidate untracked paths")
+        .expect_err("capture failure must remain an error");
+    assert_eq!(
+        candidate_failure_message("failed to finalize bound candidate", &error),
+        "failed to finalize bound candidate: failed to capture candidate untracked paths: git command exceeded its time limit"
+    );
+    assert_eq!(
+        candidate_failure_message("failed to bind candidate before validation", &error),
+        "failed to bind candidate before validation: failed to capture candidate untracked paths: git command exceeded its time limit"
+    );
+    assert_eq!(
+        candidate_failure_message(
+            "failed to finalize bound candidate",
+            &anyhow::anyhow!("candidate state changed")
+        ),
+        "failed to finalize bound candidate: candidate state changed"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 fn collect_status_paths_fails_closed_on_non_utf8_path() -> Result<()> {
