@@ -803,17 +803,24 @@ fn propose_task_decomposition_from_inventory(
             },
         });
     }
+    let mut unsupported_scan_files: BTreeSet<PathBuf> = BTreeSet::new();
     let semantic_map = match repo_semantic::scan_repository_with_exclusions(
         repo,
         Some(&file_set),
         &inventory.nested_repository_boundaries,
     ) {
         Ok(map) => {
-            let allowed_error_count = map
-                .errors
-                .iter()
-                .filter(|error| file_set.contains(&error.file))
-                .count();
+            let mut allowed_error_count = 0;
+            for error in &map.errors {
+                if !file_set.contains(&error.file) {
+                    continue;
+                }
+                if error.kind == repo_semantic::SemanticScanErrorKind::Unsupported {
+                    unsupported_scan_files.insert(error.file.clone());
+                } else {
+                    allowed_error_count += 1;
+                }
+            }
             if allowed_error_count > 0 {
                 diagnostics.degraded = true;
                 diagnostics.notes.push(format!(
@@ -867,6 +874,24 @@ fn propose_task_decomposition_from_inventory(
         } else {
             candidates.push(candidate);
         }
+    }
+    let unsupported_covered_count = unsupported_scan_files
+        .iter()
+        .filter(|unsupported| {
+            candidates.iter().any(|candidate| {
+                candidate
+                    .assigned_paths
+                    .iter()
+                    .any(|path| path == *unsupported || unsupported.starts_with(path))
+            })
+        })
+        .count();
+    if unsupported_covered_count > 0 {
+        diagnostics.degraded = true;
+        diagnostics.notes.push(format!(
+            "semantic scan has no language adapter for {} proposed path(s); affected fragments use path-only scope",
+            unsupported_covered_count
+        ));
     }
     if !coverage_gaps.is_empty() {
         diagnostics.notes.push(format!(
@@ -2560,6 +2585,8 @@ fn propose_fragment_scope(
     let named = match_named_paths_in_text(repo, &fragment.text, files, file_set);
     explicit_paths.extend(named.resolved);
     notes.extend(named.notes);
+    let named_paths = explicit_paths.clone();
+    let code_identifier_text = inline_code_identifier_text(&fragment.text, files);
     if explicit_paths.is_empty() {
         propose_docs_paths(&normalized_text, file_set, &mut explicit_paths);
         propose_non_rust_identifier_paths(&normalized_text, files, &mut explicit_paths);
@@ -2570,10 +2597,16 @@ fn propose_fragment_scope(
             if !file_set.contains(&file.path) {
                 continue;
             }
-            if identifier_matches(&normalized_text, &file.path) {
+            let outside_named_path = !named_paths.is_empty() && !named_paths.contains(&file.path);
+            let stem_kept = identifier_matches(&normalized_text, &file.path)
+                && (!outside_named_path || identifier_matches(&code_identifier_text, &file.path));
+            let module_kept = module_matches(&normalized_text, &file.module_path)
+                && (!outside_named_path
+                    || module_matches(&code_identifier_text, &file.module_path));
+            if stem_kept {
                 broad_semantic_paths.insert(file.path.clone());
             }
-            if module_matches(&normalized_text, &file.module_path) {
+            if module_kept {
                 broad_semantic_paths.insert(file.path.clone());
                 semantic_modules.insert(file.module_path.join("::"));
             }
@@ -2584,6 +2617,14 @@ fn propose_fragment_scope(
                     || qualified_path_matches(&normalized_text, &symbol.qualified_path))
             {
                 continue;
+            }
+            if !named_paths.is_empty() && !named_paths.contains(&symbol.file) {
+                let kept_by_code_identifier =
+                    identifier_matches_text(&code_identifier_text, &symbol.name)
+                        || qualified_path_matches(&code_identifier_text, &symbol.qualified_path);
+                if !kept_by_code_identifier {
+                    continue;
+                }
             }
             let qualified = symbol.qualified_path.join("::");
             if symbol.kind == repo_semantic::SemanticSymbolKind::Module {
@@ -2601,6 +2642,9 @@ fn propose_fragment_scope(
                 .and_then(|extension| extension.to_str())
                 .is_some_and(|extension| extension.eq_ignore_ascii_case("rs"))
                 && identifier_matches(&normalized_text, file)
+                && (named_paths.is_empty()
+                    || named_paths.contains(file)
+                    || identifier_matches(&code_identifier_text, file))
             {
                 broad_semantic_paths.insert(file.clone());
             }
@@ -2641,6 +2685,30 @@ struct ProposedFragmentScope {
     suppressed_broad_paths: usize,
     unresolved_named_paths: Vec<String>,
     notes: Vec<String>,
+}
+
+fn inline_code_identifier_text(text: &str, files: &[PathBuf]) -> String {
+    let mut spans: Vec<String> = Vec::new();
+    for line in text.lines() {
+        let mut rest = line;
+        while let Some(start) = rest.find('`') {
+            let after = &rest[start + 1..];
+            let Some(end) = after.find('`') else {
+                break;
+            };
+            let content = after[..end].trim();
+            if !content.contains('/')
+                && !content.contains('\\')
+                && !files
+                    .iter()
+                    .any(|file| file.file_name().is_some_and(|name| name == content))
+            {
+                spans.push(content.to_string());
+            }
+            rest = &after[end + 1..];
+        }
+    }
+    normalize_text(&spans.join(" "))
 }
 
 fn module_matches(normalized_text: &str, module_path: &[String]) -> bool {
@@ -6495,5 +6563,231 @@ Add a single new line at the end of `RELEASE_NOTES.md`. Do not change any other 
             git2::Signature::now("maco test", "maco-test@example.invalid").expect("signature");
         repo.commit(Some("HEAD"), &signature, &signature, message, &tree, &[])
             .expect("commit test files")
+    }
+
+    #[test]
+    fn semantic_unsupported_files_outside_the_task_keep_the_proposal_clean() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/alpha.rs", "pub fn alpha_entry() {}\n");
+        write_file(repo, "src/beta.rs", "pub fn beta_entry() {}\n");
+        write_file(repo, "web/app.ts", "export const value = 1;\n");
+        write_file(repo, "web/view.tsx", "export const value = 1;\n");
+        write_file(repo, "tools/build.mjs", "export const value = 1;\n");
+        let files = vec![
+            PathBuf::from("src/alpha.rs"),
+            PathBuf::from("src/beta.rs"),
+            PathBuf::from("web/app.ts"),
+            PathBuf::from("web/view.tsx"),
+            PathBuf::from("tools/build.mjs"),
+        ];
+        let body = "- Update `src/alpha.rs` so that alpha_entry returns unit.\n- Update `src/beta.rs` so that beta_entry returns unit.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert!(!proposal.diagnostics.degraded);
+        assert!(proposal
+            .diagnostics
+            .notes
+            .iter()
+            .all(|note| !note.contains("semantic scan reported")));
+        assert!(proposal
+            .diagnostics
+            .notes
+            .iter()
+            .all(|note| !note.contains("no language adapter")));
+        let assigned: Vec<Vec<PathBuf>> = proposal
+            .assignments
+            .iter()
+            .map(|assignment| assignment.assigned_paths.clone())
+            .collect();
+        assert_eq!(
+            assigned,
+            vec![
+                vec![PathBuf::from("src/alpha.rs")],
+                vec![PathBuf::from("src/beta.rs")]
+            ]
+        );
+
+        let rust_only = vec![PathBuf::from("src/alpha.rs"), PathBuf::from("src/beta.rs")];
+        let baseline = decompose_with_test_inventory(repo, "", body, rust_only)
+            .expect("plan rust-only decomposition");
+        assert_eq!(proposal.assignments, baseline.assignments);
+        assert_eq!(proposal.coverage_gaps, baseline.coverage_gaps);
+        assert_eq!(proposal.diagnostics, baseline.diagnostics);
+    }
+
+    #[test]
+    fn semantic_unsupported_file_named_by_the_task_degrades_the_proposal() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/alpha.rs", "pub fn alpha_entry() {}\n");
+        write_file(repo, "src/beta.rs", "pub fn beta_entry() {}\n");
+        write_file(repo, "web/app.ts", "export const value = 1;\n");
+        write_file(repo, "web/view.tsx", "export const value = 1;\n");
+        write_file(repo, "tools/build.mjs", "export const value = 1;\n");
+        let files = vec![
+            PathBuf::from("src/alpha.rs"),
+            PathBuf::from("src/beta.rs"),
+            PathBuf::from("web/app.ts"),
+            PathBuf::from("web/view.tsx"),
+            PathBuf::from("tools/build.mjs"),
+        ];
+        let body = "- Update `web/app.ts` so that it exports a second constant.\n- Update `src/alpha.rs` so that alpha_entry returns unit.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert!(proposal.diagnostics.degraded);
+        assert_eq!(
+            proposal
+                .diagnostics
+                .notes
+                .iter()
+                .filter(|note| note.as_str()
+                    == "semantic scan has no language adapter for 1 proposed path(s); affected fragments use path-only scope")
+                .count(),
+            1
+        );
+        assert!(proposal
+            .diagnostics
+            .notes
+            .iter()
+            .all(|note| !note.contains("semantic scan reported")));
+        assert!(proposal.assignments.iter().any(|assignment| assignment
+            .assigned_paths
+            .contains(&PathBuf::from("web/app.ts"))));
+    }
+
+    #[test]
+    fn semantic_unsupported_files_do_not_mask_rust_parse_errors() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/alpha.rs", "pub fn alpha_entry() {}\n");
+        write_file(repo, "src/broken.rs", "pub fn broken(");
+        write_file(repo, "web/app.ts", "export const value = 1;\n");
+        let files = vec![
+            PathBuf::from("src/alpha.rs"),
+            PathBuf::from("src/broken.rs"),
+            PathBuf::from("web/app.ts"),
+        ];
+        let body = "- Update `src/alpha.rs` so that alpha_entry returns unit.\n- Update `src/broken.rs` so that it parses again.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert!(proposal.diagnostics.degraded);
+        assert!(proposal.diagnostics.notes.iter().any(|note| note
+            == "semantic scan reported 1 source error(s); affected fragments may have incomplete semantic intents"));
+        assert!(proposal
+            .diagnostics
+            .notes
+            .iter()
+            .all(|note| !note.contains("no language adapter")));
+    }
+
+    #[test]
+    fn named_path_scope_ignores_prose_symbol_matches_outside_named_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/notes/alpha.rs", "pub fn rewrap_alpha() {}\n");
+        write_file(repo, "src/notes/beta.rs", "pub fn rewrap_beta() {}\n");
+        write_file(
+            repo,
+            "src/helpers.rs",
+            "pub fn comment() {}\npub fn line() {}\npub struct Marker;\nimpl Marker {\n    pub fn keep(&self) {}\n}\n",
+        );
+        let files = vec![
+            PathBuf::from("src/notes/alpha.rs"),
+            PathBuf::from("src/notes/beta.rs"),
+            PathBuf::from("src/helpers.rs"),
+        ];
+        let body = "- In `src/notes/alpha.rs`, rewrap the comment line and keep the text.\n- In `src/notes/beta.rs`, rewrap the comment line and keep the text.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert_eq!(proposal.assignments.len(), 2);
+        let assigned: Vec<Vec<PathBuf>> = proposal
+            .assignments
+            .iter()
+            .map(|assignment| assignment.assigned_paths.clone())
+            .collect();
+        assert_eq!(
+            assigned,
+            vec![
+                vec![PathBuf::from("src/notes/alpha.rs")],
+                vec![PathBuf::from("src/notes/beta.rs")]
+            ]
+        );
+        assert!(proposal.assignments.iter().all(|assignment| !assignment
+            .assigned_paths
+            .contains(&PathBuf::from("src/helpers.rs"))));
+        assert!(proposal.assignments.iter().all(|assignment| {
+            assignment
+                .semantic_symbols
+                .iter()
+                .all(|symbol| !symbol.starts_with("crate::helpers"))
+                && assignment
+                    .semantic_modules
+                    .iter()
+                    .all(|module| !module.starts_with("crate::helpers"))
+        }));
+    }
+
+    #[test]
+    fn named_path_scope_keeps_code_span_symbols_outside_named_paths() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/notes/alpha.rs", "pub fn rewrap_alpha() {}\n");
+        write_file(repo, "src/notes/beta.rs", "pub fn rewrap_beta() {}\n");
+        write_file(
+            repo,
+            "src/helpers.rs",
+            "pub fn comment() {}\npub fn line() {}\npub struct Marker;\nimpl Marker {\n    pub fn keep(&self) {}\n}\n",
+        );
+        let files = vec![
+            PathBuf::from("src/notes/alpha.rs"),
+            PathBuf::from("src/notes/beta.rs"),
+            PathBuf::from("src/helpers.rs"),
+        ];
+        let body = "- In `src/notes/alpha.rs`, call `comment` from the helpers.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert_eq!(proposal.assignments.len(), 1);
+        let assignment = &proposal.assignments[0];
+        assert_eq!(
+            assignment.assigned_paths,
+            vec![
+                PathBuf::from("src/helpers.rs"),
+                PathBuf::from("src/notes/alpha.rs")
+            ]
+        );
+        assert!(assignment
+            .semantic_symbols
+            .contains(&"crate::helpers::comment".to_string()));
+    }
+
+    #[test]
+    fn named_path_scope_leaves_fragments_without_named_paths_unchanged() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let repo = temp.path();
+        git2::Repository::init(repo).expect("init repo");
+        write_file(repo, "src/notes/alpha.rs", "pub fn rewrap_alpha() {}\n");
+        write_file(repo, "src/notes/beta.rs", "pub fn rewrap_beta() {}\n");
+        write_file(
+            repo,
+            "src/helpers.rs",
+            "pub fn comment() {}\npub fn line() {}\npub struct Marker;\nimpl Marker {\n    pub fn keep(&self) {}\n}\n",
+        );
+        let files = vec![
+            PathBuf::from("src/notes/alpha.rs"),
+            PathBuf::from("src/notes/beta.rs"),
+            PathBuf::from("src/helpers.rs"),
+        ];
+        let body = "- Rewrap the comment line in the helpers.";
+        let proposal =
+            decompose_with_test_inventory(repo, "", body, files).expect("plan decomposition");
+        assert!(proposal.assignments.iter().any(|assignment| assignment
+            .assigned_paths
+            .contains(&PathBuf::from("src/helpers.rs"))));
     }
 }
