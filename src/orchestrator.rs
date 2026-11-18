@@ -3451,7 +3451,10 @@ fn run_agent_schedule(
                     notify_candidate_boundary_failure(&context.plan.agents[index].id);
                     fail_summary(
                         &mut summaries[index],
-                        format!("failed to bind candidate before validation: {error}"),
+                        candidate_failure_message(
+                            "failed to bind candidate before validation",
+                            &error,
+                        ),
                     );
                     None
                 }
@@ -3503,7 +3506,10 @@ fn run_agent_schedule(
                         Err(error) => {
                             fail_summary(
                                 &mut summaries[index],
-                                format!("failed to finalize bound candidate: {error}"),
+                                candidate_failure_message(
+                                    "failed to finalize bound candidate",
+                                    &error,
+                                ),
                             );
                             None
                         }
@@ -3872,6 +3878,12 @@ fn capture_selected_bound_candidate(
     let captured = capture_bound_candidate(worktree.path(), base_oid, expected_state, runtime)?;
     verify_selected_worktree_binding(manager, agent, summary, worktree)?;
     Ok(captured)
+}
+
+/// Fail-closed candidate binding and capture messages keep the full anyhow
+/// cause chain so that the outermost context never hides the cause (#1086).
+fn candidate_failure_message(prefix: &str, error: &anyhow::Error) -> String {
+    format!("{prefix}: {error:#}")
 }
 
 fn propagate_dependency_failures(
