@@ -707,18 +707,24 @@ fn deterministic_verification_path(
         return ViabilityFinding::Unknown;
     }
     // An assigned Rust file's own test module (inline or declared, named `tests` or ending in
-    // `_tests`) is a verification path for a Worker edit (#1019, #1033).
+    // `_tests`) is a verification path for a Worker edit (#1019, #1033), and for a child
+    // orchestrator when each of its Worker assignments has such a file among the coordinator's
+    // assigned paths, because each of those Workers would be claimed on its own (#1090).
     if assignment.role == AgentRole::Worker
-        && risk_report.touched_symbols.iter().any(|symbol| {
-            symbol.kind == SemanticSymbolKind::Module
-                && (symbol.name == "tests" || symbol.name.ends_with("_tests"))
-                && assignment.assigned_paths.contains(&symbol.file)
-                && symbol
-                    .file
-                    .extension()
-                    .and_then(|extension| extension.to_str())
-                    == Some("rs")
-                && mapped_regular_file(repo_map, &symbol.file)
+        && assignment
+            .assigned_paths
+            .iter()
+            .any(|path| rust_file_has_own_test_module(risk_report, repo_map, path))
+    {
+        return ViabilityFinding::Yes;
+    }
+    if assignment.role == AgentRole::ChildOrchestrator
+        && !assignment.worker_assignments.is_empty()
+        && assignment.worker_assignments.iter().all(|worker| {
+            worker.assigned_paths.iter().any(|path| {
+                assignment.assigned_paths.contains(path)
+                    && rust_file_has_own_test_module(risk_report, repo_map, path)
+            })
         })
     {
         return ViabilityFinding::Yes;
@@ -1353,6 +1359,20 @@ fn mapped_regular_file(repo_map: &RepoMap, path: &Path) -> bool {
         .entries
         .iter()
         .any(|entry| entry.path == path && entry.kind == RepoEntryKind::File)
+}
+
+fn rust_file_has_own_test_module(
+    risk_report: &SemanticRiskReport,
+    repo_map: &RepoMap,
+    path: &Path,
+) -> bool {
+    path.extension().and_then(|extension| extension.to_str()) == Some("rs")
+        && mapped_regular_file(repo_map, path)
+        && risk_report.touched_symbols.iter().any(|symbol| {
+            symbol.kind == SemanticSymbolKind::Module
+                && (symbol.name == "tests" || symbol.name.ends_with("_tests"))
+                && symbol.file == *path
+        })
 }
 
 fn risk_is_bound_to_assignment(
@@ -4586,6 +4606,131 @@ mod tests {
         let mut risk = risk_for_path("src/lib.rs");
         risk.touched_symbols = vec![symbol("src/lib.rs", "tests", SemanticSymbolKind::Module)];
         assert_eq!(verify(&orchestrator, &risk), ViabilityFinding::Unknown);
+    }
+
+    #[test]
+    fn child_orchestrator_whose_workers_each_have_a_rust_tests_module_is_a_verification_path() {
+        fn worker_for(id: &str, path: &str) -> crate::supervise::WorkerAssignment {
+            crate::supervise::WorkerAssignment {
+                id: id.to_string(),
+                role: AgentRole::Worker,
+                role_category: None,
+                selection_source: None,
+                assigned_paths: vec![PathBuf::from(path)],
+                semantic_symbols: Vec::new(),
+                semantic_modules: Vec::new(),
+                task: None,
+                environment_requirements: Vec::new(),
+                report_path: None,
+            }
+        }
+        let coordinator_for = |workers: Vec<crate::supervise::WorkerAssignment>| {
+            let mut coordinator = assignment();
+            coordinator.assigned_paths =
+                vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/other.rs")];
+            coordinator.worker_assignments = workers;
+            coordinator
+        };
+        let mut map = present_map();
+        for path in ["src/other.rs", "src/third.rs"] {
+            map.entries.push(RepoMapEntry {
+                path: PathBuf::from(path),
+                kind: RepoEntryKind::File,
+                size_bytes: Some(1),
+                category: "source".to_string(),
+                git_status: RepoGitStatus::Clean,
+            });
+        }
+        let verify = |coordinator: &OrchestratorAssignment, risk: &SemanticRiskReport| {
+            let requested = [coordinator.clone()];
+            evaluate_preclaim_viability(
+                coordinator,
+                &requested,
+                Some(&map),
+                Some(risk),
+                Some(SupervisorRuntime::Fake),
+                SupervisorExecutionRuntime::Verified,
+            )
+        };
+        let risk_with = |symbols: Vec<SemanticSymbol>| {
+            let mut risk = risk_for_path("src/lib.rs");
+            risk.changed_paths = vec![PathBuf::from("src/lib.rs"), PathBuf::from("src/other.rs")];
+            risk.touched_symbols = symbols;
+            risk
+        };
+        let both_symbols = || {
+            vec![
+                symbol("src/lib.rs", "tests", SemanticSymbolKind::Module),
+                symbol(
+                    "src/other.rs",
+                    "coordination_tests",
+                    SemanticSymbolKind::Module,
+                ),
+            ]
+        };
+
+        // (a) Each Worker's assigned file has its own test module.
+        let coordinator = coordinator_for(vec![
+            worker_for("w1", "src/lib.rs"),
+            worker_for("w2", "src/other.rs"),
+        ]);
+        let decision = verify(&coordinator, &risk_with(both_symbols()));
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
+        assert_eq!(decision.disposition, PreclaimDisposition::Claim);
+
+        // (b) w2's file has no test module.
+        let coordinator = coordinator_for(vec![
+            worker_for("w1", "src/lib.rs"),
+            worker_for("w2", "src/other.rs"),
+        ]);
+        let decision = verify(
+            &coordinator,
+            &risk_with(vec![symbol(
+                "src/lib.rs",
+                "tests",
+                SemanticSymbolKind::Module,
+            )]),
+        );
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        // (c) No Worker assignments.
+        let coordinator = coordinator_for(Vec::new());
+        let decision = verify(&coordinator, &risk_with(both_symbols()));
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        // (d) w2's file is outside the coordinator's assigned paths.
+        let coordinator = coordinator_for(vec![
+            worker_for("w1", "src/lib.rs"),
+            worker_for("w2", "src/third.rs"),
+        ]);
+        let mut symbols = both_symbols();
+        symbols.push(symbol("src/third.rs", "tests", SemanticSymbolKind::Module));
+        let decision = verify(&coordinator, &risk_with(symbols));
+        assert_eq!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Unknown
+        );
+
+        // (e) The Researcher path is separate.
+        let mut coordinator = coordinator_for(vec![
+            worker_for("w1", "src/lib.rs"),
+            worker_for("w2", "src/other.rs"),
+        ]);
+        coordinator.role = AgentRole::Researcher;
+        let decision = verify(&coordinator, &risk_with(both_symbols()));
+        assert_ne!(
+            decision.dimensions.clear_verification_path,
+            ViabilityFinding::Yes
+        );
     }
 
     #[test]
