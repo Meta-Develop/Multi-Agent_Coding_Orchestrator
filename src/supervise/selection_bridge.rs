@@ -197,6 +197,9 @@ pub(super) fn bind_test_selector_triple_catalog(
         .models
         .into_iter()
         .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Codex))
+        .filter(|prior| {
+            crate::selection::runtime_model_policy::offered_by_codex_cli_0_162(&prior.model)
+        })
         .map(|prior| prior.model)
         .collect::<BTreeSet<_>>();
     slugs.insert(TEST_SELECTOR_TRIPLE_RUNNER_UP_MODEL.to_string());
@@ -6183,6 +6186,11 @@ pub(super) mod tests {
                     .models
                     .iter()
                     .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Codex))
+                    .filter(|prior| {
+                        crate::selection::runtime_model_policy::offered_by_codex_cli_0_162(
+                            &prior.model,
+                        )
+                    })
                     .map(|prior| prior.model.clone()),
             )?,
         ))
@@ -6299,6 +6307,67 @@ pub(super) mod tests {
                 reason: "legacy override must fail closed".into(),
             });
             assert!(select_with_live_switch_cost(&absent)?.choice.is_none());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn every_codex_role_uses_62_sol_when_the_catalog_offers_it() -> Result<()> {
+        let _policy = bind_fixture_routing_policy()?;
+        let priors = selection::built_in_prior_dataset()?;
+        let catalog = RuntimeModelCatalog::Codex(CodexRuntimeModelCatalog::from_slugs(
+            priors
+                .models
+                .iter()
+                .filter(|prior| prior.runtime == runtime_name(SupervisorRuntime::Codex))
+                .map(|prior| prior.model.clone()),
+        )?);
+        let advertised = AdvertisedCatalogSet::empty();
+        let admission = test_admission();
+        let profile = default_resolved_profile();
+        for role in [
+            AgentRole::Supervisor,
+            AgentRole::ChildOrchestrator,
+            AgentRole::Worker,
+            AgentRole::Researcher,
+            AgentRole::GateClassifier,
+            AgentRole::Auditor,
+        ] {
+            let input = selection_input_for_role(SelectionInputForRoleArgs {
+                role,
+                runtime: SupervisorRuntime::Codex,
+                catalog: &catalog,
+                advertised: &advertised,
+                admission: &admission,
+                resolved_objective_profile: &profile,
+                quota_context: None,
+                quota_ledger: None,
+                account_observation: None,
+                signals: DynamicSignals {
+                    retry_count: 0,
+                    budget_signal: BudgetSignal::Continue,
+                    previous_choice: None,
+                    previous_catalog_digest: None,
+                    environment_rejections: Vec::new(),
+                    accepted_task_cost_context: None,
+                    accepted_task_cost_observations: Vec::new(),
+                },
+                debug_override: None,
+                history: None,
+            })?;
+            let decision = select_with_live_switch_cost(&input)?;
+            let choice = decision
+                .choice
+                .as_ref()
+                .with_context(|| format!("{role:?}: {}", decision.decision_reason))?;
+            assert_eq!(choice.candidate.model, "gpt-6.2-sol");
+            if role != AgentRole::Worker {
+                assert_eq!(choice.candidate.effort, SelectorEffort::Xhigh);
+            }
+            assert!(decision
+                .candidate_set
+                .iter()
+                .all(|c| c.candidate.model == "gpt-6.2-sol" || !c.eligible));
         }
         Ok(())
     }

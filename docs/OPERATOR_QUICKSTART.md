@@ -129,14 +129,18 @@ default.
 Prerequisites:
 
 - Install **codex-cli 0.162.0 or newer** at the trusted path. The selected
-  account's `codex debug models` catalog must advertise `gpt-6.1-sol`.
-  Every Codex runtime role (supervisor, orchestrator, worker, researcher,
-  reviewer, gate classifier and auditor) uses `gpt-6.1-sol`; assignments differ
-  only by the existing effort selection. Auditor lenses retain the xhigh floor.
-  Missing 6.1 availability fails closed; older Sol and Luna are not fallbacks.
-  `gpt-6-astra` remains prohibited for every role.
-  Use 0.162.0 for this lineup: app-server launches retain an exact protocol
-  qualification gate, so a newer CLI also needs protocol qualification.
+  account's `codex debug models` catalog must advertise `gpt-6.2-sol`
+  (codex-cli 0.169.1 or newer) or `gpt-6.1-sol`. Every Codex
+  runtime role (supervisor, orchestrator, worker, researcher, reviewer, gate
+  classifier and auditor) uses the first of `gpt-6.2-sol` and `gpt-6.1-sol`
+  that the catalog offers as available; assignments differ only by the
+  existing effort selection. Auditor lenses retain the xhigh floor. When
+  neither is available, selection fails closed; older Sol and Luna are not
+  fallbacks. `gpt-6-astra`, `gpt-6.2-astra` and the Terra family remain
+  prohibited for every role. App-server launches retain an exact protocol
+  qualification gate that currently admits 0.144.4 and 0.162.0, so a newer CLI
+  whose catalog offers `gpt-6.2-sol` also needs protocol qualification; until
+  then use 0.162.0, whose catalog offers `gpt-6.1-sol`.
   The 0.162.0 adapter validates asynchronous `account/updated` notices during
   startup and inference, timestamped moderation metadata, request-resolution
   notices, and `turn/started` arriving before its response. These notifications
@@ -482,8 +486,9 @@ It is a supported routing configuration, not a guarantee of current provider
 availability. Unknown or newer model ids need an evidence-backed operator
 prior via `--prior-data` before use; a similar name is insufficient. Keep
 delegating assignments and all control roles on Codex. The remaining role
-models explicitly use `gpt-6.1-sol` / `xhigh` with fail-closed availability;
-the explicit Worker preference cannot bypass qualification gates.
+models explicitly use `gpt-6.1-sol` / `xhigh` (the 0.162.0 lineup) with
+fail-closed availability; the explicit Worker preference cannot bypass
+qualification gates.
 
 The supervisor plan is **positional**; there is no `--supervisor-plan` flag.
 `--from-goal FILE` is an alternative source that decomposes a goal/spec and
@@ -711,12 +716,13 @@ publication gates, plus selected-account live qualification, remain required.
 Native token charges survive identity refusal. See the
 [identity qualification gate and mapping receipts](qualification/grok-lower-effort.md).
 
-If selection reports that required model `gpt-6.1-sol` is absent or unavailable,
-check `codex --version` at the canonical trusted executable, install at least
-0.162.0, validate the selected account, and rerun `codex debug models`.
-An older CLI's catalog is insufficient even when login succeeds. Do not select
-another Codex model to bypass this refusal. The mixed plan keeps its
-`grok-4.6` / `xhigh` worker and uses 6.1 for Codex control and audit roles.
+If selection reports that no accepted Codex model is available, check `codex
+--version` at the canonical trusted executable, install at least 0.162.0
+(0.169.1 for `gpt-6.2-sol`), validate the selected account, and rerun `codex
+debug models`. An older CLI's catalog is insufficient even when login
+succeeds. Do not select another Codex model to bypass this refusal. The
+mixed plan keeps its `grok-4.6` / `xhigh` worker and uses 6.1 for Codex
+control and audit roles.
 
 A required-edit Grok report with empty `files_changed` and no native
 `tool_call`, `tool_call_update` or `tool_use` event gets one continuation

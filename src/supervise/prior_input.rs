@@ -303,6 +303,15 @@ fn bind_from_bytes(
         bail!("operator prior data predates the bundled dataset it extends");
     }
     let mut seen = BTreeSet::new();
+    // A verbatim restatement of a bundled row adds no evidence and changes no
+    // effective data, so the bundled dataset vouches for its date; this keeps
+    // operator snapshots that copy the bundled tables admissible when the
+    // bundled data gains rows dated after the snapshot.
+    let bundled_prior_rows: Vec<serde_json::Value> = priors
+        .models
+        .iter()
+        .map(|row| serde_json::to_value(row).expect("bundled prior row serializes"))
+        .collect();
     for row in &snapshot.models {
         let key = (row.runtime.clone(), row.model.clone());
         if !seen.insert(key.clone()) {
@@ -312,7 +321,10 @@ fn bind_from_bytes(
                 key.1
             );
         }
-        if row.observed_on > snapshot.published_on {
+        let verbatim_restatement = bundled_prior_rows
+            .iter()
+            .any(|base| *base == serde_json::to_value(row).expect("operator prior row serializes"));
+        if row.observed_on > snapshot.published_on && !verbatim_restatement {
             bail!(
                 "operator prior '{}' is dated after its dataset publication",
                 row.model
@@ -352,6 +364,15 @@ fn bind_from_bytes(
         bail!("operator capability policy requires a source");
     }
     let mut capability_policy = default_model_capability_policy();
+    // A verbatim restatement of a bundled row adds no evidence and changes no
+    // effective data, so the bundled dataset vouches for its date; this keeps
+    // operator snapshots that copy the bundled tables admissible when the
+    // bundled data gains rows dated after the snapshot.
+    let bundled_capability_rows: Vec<serde_json::Value> = capability_policy
+        .models
+        .iter()
+        .map(|row| serde_json::to_value(row).expect("bundled capability row serializes"))
+        .collect();
     for row in &snapshot.capability_policy.models {
         if row.evidence.trim().is_empty() || row.as_of.trim().is_empty() {
             bail!(
@@ -361,7 +382,10 @@ fn bind_from_bytes(
         }
         selection::validate_prior_date("capability.as_of", &row.as_of)
             .map_err(|error| anyhow::anyhow!(error))?;
-        if row.as_of > priors.published_on {
+        let verbatim_restatement = bundled_capability_rows.iter().any(|base| {
+            *base == serde_json::to_value(row).expect("operator capability row serializes")
+        });
+        if row.as_of > priors.published_on && !verbatim_restatement {
             bail!(
                 "operator capability row '{}' is dated after prior publication",
                 row.model
@@ -550,6 +574,61 @@ mod tests {
             None,
         )?;
         Ok(install(Some(binding)))
+    }
+
+    fn verbatim_bundled_snapshot() -> Result<OperatorPriorSnapshot> {
+        let base = base_selector_priors_with_terminal_worker_economics()?;
+        Ok(OperatorPriorSnapshot {
+            public_benchmarks: Vec::new(),
+            schema_version: PRIOR_INPUT_SCHEMA_VERSION,
+            dataset_id: "operator-prior-test".to_string(),
+            revision: format!("{}+operator-prior-test", base.revision),
+            published_on: base.published_on.clone(),
+            models: base.models.clone(),
+            capability_policy: default_model_capability_policy(),
+        })
+    }
+
+    #[test]
+    fn verbatim_bundled_rows_dated_after_the_snapshot_are_admitted() -> Result<()> {
+        let snapshot = verbatim_bundled_snapshot()?;
+        let _guard = bind_fixture(&snapshot)?;
+        let bound = current_capability_policy().context("capability policy bound")?;
+        assert_eq!(
+            bound.capability_for("gpt-6.2-sol"),
+            default_model_capability_policy().capability_for("gpt-6.2-sol")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn changed_rows_dated_after_the_snapshot_are_still_refused() -> Result<()> {
+        let mut snapshot = verbatim_bundled_snapshot()?;
+        snapshot
+            .capability_policy
+            .models
+            .iter_mut()
+            .find(|row| row.model == "gpt-6.2-sol")
+            .context("bundled gpt-6.2-sol capability row")?
+            .evidence = "operator restated capability evidence".to_string();
+        match bind_fixture(&snapshot) {
+            Ok(_) => bail!("changed capability row must be refused"),
+            Err(error) => assert!(format!("{error:#}").contains("dated after prior publication")),
+        }
+        let mut snapshot = verbatim_bundled_snapshot()?;
+        snapshot
+            .models
+            .iter_mut()
+            .find(|row| row.runtime == "codex" && row.model == "gpt-6.2-sol")
+            .context("bundled codex gpt-6.2-sol prior row")?
+            .source_id = "operator restated prior source".to_string();
+        match bind_fixture(&snapshot) {
+            Ok(_) => bail!("changed prior row must be refused"),
+            Err(error) => {
+                assert!(format!("{error:#}").contains("dated after its dataset publication"))
+            }
+        }
+        Ok(())
     }
 
     #[test]

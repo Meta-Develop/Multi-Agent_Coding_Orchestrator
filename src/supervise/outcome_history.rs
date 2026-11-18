@@ -2607,6 +2607,9 @@ mod tests {
                 .models
                 .iter()
                 .filter(|prior| prior.runtime == "codex")
+                .filter(|prior| {
+                    crate::selection::runtime_model_policy::offered_by_codex_cli_0_162(&prior.model)
+                })
                 .map(|prior| prior.model.clone()),
         )?);
         let admission = SupervisorAdmissionPolicyInput {

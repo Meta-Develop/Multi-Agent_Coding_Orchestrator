@@ -1383,10 +1383,10 @@ fn task_shape_ceiling_prior_compatibility_and_validation() -> anyhow::Result<()>
 fn built_in_data_is_dated_and_keeps_policy_in_data() {
     let priors = built_in_prior_dataset().expect("built-in priors");
     let _: &SelectorCalibration = &priors.objective_profiles[0];
-    assert_eq!(priors.revision, "2026-10-29.1");
+    assert_eq!(priors.revision, "2026-11-18.1");
     assert_eq!(priors.published_on, "2026-10-29");
     assert_eq!(priors.schema_version, 2);
-    assert_eq!(priors.models.len(), 9);
+    assert_eq!(priors.models.len(), 12);
     assert_eq!(priors.objective_profiles[0].version, 3);
     assert_eq!(priors.objective_profiles[0].effective_date, "2026-08-26");
     assert!(priors.models.iter().any(|prior| prior.prohibited));
@@ -1654,6 +1654,163 @@ fn current_codex_policy_excludes_astra_for_every_authority_and_catalog_fallback(
                 .is_none());
         }
     }
+    Ok(())
+}
+
+fn codex_policy_catalog(
+    task_class: &str,
+    authority: AuthorityRole,
+    models: &[(&str, &[ReasoningEffort], bool)],
+) -> SelectionInput {
+    let mut input = base_input();
+    if authority != AuthorityRole::TerminalLeaf {
+        input.task.authority_role = authority;
+        input.task.task_class = task_class.into();
+        input.task.risk = RiskLevel::Critical;
+        input.task.boundedness = Boundedness::CrossCutting;
+        input.task.context = ContextSize::Long;
+        input.task.horizon = TaskHorizon::Long;
+    }
+    input.catalogs = vec![catalog(
+        "codex",
+        "codex-0.169.1",
+        task_class,
+        authority,
+        models,
+    )];
+    input.pools = vec![pool("codex", 0)];
+    input
+}
+
+fn assert_forbidden(input: &SelectionInput, model: &str, forbidden: bool) {
+    for effort in [ReasoningEffort::High, ReasoningEffort::Xhigh] {
+        assert_eq!(
+            input
+                .constraints
+                .forbidden_candidates
+                .contains(&CandidateKey {
+                    runtime: "codex".into(),
+                    model: model.into(),
+                    effort,
+                }),
+            forbidden,
+            "{model} forbidden state"
+        );
+    }
+}
+
+#[test]
+fn codex_policy_prefers_gpt_6_2_sol_when_the_catalog_offers_it() -> anyhow::Result<()> {
+    let efforts = &[ReasoningEffort::High, ReasoningEffort::Xhigh];
+    let models: &[(&str, &[ReasoningEffort], bool)] = &[
+        ("gpt-6.2-sol", efforts, true),
+        ("gpt-6.1-sol", efforts, true),
+        ("gpt-6.2-astra", efforts, true),
+        ("gpt-6.1-terra", efforts, true),
+    ];
+    let mut input =
+        codex_policy_catalog("localized_code_change", AuthorityRole::TerminalLeaf, models);
+    runtime_model_policy::constrain(&mut input);
+    assert_forbidden(&input, "gpt-6.1-sol", true);
+    assert_forbidden(&input, "gpt-6.2-astra", true);
+    assert_forbidden(&input, "gpt-6.1-terra", true);
+    assert_forbidden(&input, "gpt-6.2-sol", false);
+    assert_eq!(runtime_model_policy::missing_model_guidance(&input), "");
+    let decision = select(&input)?;
+    assert_eq!(
+        decision
+            .choice
+            .expect("preferred Sol leaf choice")
+            .candidate
+            .model,
+        "gpt-6.2-sol"
+    );
+    let mut judgment = codex_policy_catalog("review_gate", AuthorityRole::ReviewAuditor, models);
+    runtime_model_policy::constrain(&mut judgment);
+    assert_eq!(runtime_model_policy::missing_model_guidance(&judgment), "");
+    let decision = select(&judgment)?;
+    assert_eq!(
+        decision
+            .choice
+            .expect("preferred Sol judgment choice")
+            .candidate
+            .model,
+        "gpt-6.2-sol"
+    );
+    Ok(())
+}
+
+#[test]
+fn codex_policy_falls_back_to_gpt_6_1_sol_when_gpt_6_2_sol_is_not_usable() -> anyhow::Result<()> {
+    let efforts = &[ReasoningEffort::High, ReasoningEffort::Xhigh];
+    let models: &[(&str, &[ReasoningEffort], bool)] = &[
+        ("gpt-6.2-sol", efforts, true),
+        ("gpt-6.1-sol", efforts, true),
+        ("gpt-6.2-astra", efforts, true),
+        ("gpt-6.1-terra", efforts, true),
+    ];
+    for case in ["absent", "unavailable", "access-unavailable"] {
+        let mut input =
+            codex_policy_catalog("localized_code_change", AuthorityRole::TerminalLeaf, models);
+        match case {
+            "absent" => input.catalogs[0]
+                .models
+                .retain(|model| model.model != "gpt-6.2-sol"),
+            "unavailable" => {
+                input.catalogs[0]
+                    .models
+                    .iter_mut()
+                    .find(|model| model.model == "gpt-6.2-sol")
+                    .expect("gpt-6.2-sol catalog entry")
+                    .available = false
+            }
+            _ => {
+                input.catalogs[0]
+                    .models
+                    .iter_mut()
+                    .find(|model| model.model == "gpt-6.2-sol")
+                    .expect("gpt-6.2-sol catalog entry")
+                    .access = Some(crate::selection::ModelAccessOutcome::Unavailable)
+            }
+        }
+        runtime_model_policy::constrain(&mut input);
+        assert_forbidden(&input, "gpt-6.1-sol", false);
+        if case != "absent" {
+            assert_forbidden(&input, "gpt-6.2-sol", true);
+        }
+        assert_forbidden(&input, "gpt-6.2-astra", true);
+        assert_forbidden(&input, "gpt-6.1-terra", true);
+        assert_eq!(runtime_model_policy::missing_model_guidance(&input), "");
+        let decision = select(&input)?;
+        assert_eq!(
+            decision
+                .choice
+                .expect("fallback Sol choice")
+                .candidate
+                .model,
+            "gpt-6.1-sol"
+        );
+    }
+    Ok(())
+}
+
+#[test]
+fn codex_policy_fails_closed_when_no_preferred_sol_is_usable() -> anyhow::Result<()> {
+    let efforts = &[ReasoningEffort::High, ReasoningEffort::Xhigh];
+    let models: &[(&str, &[ReasoningEffort], bool)] = &[
+        ("gpt-6.2-astra", efforts, true),
+        ("gpt-5.6-sol", efforts, true),
+    ];
+    let mut input =
+        codex_policy_catalog("localized_code_change", AuthorityRole::TerminalLeaf, models);
+    runtime_model_policy::constrain(&mut input);
+    assert_forbidden(&input, "gpt-6.2-astra", true);
+    assert_forbidden(&input, "gpt-5.6-sol", true);
+    assert_eq!(
+        runtime_model_policy::missing_model_guidance(&input),
+        "; required codex model is absent or unavailable in the observed catalog; accepted models in preference order: 'gpt-6.2-sol' (codex-cli >= 0.169.1), 'gpt-6.1-sol' (codex-cli >= 0.162.0); install codex-cli >= 0.162.0 at the trusted path, validate the selected account, and rerun catalog preflight; no other model fallback is permitted"
+    );
+    assert!(select(&input)?.choice.is_none());
     Ok(())
 }
 
