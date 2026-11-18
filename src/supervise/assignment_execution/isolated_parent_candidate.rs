@@ -6,6 +6,9 @@ pub(super) struct IsolatedParentCandidate {
     pub paths: Vec<PathBuf>,
     pub workers: Vec<crate::merge::ExactBaseWorktreeSnapshot>,
     pub snapshot: PrimaryWorktreeSnapshot,
+    /// Parent worktree tree before this candidate was applied: the base on a
+    /// first attempt, the earlier accepted union on a gate correction (#1103).
+    source_tree: Oid,
 }
 
 impl IsolatedParentCandidate {
@@ -67,7 +70,21 @@ impl IsolatedParentCandidate {
         }
         // Only supervisor code writes the tentative view. HEAD/index stay at base;
         // the external final turn still receives the normal read-only admission.
-        apply_candidate_delta(&parent, &base, &aggregate)?;
+        // The worktree holds the base on a first attempt and the earlier accepted
+        // union on a gate correction, so apply the delta from its current tree (#1103).
+        let source_tree = crate::merge::capture_exact_base_worktree_with_write_lease(
+            context.repo,
+            &preflight.assignment.id,
+            &preflight.assignment.assigned_paths,
+            preflight
+                .worktree_write_lease
+                .as_ref()
+                .context("isolated parent lease missing")?,
+            preflight.child_base_head,
+        )?
+        .snapshot_tree;
+        let source = parent.find_tree(source_tree)?;
+        apply_candidate_delta(&parent, &source, &aggregate)?;
         let snapshot =
             primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?;
         if snapshot.inspection_problem().is_some() {
@@ -93,6 +110,7 @@ impl IsolatedParentCandidate {
             paths: paths.into_iter().collect(),
             workers: candidates,
             snapshot,
+            source_tree,
         })
     }
 
@@ -123,8 +141,8 @@ impl IsolatedParentCandidate {
         }
         let parent = crate::git_repository::open(&preflight.worktree.path)?;
         let aggregate = parent.find_tree(self.tree)?;
-        let base = parent.find_commit(preflight.child_base_head)?.tree()?;
-        apply_candidate_delta(&parent, &aggregate, &base)?;
+        let source = parent.find_tree(self.source_tree)?;
+        apply_candidate_delta(&parent, &aggregate, &source)?;
         if primary_worktree_snapshot(&preflight.worktree.path, context.execution_runtime)?
             != *original
         {
@@ -170,6 +188,43 @@ mod tests {
         assert_eq!(fs::read(temp.path().join("data.bin"))?, after);
         apply_candidate_delta(&repo, &candidate, &base)?;
         assert_eq!(fs::read(temp.path().join("data.bin"))?, before);
+        assert_eq!(fs::read(repo.path().join("index"))?, index_before);
+        Ok(())
+    }
+
+    #[test]
+    fn correction_delta_replaces_an_earlier_union_and_rolls_back() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let repo = git2::Repository::init(temp.path())?;
+        let tree_of = |text: &[u8]| -> Result<Oid> {
+            let mut builder = repo.treebuilder(None)?;
+            builder.insert("doc.rs", repo.blob(text)?, 0o100644)?;
+            Ok(builder.write()?)
+        };
+        let base = repo.find_tree(tree_of(b"one\ntwo\nthree\nfour\n")?)?;
+        let earlier = repo.find_tree(tree_of(b"one\nTWO\nTHREE\nfour\n")?)?;
+        let corrected = repo.find_tree(tree_of(b"one\nTwo\nthree\nfour\n")?)?;
+        let mut index = repo.index()?;
+        index.read_tree(&base)?;
+        index.write()?;
+        fs::write(temp.path().join("doc.rs"), b"one\nTWO\nTHREE\nfour\n")?;
+        let index_before = fs::read(repo.path().join("index"))?;
+        // The earlier union is in the worktree: the base delta cannot apply.
+        assert!(apply_candidate_delta(&repo, &base, &corrected).is_err());
+        assert_eq!(
+            fs::read(temp.path().join("doc.rs"))?,
+            b"one\nTWO\nTHREE\nfour\n"
+        );
+        apply_candidate_delta(&repo, &earlier, &corrected)?;
+        assert_eq!(
+            fs::read(temp.path().join("doc.rs"))?,
+            b"one\nTwo\nthree\nfour\n"
+        );
+        apply_candidate_delta(&repo, &corrected, &earlier)?;
+        assert_eq!(
+            fs::read(temp.path().join("doc.rs"))?,
+            b"one\nTWO\nTHREE\nfour\n"
+        );
         assert_eq!(fs::read(repo.path().join("index"))?, index_before);
         Ok(())
     }
