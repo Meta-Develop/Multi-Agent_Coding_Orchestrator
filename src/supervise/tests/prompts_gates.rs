@@ -3090,6 +3090,54 @@ fn gate_budget_exhaustion_feeds_existing_breaker() {
 }
 
 #[test]
+fn gate_correction_accepted_after_breaker_retries_keeps_the_run_successful() {
+    skip_without_containment!();
+    let (temp, repo_path) = injected_repository();
+    let assignment = injected_assignment(false);
+    let (report, child_invocations, _auditor_invocations) = run_validation_repair_script(
+        &temp,
+        &repo_path,
+        &assignment,
+        MAX_GATE_CORRECTIONS_LIMIT,
+        "gate-correction-accepted-after-breaker-retries",
+        |invocation, assignment| {
+            if invocation <= usize::from(MAX_GATE_CORRECTIONS_LIMIT) {
+                injected_failed_validation_report(assignment, None, "", Some(ReviewStatus::Failed))
+            } else {
+                injected_child_report(assignment)
+            }
+        },
+    );
+
+    assert!(
+        report.success,
+        "accepted work must survive the trip: {report:#?}"
+    );
+    assert_eq!(child_invocations, 5);
+    assert_eq!(
+        report.gate_correction_outcomes[0].correction_attempts,
+        MAX_GATE_CORRECTIONS_LIMIT
+    );
+    assert_eq!(
+        report.gate_correction_outcomes[0].terminal_class,
+        GateCorrectionTerminalClass::SelfCorrected
+    );
+    let trip = report
+        .breaker_trip
+        .expect("correction retry loop must still trip the existing breaker");
+    assert_eq!(trip.window.retries, usize::from(MAX_GATE_CORRECTIONS_LIMIT));
+    assert!(report.findings.iter().any(|finding| {
+        finding.severity == FindingSeverity::Warning
+            && finding.message.contains(
+                "circuit breaker opened after every planned assignment had been admitted, so no pending assignment was stopped",
+            )
+    }));
+    assert!(!report.findings.iter().any(|finding| {
+        finding.severity == FindingSeverity::Error && finding.message.contains("circuit breaker")
+    }));
+}
+
+#[test]
 fn non_retryable_containment_denial_escalates_without_second_launch() {
     let (temp, repo_path) = injected_repository();
     let assignment = injected_assignment(false);

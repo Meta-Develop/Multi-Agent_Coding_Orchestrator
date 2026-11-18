@@ -455,6 +455,7 @@ struct SchedulerProgress {
     budget_prevented_dispatch: bool,
     budget_denied_assignment_indices: BTreeSet<usize>,
     circuit_breaker_trip: Option<CircuitBreakerTrip>,
+    breaker_prevented_admission: bool,
     concurrency: SchedulerConcurrencyTracker,
     budget_degradation: BudgetDegradationController,
 }
@@ -485,6 +486,7 @@ impl SchedulerProgress {
             budget_prevented_dispatch: false,
             budget_denied_assignment_indices: BTreeSet::new(),
             circuit_breaker_trip: None,
+            breaker_prevented_admission: false,
             concurrency: SchedulerConcurrencyTracker::new(),
             budget_degradation: BudgetDegradationController::new_with_selection_state(
                 max_concurrent_children,
@@ -1827,6 +1829,7 @@ fn run_serial_assignment_schedule(
             break;
         }
         if !progress.health_breaker.permits_admission() {
+            progress.breaker_prevented_admission = true;
             break;
         }
         let budget_report = context
@@ -2048,6 +2051,7 @@ fn run_concurrent_assignment_schedule(
                     .commit_completed_selection_prefix(context.options.runtime, context.run_dir)?;
                 while active.len() < progress.budget_degradation.effective_fan_out {
                     if !progress.health_breaker.permits_admission() {
+                        progress.breaker_prevented_admission |= !pending.is_empty();
                         stop_scheduling = true;
                         break;
                     }
@@ -2360,6 +2364,7 @@ fn run_concurrent_assignment_schedule(
                         // A breaker trip is a graceful scheduler stop: pending assignments are not
                         // admitted, while already-active children retain their cancellation tokens
                         // and are drained.
+                        progress.breaker_prevented_admission |= !pending.is_empty();
                         stop_scheduling = true;
                     }
                 }
@@ -7479,6 +7484,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
     let mut budget_degradations = Vec::new();
     let mut assignment_effort_bindings = Vec::new();
     let mut circuit_breaker_trip = None;
+    let mut breaker_prevented_admission = false;
     let mut achieved_concurrency = AchievedConcurrency::default();
     let run_result = (|| -> Result<()> {
         initialize_scheduler_evidence(&mut SchedulerEvidenceInitialization {
@@ -7608,6 +7614,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         budget_degradations.append(&mut progress.budget_degradation.records);
         assignment_effort_bindings
             .append(&mut progress.budget_degradation.assignment_effort_bindings);
+        breaker_prevented_admission = progress.breaker_prevented_admission;
         circuit_breaker_trip = progress.circuit_breaker_trip;
 
         let fatal_errors = collect_indexed_assignment_outcomes(
@@ -7629,7 +7636,7 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
             paths: Vec::new(),
         });
     }
-    let breaker_tripped = circuit_breaker_trip.is_some();
+    let breaker_tripped = circuit_breaker_trip.is_some() && breaker_prevented_admission;
     let mut supervisor_breaker_trip = circuit_breaker_trip.map(|trip| SupervisorBreakerTrip {
         reason: trip.reason,
         window: trip.window,
@@ -7637,14 +7644,25 @@ pub(super) fn run_supervisor_plan_with_runner_and_creation(
         recovery_guidance: BREAKER_RECOVERY_GUIDANCE.to_string(),
     });
     if let Some(trip) = &supervisor_breaker_trip {
-        collected.findings.push(Finding {
-            severity: FindingSeverity::Error,
-            message: format!(
-                "swarm-health circuit breaker opened and drained active assignments: {:?}",
-                trip.reason
-            ),
-            paths: Vec::new(),
-        });
+        if breaker_tripped {
+            collected.findings.push(Finding {
+                severity: FindingSeverity::Error,
+                message: format!(
+                    "swarm-health circuit breaker opened and drained active assignments: {:?}",
+                    trip.reason
+                ),
+                paths: Vec::new(),
+            });
+        } else {
+            collected.findings.push(Finding {
+                severity: FindingSeverity::Warning,
+                message: format!(
+                    "swarm-health circuit breaker opened after every planned assignment had been admitted, so no pending assignment was stopped: {:?}",
+                    trip.reason
+                ),
+                paths: Vec::new(),
+            });
+        }
     }
 
     let mut scheduler_resources = CollectedSchedulerResources::take_from(&mut collected);
