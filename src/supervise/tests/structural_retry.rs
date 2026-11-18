@@ -241,3 +241,80 @@ fn prompt_with_structural_retry_lists_at_most_eight_truncated_problems() {
         assert!(problem.starts_with("problem-"));
     }
 }
+
+fn worker_report_json_with_validation_command(command: &str) -> String {
+    let mut report: serde_json::Value =
+        serde_json::from_str(&sample_worker_report_json_missing_finding_severity())
+            .expect("sample worker report json");
+    report["findings"] = serde_json::json!([]);
+    report["validation_results"] = serde_json::json!([{
+        "name": "check",
+        "status": "succeeded",
+        "command": serde_json::from_str::<serde_json::Value>(command)
+            .expect("command json value"),
+    }]);
+    serde_json::to_string(&report).expect("serialize worker report json")
+}
+
+#[test]
+fn worker_report_validation_command_accepts_string() {
+    let json = worker_report_json_with_validation_command(r#""awk '/x/ {print FNR}' src/lib.rs""#);
+    let parsed = parse_report_json::<WorkerReport>(&json).expect("parse worker report");
+    let validation = &parsed.report.validation_results[0];
+    assert_eq!(
+        validation.command,
+        vec!["awk '/x/ {print FNR}' src/lib.rs".to_string()]
+    );
+    let serialized = serde_json::to_value(validation).expect("serialize validation result");
+    assert_eq!(
+        serialized["command"],
+        serde_json::json!(["awk '/x/ {print FNR}' src/lib.rs"])
+    );
+}
+
+#[test]
+fn worker_report_validation_command_keeps_argv_and_empty_forms() {
+    let argv = worker_report_json_with_validation_command(r#"["cargo", "test"]"#);
+    let parsed = parse_report_json::<WorkerReport>(&argv).expect("parse argv worker report");
+    assert_eq!(
+        parsed.report.validation_results[0].command,
+        vec!["cargo".to_string(), "test".to_string()]
+    );
+    for command in ["[]", r#""   ""#, "null"] {
+        let json = worker_report_json_with_validation_command(command);
+        let parsed = parse_report_json::<WorkerReport>(&json).expect("parse worker report");
+        assert!(
+            parsed.report.validation_results[0].command.is_empty(),
+            "command {command} must parse as an empty command"
+        );
+    }
+    let mut report: serde_json::Value =
+        serde_json::from_str(&sample_worker_report_json_missing_finding_severity())
+            .expect("sample worker report json");
+    report["findings"] = serde_json::json!([]);
+    report["validation_results"] = serde_json::json!([{
+        "name": "check",
+        "status": "succeeded",
+    }]);
+    let json = serde_json::to_string(&report).expect("serialize worker report json");
+    let parsed = parse_report_json::<WorkerReport>(&json).expect("parse worker report");
+    assert!(
+        parsed.report.validation_results[0].command.is_empty(),
+        "missing command key must parse as an empty command"
+    );
+}
+
+#[test]
+fn worker_report_validation_command_rejects_other_types() {
+    for command in ["5", "[1, 2]"] {
+        let json = worker_report_json_with_validation_command(command);
+        let error = parse_report_json::<WorkerReport>(&json)
+            .expect_err("command of an unsupported type must not parse");
+        assert!(
+            error
+                .to_string()
+                .contains("report JSON/contract parse failed"),
+            "unexpected error: {error}"
+        );
+    }
+}

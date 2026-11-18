@@ -3578,10 +3578,31 @@ pub struct CommandRunRecord {
 pub struct ValidationResult {
     pub name: String,
     pub status: ReviewStatus,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_validation_command")]
     pub command: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
+}
+
+/// A reported validation command is a JSON array of strings, a JSON string or
+/// null (#1096). A string is one argv element; a blank string and null are an
+/// empty command. Serialization always writes an array.
+fn deserialize_validation_command<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Command {
+        Argv(Vec<String>),
+        Text(String),
+    }
+    Ok(match Option::<Command>::deserialize(deserializer)? {
+        None => Vec::new(),
+        Some(Command::Argv(argv)) => argv,
+        Some(Command::Text(text)) if text.trim().is_empty() => Vec::new(),
+        Some(Command::Text(text)) => vec![text],
+    })
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
