@@ -1186,6 +1186,9 @@ fn authored_profile_reaches_verified_scheduler_selection_and_exact_score_evidenc
                 .models
                 .into_iter()
                 .filter(|prior| prior.runtime == "codex")
+                .filter(|prior| {
+                    crate::selection::runtime_model_policy::offered_by_codex_cli_0_162(&prior.model)
+                })
                 .map(|prior| prior.model),
         )
         .expect("Codex selector catalog"),
