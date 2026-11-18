@@ -436,6 +436,7 @@ Review requirements:
 - Set accepted=false or status=failed/rejected if worker evidence is missing, validation is insufficient, diffs exceed assigned scope, or remaining risk is underreported.
 - If the child report contains licensed_breakage_review, verify that every failed validation is attributable to its exact named dependent, path, and interface scope and that the migration rationale is adequate. Accepting that license requires one succeeded validation_results entry whose name is "licensed_breakage_declaration" and whose message is the exact declaration_sha256. Omitting or changing that marker refuses the license and must reject the report.
 - Include reviewed_worker_ids, reviewed_paths, commands_run, validation_results, findings, remaining_risk, and next_safe_action.
+- validation_results must contain at least one entry in every review scope, including the diff-only and output-only scopes: name each check you actually performed on the material in your scope (for example, a review of the supplied diff against REQUIRED_COVERAGE_JSON), set its status to the outcome of that check, and set its command to [] when you ran no command. Never report a command that you did not run. MACO treats an empty validation_results list as a procedural failure of the review.
 - Include environment_failures as [] when no typed environment failure occurred. When it is nonempty, do not report an accepted or succeeded outcome, and never include credential or secret values.
 "#,
         tool_call_batching_guidance = TOOL_CALL_BATCHING_GUIDANCE,
@@ -1941,10 +1942,10 @@ fn review_lens_withheld_evidence_rule(
             "This is a read-only Researcher assignment. Judge the supplied report for internal consistency, zero changed files, no delegation, and matching successful command and validation claims. The command stdout is intentionally empty because the report cannot authenticate stdout; do not reject solely for that empty field or claim this lens independently verified the source assertion. The independent full-transcript lens validates host command evidence and source contents."
         }
         (ReviewInformationScope::DiffOnly, false) => {
-            "The earlier instruction to reject when worker evidence, the child report, or validation results are missing does not apply to this diff-only scope: those records are withheld by the information boundary. Judge only the supplied diff against REQUIRED_COVERAGE_JSON. Reject with implementation_defect only when that diff is wrong, outside the required paths, or does not show the required change."
+            "The earlier instruction to reject when worker evidence, the child report, or validation results are missing does not apply to this diff-only scope: those records are withheld by the information boundary. Judge only the supplied diff against REQUIRED_COVERAGE_JSON. Reject with implementation_defect only when that diff is wrong, outside the required paths, or does not show the required change. Still list the diff review you performed in validation_results, with command [] when you ran no command."
         }
         (ReviewInformationScope::OutputReportOnly, false) => {
-            "The earlier instruction to reject when the worktree diff is missing does not apply to this output-only scope: the diff is withheld by the information boundary. Judge only the supplied reports against REQUIRED_COVERAGE_JSON."
+            "The earlier instruction to reject when the worktree diff is missing does not apply to this output-only scope: the diff is withheld by the information boundary. Judge only the supplied reports against REQUIRED_COVERAGE_JSON. Still list the report review you performed in validation_results, with command [] when you ran no command."
         }
         (ReviewInformationScope::FullChildTranscript, _) => {
             "This full-transcript scope supplies the child transcript. Declared compaction removes records repeated later with only in-progress placeholders and start timestamps differing, and provider telemetry; their absence is not missing evidence. Head/tail truncation leaves evidence unavailable and may justify rejection. Other missing worker evidence remains grounds for rejection."
@@ -3994,5 +3995,33 @@ mod regression_tests {
         )
         .is_err());
         Ok(())
+    }
+    #[test]
+    fn parent_auditor_prefix_requires_nonempty_validation_results() {
+        let required = "- validation_results must contain at least one entry in every review scope, including the diff-only and output-only scopes: name each check you actually performed on the material in your scope (for example, a review of the supplied diff against REQUIRED_COVERAGE_JSON), set its status to the outcome of that check, and set its command to [] when you ran no command. Never report a command that you did not run. MACO treats an empty validation_results list as a procedural failure of the review.";
+        let prefix = parent_review_auditor_cacheable_prefix();
+        assert_eq!(prefix.lines().filter(|line| *line == required).count(), 1);
+        let before = prefix
+            .lines()
+            .zip(prefix.lines().skip(1))
+            .find(|(_, next)| *next == required)
+            .map(|(prev, _)| prev)
+            .expect("required line present");
+        assert!(before.starts_with("- Include reviewed_worker_ids"));
+        assert!(!review_auditor_cacheable_prefix().contains(required));
+    }
+
+    #[test]
+    fn narrow_review_scopes_still_require_validation_results() {
+        let diff_rule = review_lens_withheld_evidence_rule(ReviewInformationScope::DiffOnly, false);
+        assert!(diff_rule
+            .contains("does not apply to this diff-only scope: those records are withheld"));
+        assert!(diff_rule.ends_with("Still list the diff review you performed in validation_results, with command [] when you ran no command."));
+        let report_rule =
+            review_lens_withheld_evidence_rule(ReviewInformationScope::OutputReportOnly, false);
+        assert!(
+            report_rule.contains("does not apply to this output-only scope: the diff is withheld")
+        );
+        assert!(report_rule.ends_with("Still list the report review you performed in validation_results, with command [] when you ran no command."));
     }
 }
