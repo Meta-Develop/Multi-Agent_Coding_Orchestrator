@@ -6955,20 +6955,32 @@ fn materialize_review_lens_auditor_schema_input(
     authoritative_schema: &Path,
     scope_workspace: &Path,
     runtime: SupervisorRuntime,
+    auditor_id: &str,
 ) -> Result<PathBuf> {
+    let materialize = |source: &Path, destination: &Path| -> Result<()> {
+        let mut schema: Value = serde_json::from_slice(
+            &fs::read(source)
+                .with_context(|| format!("failed to read auditor schema {}", source.display()))?,
+        )
+        .with_context(|| format!("failed to parse auditor schema {}", source.display()))?;
+        // Narrow only this lens's copies. A singleton string enum also works in
+        // Codex's projected schema; the shared authoritative schemas stay intact.
+        schema["properties"]["id"]["enum"] = json!([auditor_id]);
+        fs::write(destination, serde_json::to_vec_pretty(&schema)?).with_context(|| {
+            format!(
+                "failed to materialize ID-bound auditor schema {} from {}",
+                destination.display(),
+                source.display()
+            )
+        })?;
+        Ok(())
+    };
     let schema_input = scope_workspace.join("auditor-report.schema.json");
-    fs::copy(authoritative_schema, &schema_input)
-        .context("failed to materialize the isolated authoritative auditor schema input")?;
+    materialize(authoritative_schema, &schema_input)?;
     if runtime == SupervisorRuntime::Codex {
         let codex_source = codex_output_schema_path(authoritative_schema)?;
         let codex_input = codex_output_schema_path(&schema_input)?;
-        fs::copy(&codex_source, &codex_input).with_context(|| {
-            format!(
-                "failed to materialize isolated Codex auditor schema {} from {}",
-                codex_input.display(),
-                codex_source.display()
-            )
-        })?;
+        materialize(&codex_source, &codex_input)?;
     }
     Ok(schema_input)
 }
@@ -7219,6 +7231,7 @@ fn prepare_parent_auditor<'a>(
         &auditor_schema_path,
         scope_workspace.path(),
         launch_runtime,
+        &auditor_id,
     )?;
     let mut auditor_command = ExternalAgentCommand::codex(
         &options.codex_bin,
@@ -10592,7 +10605,12 @@ mod decomposition_tests {
             let schema = PathBuf::from(
                 std::env::var_os(SCHEMA_ENV).context("missing hostile probe schema path")?,
             );
-            assert_eq!(fs::read_to_string(schema)?, "{\"type\":\"object\"}\n");
+            let schema: Value = serde_json::from_slice(&fs::read(schema)?)?;
+            assert_eq!(schema["type"], "object");
+            assert_eq!(
+                schema["properties"]["id"]["enum"],
+                json!(["hostile-boundary-review-auditor-lens-0"])
+            );
             return Ok(());
         }
 
@@ -10623,6 +10641,7 @@ mod decomposition_tests {
             &authoritative_schema,
             scope_workspace.path(),
             SupervisorRuntime::Codex,
+            "hostile-boundary-review-auditor-lens-0",
         )?;
         let prompt = scope_workspace.path().join("prompt.md");
         fs::write(&prompt, "Attempt hostile access to omitted lens inputs.\n")?;
@@ -15288,6 +15307,118 @@ done
         );
         assert_eq!(fake.output_schema.as_deref(), Some(schema));
         assert!(fake.read_only_input_files.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn review_lens_dispatch_schema_binds_assigned_id_in_isolated_workspaces() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let authoritative_schema = temp.path().join("auditor-report.schema.json");
+        let codex_schema = codex_output_schema_path(&authoritative_schema)?;
+        let authoritative_value = super::super::schema_artifacts::auditor_report_schema_value();
+        let codex_value = super::super::schema_artifacts::codex_response_format_schema(
+            authoritative_value.clone(),
+        )?;
+        let authoritative_bytes = serde_json::to_vec_pretty(&authoritative_value)?;
+        let codex_bytes = serde_json::to_vec_pretty(&codex_value)?;
+        fs::write(&authoritative_schema, &authoritative_bytes)?;
+        fs::write(&codex_schema, &codex_bytes)?;
+        let workspaces = [
+            create_review_lens_scope_workspace()?,
+            create_review_lens_scope_workspace()?,
+        ];
+        let auditor_ids = [
+            "csv-manager-review-auditor-lens-0",
+            "csv-manager-review-auditor-lens-2",
+        ];
+        let schema_inputs = std::thread::scope(|scope| {
+            let handles = workspaces
+                .iter()
+                .zip(auditor_ids)
+                .map(|(workspace, auditor_id)| {
+                    let authoritative_schema = &authoritative_schema;
+                    scope.spawn(move || {
+                        materialize_review_lens_auditor_schema_input(
+                            authoritative_schema,
+                            workspace.path(),
+                            SupervisorRuntime::Codex,
+                            auditor_id,
+                        )
+                    })
+                })
+                .collect::<Vec<_>>();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("isolated lens schema materialization"))
+                .collect::<Result<Vec<_>>>()
+        })?;
+
+        for (lens_index, (schema_input, auditor_id)) in
+            schema_inputs.iter().zip(auditor_ids).enumerate()
+        {
+            assert!(schema_input.starts_with(workspaces[lens_index].path()));
+            for (runtime, original) in [
+                (SupervisorRuntime::Codex, &codex_value),
+                (SupervisorRuntime::Grok, &authoritative_value),
+                (SupervisorRuntime::Fake, &authoritative_value),
+            ] {
+                let command =
+                    bind_runtime_output_schema(launch_fixture_command(), runtime, schema_input)?;
+                let output_schema = command
+                    .output_schema
+                    .context("missing lens output schema")?;
+                assert!(output_schema.starts_with(workspaces[lens_index].path()));
+                let bound: Value = serde_json::from_slice(&fs::read(output_schema)?)?;
+                assert_eq!(
+                    bound["properties"]["id"],
+                    json!({"type": "string", "enum": [auditor_id]})
+                );
+                let mut unchanged = bound.clone();
+                unchanged["properties"]["id"] = original["properties"]["id"].clone();
+                assert_eq!(&unchanged, original);
+
+                let schema_id = "urn:review-lens-assigned-auditor-id";
+                let mut compiler = boon::Compiler::new();
+                compiler.set_default_draft(boon::Draft::V2020_12);
+                compiler
+                    .add_resource(schema_id, bound)
+                    .map_err(|error| anyhow!("{error:#}"))?;
+                let mut schemas = boon::Schemas::new();
+                let index = compiler
+                    .compile(schema_id, &mut schemas)
+                    .map_err(|error| anyhow!("{error:#}"))?;
+                let mut report = json!({
+                    "id": auditor_id,
+                    "role": "auditor",
+                    "reviewed_worker_ids": [],
+                    "reviewed_paths": [],
+                    "commands_run": [],
+                    "environment_failures": [],
+                    "validation_results": [],
+                    "findings": [],
+                    "rejection_kind": null,
+                    "no_further_delegation": true,
+                    "read_only": true,
+                    "accepted": true,
+                    "rejected": false,
+                    "status": "succeeded",
+                    "remaining_risk": "none",
+                    "next_safe_action": "continue"
+                });
+                schemas
+                    .validate(&report, index)
+                    .map_err(|error| anyhow!("{error:#}"))?;
+                for wrong_id in ["diff-only", auditor_ids[1 - lens_index]] {
+                    report["id"] = json!(wrong_id);
+                    assert!(
+                        schemas.validate(&report, index).is_err(),
+                        "{runtime:?} accepted foreign auditor id {wrong_id}"
+                    );
+                }
+            }
+        }
+        assert_eq!(fs::read(authoritative_schema)?, authoritative_bytes);
+        assert_eq!(fs::read(codex_schema)?, codex_bytes);
         Ok(())
     }
 
