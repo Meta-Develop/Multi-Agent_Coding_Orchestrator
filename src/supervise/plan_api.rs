@@ -7147,7 +7147,8 @@ pub fn resume_supervisor_run(
         });
     }
 
-    let (mut checkpoint, mut snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
+    let (mut checkpoint, mut snapshot) = match open_supervisor_checkpoint_for_resume(&repo, &run_id)
+    {
         Ok(opened) => opened,
         Err(error) => {
             return resume_refusal(
@@ -7491,8 +7492,8 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
     let (lifecycle, resume_gate_denial) = if final_report.is_some() {
         (SupervisorRunLifecycle::Finalized, None)
     } else {
-        match open_supervisor_checkpoint(&repo, &run_id) {
-            Ok((_writer, snapshot)) if !snapshot.uncertain_assignments.is_empty() => {
+        match read_supervisor_checkpoint(&repo, &run_id) {
+            Ok(snapshot) if !snapshot.uncertain_assignments.is_empty() => {
                 let denial = GateDenial::new(
                     run_id.as_str(),
                     GateDenialReason::ExternalSideEffect {
@@ -7506,10 +7507,10 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
                 )?;
                 (SupervisorRunLifecycle::Uncertain, Some(denial))
             }
-            Ok((_writer, snapshot)) if snapshot.final_report.is_some() => {
+            Ok(snapshot) if snapshot.final_report.is_some() => {
                 (SupervisorRunLifecycle::Resumable, None)
             }
-            Ok((_writer, _snapshot)) => {
+            Ok(_) => {
                 let refusal = resume_refusal(
                     &run_id,
                     SupervisorRunLifecycle::Interrupted,

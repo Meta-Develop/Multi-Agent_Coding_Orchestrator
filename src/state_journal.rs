@@ -302,6 +302,14 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,
     ) -> Result<Self> {
+        Self::open_for_recovery(authenticator, expected, false)
+    }
+
+    fn open_for_recovery(
+        authenticator: RepositoryAuthenticator,
+        expected: &JournalIdentity,
+        require_published_head: bool,
+    ) -> Result<Self> {
         validate_spec::<S>()?;
         validate_identity::<S>(expected)?;
         authenticator.verify_epoch()?;
@@ -327,6 +335,11 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             head_dirty: false,
             spec: PhantomData,
         };
+        // The producer may finish its first append. A supervisor reopening an
+        // existing run needs a published head before it may recover its tail.
+        if require_published_head && !journal.run_root.direct_child_exists(S::HEAD_FILE_NAME)? {
+            bail!("authenticated journal head is missing; recovery is required");
+        }
         journal.load_and_recover()?;
         journal.verify_boundaries()?;
         Ok(journal)
@@ -383,10 +396,34 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         authenticator: RepositoryAuthenticator,
         instance_id: &str,
     ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open(authenticator, &identity)
+    }
+
+    pub(crate) fn open_published_instance(
+        authenticator: RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open_for_recovery(authenticator, &identity, true)
+    }
+
+    pub(crate) fn open_instance_read_only(
+        authenticator: RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open_existing_read_only(authenticator, &identity)
+    }
+
+    fn locate_instance(
+        authenticator: &RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<JournalIdentity> {
         validate_spec::<S>()?;
         validate_instance_id::<S>(instance_id)?;
         authenticator.verify_epoch()?;
-        let journal_root = open_existing_journal_root::<S>(&authenticator)?;
+        let journal_root = open_existing_journal_root::<S>(authenticator)?;
         let reserved = journal_root
             .bind_existing_direct_child_directory(instance_id)
             .with_context(|| format!("{} instance is missing or unsafe", S::NAMESPACE))?;
@@ -406,7 +443,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
                 S::NAMESPACE
             );
         }
-        Self::open(authenticator, &locator.identity)
+        Ok(locator.identity)
     }
 
     pub(crate) fn identity(&self) -> &JournalIdentity {
