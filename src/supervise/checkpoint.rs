@@ -1067,7 +1067,7 @@ pub(super) fn read_supervisor_checkpoint(
 pub(super) fn authenticated_child_dispatch_started(repo: &Path, run_id: &RunId) -> Result<bool> {
     let authenticator = repository_authenticator_key_only(repo)?;
     validate_repository_authenticated_state(repo, &authenticator)?;
-    let journal = StateJournal::open_instance(authenticator, run_id.as_str())?;
+    let journal = StateJournal::open_instance_read_only(authenticator, run_id.as_str())?;
     let records = journal.records();
     // Opening authenticates the complete chain and repository/key epoch. The
     // supervise analyzer additionally proves that the authenticated records

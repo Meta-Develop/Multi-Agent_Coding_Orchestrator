@@ -4455,6 +4455,70 @@ fn authenticated_child_dispatch_evidence_accepts_structurally_valid_checkpoint()
 }
 
 #[test]
+fn authenticated_child_dispatch_evidence_inspection_preserves_state() {
+    for case in [
+        "stable",
+        "missing-lock",
+        "lagging-head",
+        "head-temp",
+        "record-temp",
+    ] {
+        let (_temp, repo) = injected_repository();
+        let run_id = RunId::new(format!("dispatch-inspection-{case}")).unwrap();
+        let (writer, mut checkpoint, assignment, ledger) =
+            prepared_dispatch_evidence_checkpoint(&repo, &run_id);
+        checkpoint
+            .assignment_started(
+                &assignment,
+                0,
+                Some(writer.resume_binding().unwrap()),
+                ledger.report().unwrap(),
+            )
+            .unwrap();
+        let journal = checkpoint_journal_dir(&repo, &run_id);
+        let prior_head = fs::read(journal.join(".head.json")).unwrap();
+        checkpoint
+            .dispatch_started(false, &assignment.id, 1)
+            .unwrap();
+        let head: serde_json::Value =
+            serde_json::from_slice(&fs::read(journal.join(".head.json")).unwrap()).unwrap();
+        let next_sequence = head["sequence"].as_u64().unwrap() + 1;
+        drop(checkpoint);
+        drop(writer);
+        match case {
+            "missing-lock" => fs::remove_file(journal.join(".resume.lock")).unwrap(),
+            "lagging-head" => fs::write(journal.join(".head.json"), prior_head).unwrap(),
+            "head-temp" | "record-temp" => {
+                let name = if case == "head-temp" {
+                    format!(".head-{}.tmp", "a".repeat(64))
+                } else {
+                    format!(".record-{next_sequence:020}-{}.tmp", "a".repeat(64))
+                };
+                let path = journal.join(name);
+                fs::write(&path, b"partial publication\n").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            _ => {}
+        }
+        let before = resume_state_inventory(&repo);
+        let evidence = authenticated_child_dispatch_started(&repo, &run_id);
+        if case == "stable" {
+            assert!(evidence.unwrap());
+        } else {
+            assert!(evidence.is_err(), "{case} must require recovery");
+        }
+        assert_eq!(resume_state_inventory(&repo), before, "{case}");
+        // Recovery remains explicit; evidence becomes usable after repair.
+        drop(open_supervisor_checkpoint(&repo, &run_id).unwrap());
+        assert!(authenticated_child_dispatch_started(&repo, &run_id).unwrap());
+    }
+}
+
+#[test]
 fn authenticated_child_dispatch_evidence_refuses_dispatch_after_assignment_completion() {
     let (_temp, repo) = injected_repository();
     let run_id = RunId::new("authenticated-dispatch-evidence-after-completion")
