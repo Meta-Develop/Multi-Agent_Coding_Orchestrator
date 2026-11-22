@@ -4418,6 +4418,9 @@ mod tests {
 
     #[test]
     fn post_cascade_error_evidence_inspection_preserves_queue_state() {
+        use crate::artifacts::{
+            ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
+        };
         use crate::supervise::{
             generated_follow_up_dispatch_evidence_after_cascade_error,
             GeneratedFollowUpDispatchEvidence,
@@ -4491,23 +4494,51 @@ mod tests {
                 }
                 _ => {}
             }
-            // Force the post-error fallback to authenticated queue evidence:
-            // the source artifact path cannot be observed as a supervisor run.
+            // A safely finalized artifact from an unsupported runtime cannot be
+            // decoded as a supervisor report. Exercise the queue fallback without
+            // obstructing artifact directories or breaking writer authentication.
             let source_run_id =
                 crate::orchestrator::RunId::new(source.source_supervisor_run_id()).unwrap();
-            let source_artifact = crate::artifacts::run_dir(
+            let mut report: serde_json::Value = serde_json::from_str(include_str!(
+                "../fixtures/schemas/supervisor-final-report-v1.valid.json"
+            ))
+            .unwrap();
+            report["run_id"] = serde_json::json!(source_run_id.as_str());
+            report["run_dir"] = serde_json::json!(RunArtifactFamily::Supervise
+                .run_root()
+                .join(source_run_id.as_str()));
+            report["runtime"] = serde_json::json!("future-runtime");
+            let mut writer = ArtifactRunWriter::reserve(
                 &repo,
-                crate::artifacts::RunArtifactFamily::Supervise,
-                &source_run_id,
+                RunArtifactFamily::Supervise,
+                source_run_id.clone(),
+                "queue-evidence-test",
+            )
+            .unwrap();
+            let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+            writer
+                .write_json(
+                    &report_path,
+                    &report,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .unwrap();
+            writer.finalize(&report_path, false).unwrap();
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &source_run_id)
+                .expect("source artifact must remain authenticated");
+            let status_error =
+                crate::supervise::supervisor_status(&repo, source_run_id.clone()).unwrap_err();
+            let status_error = format!("{status_error:#}");
+            assert!(
+                status_error.contains("unknown variant `future-runtime`"),
+                "{status_error}"
             );
-            fs::create_dir_all(source_artifact.parent().unwrap()).unwrap();
-            fs::write(&source_artifact, b"unobservable source artifact").unwrap();
-            assert!(crate::supervise::supervisor_status(&repo, source_run_id.clone()).is_err());
             let before = inventory(&repo);
             // The inspection API returns data only, even for a healthy queue.
             let inspection: Result<Option<GeneratedFollowUpQueueSnapshot>> =
                 GeneratedFollowUpQueue::inspect_existing_for_source_execution(
-                    authenticator(&repo),
+                    crate::artifacts::repository_authenticator_key_only(&repo)
+                        .expect("read-only repository authenticator"),
                     source.source_supervisor_run_id(),
                     source.source_normalized_plan_sha256(),
                 );
