@@ -1347,16 +1347,14 @@ fn subordinate_reconciliation(repo: &Path, run_id: &RunId) -> Result<Subordinate
             .map(Box::new)
             .map(SubordinateReconciliation::Finalized)
             .context("finalized generated follow-up has no authenticated report"),
-        SupervisorRunLifecycle::Resumable => {
+        SupervisorRunLifecycle::Resumable | SupervisorRunLifecycle::Interrupted => {
             match resume_supervisor_run(repo, run_id.clone())?.final_report {
                 Some(report) => Ok(SubordinateReconciliation::Finalized(Box::new(report))),
                 None => Ok(SubordinateReconciliation::Ambiguous),
             }
         }
         SupervisorRunLifecycle::Active => Ok(SubordinateReconciliation::Active),
-        SupervisorRunLifecycle::Interrupted | SupervisorRunLifecycle::Uncertain => {
-            Ok(SubordinateReconciliation::Ambiguous)
-        }
+        SupervisorRunLifecycle::Uncertain => Ok(SubordinateReconciliation::Ambiguous),
     }
 }
 
@@ -1369,6 +1367,83 @@ fn conclusive_finalized_report(
         SubordinateReconciliation::Active
         | SubordinateReconciliation::Ambiguous
         | SubordinateReconciliation::RetryableStatusRead => Ok(None),
+    }
+}
+
+#[cfg(test)]
+mod recovery_tests {
+    use super::*;
+    use crate::supervise::tests::{artifact_test_final_report, injected_repository};
+
+    #[test]
+    fn subordinate_reconciliation_recovers_a_stale_checkpoint_head() {
+        skip_without_containment!();
+        let (_temp, repo) = injected_repository();
+        let run_id = RunId::new("subordinate-stale-head").unwrap();
+        let plan: SupervisorPlan = serde_json::from_value(json!({})).unwrap();
+        let budget = RunBudgetLedger::new(RunBudgetLimits::default())
+            .unwrap()
+            .report()
+            .unwrap();
+        let writer = ArtifactRunWriter::reserve(
+            &repo,
+            RunArtifactFamily::Supervise,
+            run_id.clone(),
+            "subordinate-recovery-test",
+        )
+        .unwrap();
+        let mut checkpoint = SupervisorCheckpointWriter::create(
+            &repo,
+            SupervisorCheckpointPreparation::new(
+                &run_id,
+                &current_head_oid(&repo).unwrap(),
+                normalized_supervisor_plan_sha256(
+                    &plan,
+                    &SupervisorConsultantPlan::default(),
+                    &AssignmentMetadata::new(),
+                    &SupervisorPlanMetadata::default(),
+                )
+                .unwrap(),
+                1,
+                &plan,
+                writer.resume_binding().unwrap(),
+                budget.clone(),
+            ),
+        )
+        .unwrap();
+        checkpoint
+            .scheduler_closed(writer.resume_binding().unwrap(), budget.clone())
+            .unwrap();
+        let head = repo
+            .join(".git/maco/state")
+            .join(crate::state_journal::JOURNAL_ROOT_NAME)
+            .join(run_id.as_str())
+            .join(".head.json");
+        let prior_head = fs::read(&head).unwrap();
+        let mut report = artifact_test_final_report(&run_id);
+        report.run_budget = Some(budget);
+        checkpoint
+            .final_report_planned(
+                &report,
+                &encode_final_report(&report).unwrap(),
+                writer.resume_binding().unwrap(),
+            )
+            .unwrap();
+        drop(checkpoint);
+        drop(writer);
+        fs::write(head, prior_head).unwrap();
+        assert_eq!(
+            supervisor_status(&repo, run_id.clone()).unwrap().lifecycle,
+            SupervisorRunLifecycle::Interrupted
+        );
+
+        let SubordinateReconciliation::Finalized(recovered) =
+            subordinate_reconciliation(&repo, &run_id).unwrap()
+        else {
+            panic!("recoverable subordinate must finalize without another dispatch");
+        };
+        assert_eq!(*recovered, report);
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id).unwrap();
     }
 }
 

@@ -6438,13 +6438,15 @@ pub fn resume_supervisor_goal_spec_cascade_with_concurrency_policy(
     resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
 }
 
-fn refuse_inbox_pr_repair_generic_resume(
+pub(super) fn refuse_inbox_pr_repair_generic_resume(
     repo: &Path,
     run_id: &RunId,
     finalized: bool,
 ) -> Result<()> {
-    let checkpoint_head = match open_supervisor_checkpoint(repo, run_id) {
-        Ok((_writer, snapshot)) => snapshot.inbox_pr_source_head_oid,
+    // Admission must inspect even a transitional authenticated tail before any
+    // recovery removes residue or republishes the head.
+    let checkpoint_head = match inspect_supervisor_checkpoint_for_resume(repo, run_id) {
+        Ok(snapshot) => snapshot.inbox_pr_source_head_oid,
         Err(_) if finalized => None,
         Err(error) => {
             return Err(error).context("failed to authenticate source checkpoint before resume");
@@ -6491,7 +6493,9 @@ fn resume_generated_follow_up_cascade(
     let status = supervisor_status(&repo, run_id.clone())?;
     if matches!(
         status.lifecycle,
-        SupervisorRunLifecycle::Finalized | SupervisorRunLifecycle::Resumable
+        SupervisorRunLifecycle::Finalized
+            | SupervisorRunLifecycle::Resumable
+            | SupervisorRunLifecycle::Interrupted
     ) {
         refuse_inbox_pr_repair_generic_resume(
             &repo,
@@ -6506,7 +6510,10 @@ fn resume_generated_follow_up_cascade(
                 .context("finalized supervise cascade source report is missing")?,
             true,
         ),
-        SupervisorRunLifecycle::Resumable => (
+        // Read-only status refuses transitional heads and crash residue. The
+        // resume opener authenticates and recovers those under the existing
+        // run lock, and still refuses missing state or an unsafe lifecycle.
+        SupervisorRunLifecycle::Resumable | SupervisorRunLifecycle::Interrupted => (
             source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?,
             false,
         ),
@@ -6515,9 +6522,6 @@ fn resume_generated_follow_up_cascade(
         }
         SupervisorRunLifecycle::Uncertain => {
             bail!("cannot resume generated follow-up cascade from an uncertain source run")
-        }
-        SupervisorRunLifecycle::Interrupted => {
-            bail!("cannot resume generated follow-up cascade from an interrupted source run")
         }
     };
     if source_was_finalized {
@@ -7147,7 +7151,8 @@ pub fn resume_supervisor_run(
         });
     }
 
-    let (mut checkpoint, mut snapshot) = match open_supervisor_checkpoint(&repo, &run_id) {
+    let (mut checkpoint, mut snapshot) = match open_supervisor_checkpoint_for_resume(&repo, &run_id)
+    {
         Ok(opened) => opened,
         Err(error) => {
             return resume_refusal(
@@ -7491,8 +7496,8 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
     let (lifecycle, resume_gate_denial) = if final_report.is_some() {
         (SupervisorRunLifecycle::Finalized, None)
     } else {
-        match open_supervisor_checkpoint(&repo, &run_id) {
-            Ok((_writer, snapshot)) if !snapshot.uncertain_assignments.is_empty() => {
+        match read_supervisor_checkpoint(&repo, &run_id) {
+            Ok(snapshot) if !snapshot.uncertain_assignments.is_empty() => {
                 let denial = GateDenial::new(
                     run_id.as_str(),
                     GateDenialReason::ExternalSideEffect {
@@ -7506,10 +7511,10 @@ pub fn supervisor_status(repo: impl AsRef<Path>, run_id: RunId) -> Result<Superv
                 )?;
                 (SupervisorRunLifecycle::Uncertain, Some(denial))
             }
-            Ok((_writer, snapshot)) if snapshot.final_report.is_some() => {
+            Ok(snapshot) if snapshot.final_report.is_some() => {
                 (SupervisorRunLifecycle::Resumable, None)
             }
-            Ok((_writer, _snapshot)) => {
+            Ok(_) => {
                 let refusal = resume_refusal(
                     &run_id,
                     SupervisorRunLifecycle::Interrupted,
