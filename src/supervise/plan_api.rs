@@ -120,6 +120,42 @@ pub fn coordination_topology_from_plan(
     }
 }
 
+fn coordination_topology_from_plan_metadata(
+    plan: &SupervisorPlan,
+    plan_metadata: &SupervisorPlanMetadata,
+) -> CoordinationTopology {
+    let mut topology = coordination_topology_from_plan(plan, &plan_metadata.assignment_schedule);
+    // Only an explicit lowering receipt establishes who selected this ceiling.
+    // Fragment IDs can also be supplied by authored plans. Bind the receipt to
+    // its value so it cannot mask a subsequent authored ceiling change.
+    let generated_depth_note = goal_spec_generated_depth_note(plan.max_depth);
+    if plan_metadata
+        .path_proposal
+        .notes
+        .contains(&generated_depth_note)
+    {
+        topology.caller_selected_coordination_depth = false;
+    }
+    topology
+}
+
+fn goal_spec_generated_depth_note(max_depth: u8) -> String {
+    format!("maco:goal_spec_generated_max_depth={max_depth}")
+}
+
+/// Preserve explicit ceiling provenance in the existing round-trippable
+/// diagnostics carrier without changing the public plan or topology fields.
+fn goal_spec_depth_diagnostics(
+    mut diagnostics: planning::TaskPathProposalDiagnostics,
+    max_depth: u8,
+) -> planning::TaskPathProposalDiagnostics {
+    let note = goal_spec_generated_depth_note(max_depth);
+    if !diagnostics.notes.contains(&note) {
+        diagnostics.notes.push(note);
+    }
+    diagnostics
+}
+
 fn apply_objective_profile_override(
     loaded: &mut LoadedSupervisorPlan,
     objective_profile_override: Option<&str>,
@@ -719,7 +755,7 @@ fn supervisor_plan_and_consultant_from_goal_spec_proposal(
         admission: SupervisorAdmissionConfig::default(),
         evidence_only_reaudit: None,
         generated_follow_up: None,
-        path_proposal: proposal.diagnostics.clone(),
+        path_proposal: goal_spec_depth_diagnostics(proposal.diagnostics.clone(), plan.max_depth),
         router: SupervisorRouterConfig::default(),
         resolved_routing_policy,
         task_routing_assessment,
@@ -840,7 +876,7 @@ fn lower_coordinated_execution_proposal(
         spec_fragment_ids_by_assignment: fragments_by_assignment,
         assignment_schedule: schedule,
         run_budget: conservative_generated_role_budget(),
-        path_proposal: proposal.diagnostics,
+        path_proposal: goal_spec_depth_diagnostics(proposal.diagnostics, plan.max_depth),
         resolved_routing_policy: Some(frozen),
         task_routing_assessment,
         ..SupervisorPlanMetadata::default()
@@ -1136,7 +1172,7 @@ fn lower_nested_coordinated_execution_proposal(
         spec_fragment_ids_by_assignment: fragments_by_assignment,
         assignment_schedule: schedule,
         run_budget: conservative_generated_role_budget(),
-        path_proposal: proposal.diagnostics,
+        path_proposal: goal_spec_depth_diagnostics(proposal.diagnostics, plan.max_depth),
         resolved_routing_policy: Some(frozen),
         task_routing_assessment,
         ..SupervisorPlanMetadata::default()
@@ -1591,7 +1627,26 @@ mod task_routing_lowering_tests {
         git2::Repository::init(repo.path()).unwrap();
         let loaded = loaded(repo.path(), proposal());
         assert_eq!(loaded.plan.assignments.len(), 1);
+        assert_eq!(loaded.plan.max_depth, 2);
+        assert_eq!(loaded.plan_metadata.assignment_schedule.len(), 1);
+        assert_eq!(loaded.plan_metadata.assignment_schedule[0].depth, 2);
+        let document = intake_document(&loaded);
+        assert_eq!(
+            document["coordination_topology"],
+            json!({
+                "derived_coordination_depth": 1,
+                "caller_selected_coordination_depth": false,
+                "planned_max_depth": 2
+            })
+        );
+        let parsed = load_normal_intake_document(document.clone(), repo.path()).unwrap();
+        assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            intake_document(&parsed)["coordination_topology"],
+            document["coordination_topology"]
+        );
         let worker = &loaded.plan.assignments[0];
+        assert!(worker.worker_assignments.is_empty());
         assert_eq!(worker.role, AgentRole::Worker);
         assert_eq!(worker.phase, AssignmentPhase::Execution);
         assert!(worker.runtime.is_none());
@@ -2500,7 +2555,13 @@ mod task_routing_lowering_tests {
         assert_eq!(parent.phase, AssignmentPhase::Execution);
         assert_eq!(parent.worker_assignments.len(), 2);
         assert!(parent.runtime.is_none());
+        assert_eq!(loaded.plan.max_depth, 3);
         assert_eq!(loaded.plan_metadata.assignment_schedule.len(), 1);
+        let scheduled_parent = &loaded.plan_metadata.assignment_schedule[0];
+        assert_eq!(scheduled_parent.assignment_id, parent.id);
+        assert!(scheduled_parent.parent_assignment_id.is_none());
+        assert_eq!(scheduled_parent.depth, 2);
+        assert_eq!(scheduled_parent.flattened_index, 0);
         for (worker, proposal) in parent.worker_assignments.iter().zip(expected) {
             assert_ne!(worker.id, parent.id);
             assert_eq!(worker.id, proposal.id);
@@ -2526,8 +2587,24 @@ mod task_routing_lowering_tests {
             &loaded.plan_metadata,
         )
         .unwrap();
-        let parsed = load_normal_intake_document(document, repo.path()).unwrap();
+        assert_eq!(
+            document["coordination_topology"],
+            json!({
+                "derived_coordination_depth": 1,
+                "caller_selected_coordination_depth": false,
+                "planned_max_depth": 3
+            })
+        );
+        let parsed = load_normal_intake_document(document.clone(), repo.path()).unwrap();
         assert_eq!(parsed.plan, loaded.plan);
+        assert_eq!(
+            parsed.plan_metadata.assignment_schedule,
+            loaded.plan_metadata.assignment_schedule
+        );
+        assert_eq!(
+            intake_document(&parsed)["coordination_topology"],
+            document["coordination_topology"]
+        );
         assert_eq!(
             parsed.plan_metadata.task_routing_assessment,
             loaded.plan_metadata.task_routing_assessment
@@ -2535,6 +2612,25 @@ mod task_routing_lowering_tests {
         assert_eq!(
             parsed.plan_metadata.spec_fragment_ids_by_assignment,
             loaded.plan_metadata.spec_fragment_ids_by_assignment
+        );
+
+        // Retaining generated metadata while authoring a different ceiling
+        // must not reuse the old ceiling's provenance.
+        let mut authored_ceiling = document;
+        authored_ceiling["max_depth"] = json!(4);
+        let changed = parse_supervisor_plan_with_consultant(&authored_ceiling.to_string()).unwrap();
+        assert_eq!(changed.plan.assignments, loaded.plan.assignments);
+        assert_eq!(
+            changed.plan_metadata.assignment_schedule,
+            loaded.plan_metadata.assignment_schedule
+        );
+        assert_eq!(
+            intake_document(&changed)["coordination_topology"],
+            json!({
+                "derived_coordination_depth": 1,
+                "caller_selected_coordination_depth": true,
+                "planned_max_depth": 4
+            })
         );
     }
 
@@ -5438,9 +5534,9 @@ pub(super) fn supervisor_plan_value(
     );
     object.insert(
         "coordination_topology".to_string(),
-        serde_json::to_value(coordination_topology_from_plan(
+        serde_json::to_value(coordination_topology_from_plan_metadata(
             plan,
-            &plan_metadata.assignment_schedule,
+            plan_metadata,
         ))
         .context("failed to serialize coordination topology")?,
     );
@@ -8628,6 +8724,65 @@ mod diagnostics_emission_tests {
             assignment.selection_source,
             Some(AssignmentSelectionSource::OperatorOverride)
         );
+    }
+
+    #[test]
+    fn authored_depth_ceiling_keeps_legacy_caller_selection_provenance() {
+        // The same ceiling/schedule mismatch as generated coordinated plans,
+        // with and without fragment metadata accepted from authored documents.
+        for with_fragments in [false, true] {
+            let mut document: Value =
+                serde_json::from_str(&fixture_plan_json("delegating_coordinator", None)).unwrap();
+            document["max_depth"] = json!(3);
+            if with_fragments {
+                document["spec_fragment_ids"] = json!(["authored-fragment"]);
+                document["assignments"][0]["spec_fragment_ids"] = json!(["authored-fragment"]);
+                document["assignments"][0]["worker_assignments"][0]["spec_fragment_ids"] =
+                    json!(["authored-fragment"]);
+                document["path_proposal"] =
+                    json!({"degraded": false, "notes": ["authored scope diagnostic"]});
+            }
+            let loaded = parse_supervisor_plan_with_consultant(&document.to_string())
+                .expect("authored plan");
+            assert_eq!(
+                loaded.plan_metadata.spec_fragment_ids.is_empty(),
+                !with_fragments
+            );
+            assert_eq!(loaded.plan_metadata.assignment_schedule[0].depth, 2);
+            assert_eq!(loaded.plan.assignments[0].worker_assignments.len(), 1);
+            let emitted = supervisor_plan_value(
+                &loaded.plan,
+                &loaded.consultant,
+                &loaded.assignment_metadata,
+                &loaded.plan_metadata,
+            )
+            .expect("emit authored topology");
+            assert_eq!(
+                emitted["coordination_topology"],
+                json!({
+                    "derived_coordination_depth": 1,
+                    "caller_selected_coordination_depth": true,
+                    "planned_max_depth": 3
+                })
+            );
+            let reloaded = parse_supervisor_plan_with_consultant(&emitted.to_string())
+                .expect("reload authored plan");
+            assert_eq!(
+                reloaded.plan_metadata.spec_fragment_ids,
+                loaded.plan_metadata.spec_fragment_ids
+            );
+            let round_trip = supervisor_plan_value(
+                &reloaded.plan,
+                &reloaded.consultant,
+                &reloaded.assignment_metadata,
+                &reloaded.plan_metadata,
+            )
+            .expect("re-emit authored topology");
+            assert_eq!(
+                round_trip["coordination_topology"],
+                emitted["coordination_topology"]
+            );
+        }
     }
 
     #[test]
