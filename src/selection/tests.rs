@@ -2913,6 +2913,14 @@ fn eligible_debug_override_is_applied_and_recorded() {
             .disposition,
         DebugOverrideDisposition::Applied
     );
+    assert_eq!(
+        decision
+            .debug_override
+            .as_ref()
+            .expect("debug provenance")
+            .reason,
+        "debug override applied after all hard eligibility gates passed"
+    );
     assert_eq!(decision.triggers, vec![SelectionTrigger::DebugOverride]);
 }
 

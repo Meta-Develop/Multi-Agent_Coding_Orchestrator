@@ -336,7 +336,9 @@ pub fn select_with_loaded_routing_policy(
             } else {
                 DebugOverrideDisposition::Rejected
             },
-            reason: if !normalized.constraints.allow_debug_override {
+            reason: if applied {
+                "debug override applied after all hard eligibility gates passed".to_string()
+            } else if !normalized.constraints.allow_debug_override {
                 "operator constraints disable debug overrides".to_string()
             } else if evaluation.is_none() {
                 "debug override is absent from the runtime-advertised candidate set".to_string()
