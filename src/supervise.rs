@@ -3932,6 +3932,18 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
     let loaded = load_supervisor_plan_file_with_consultant(&options.plan_file, Some(&repo))?;
     let run_id = options.run_id.clone();
     let status = supervisor_status(&repo, run_id.clone())?;
+    if matches!(
+        status.lifecycle,
+        SupervisorRunLifecycle::Finalized
+            | SupervisorRunLifecycle::Resumable
+            | SupervisorRunLifecycle::Interrupted
+    ) {
+        plan_api::refuse_inbox_pr_repair_generic_resume(
+            &repo,
+            &run_id,
+            status.lifecycle == SupervisorRunLifecycle::Finalized,
+        )?;
+    }
     let source_report = match status.lifecycle {
         SupervisorRunLifecycle::Finalized => status
             .final_report

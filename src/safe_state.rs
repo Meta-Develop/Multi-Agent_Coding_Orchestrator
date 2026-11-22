@@ -1674,6 +1674,87 @@ impl BoundedRegularReader {
         Ok(contents)
     }
 
+    /// Reads a journal publication interrupted between hard-linking its final
+    /// name and removing its temp. Both distinct names must account for exactly
+    /// two links to the same owner-private inode, before and after the read.
+    /// The caller must hold the journal lock, validate the publication names,
+    /// and authenticate the returned bytes before recovering either entry.
+    #[cfg(unix)]
+    pub(crate) fn read_direct_published_pair(
+        root: &SafeRoot,
+        record_name: &OsStr,
+        temp_name: &OsStr,
+        max_bytes: u64,
+    ) -> Result<Vec<u8>> {
+        validate_single_component(record_name)?;
+        validate_single_component(temp_name)?;
+        if record_name == temp_name {
+            bail!("journal publication must have distinct record and temp names");
+        }
+        root.verify()?;
+        // This exception is confined to this pair reader. Normal state readers
+        // continue to require exactly one hard link.
+        let open = |name: &OsStr| -> Result<File> {
+            let name = c_string(name)?;
+            let fd = unsafe {
+                libc::openat(
+                    root.directory.as_raw_fd(),
+                    name.as_ptr(),
+                    libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK,
+                )
+            };
+            if fd < 0 {
+                return Err(std::io::Error::last_os_error())
+                    .context("failed to open journal publication pair");
+            }
+            Ok(unsafe { File::from_raw_fd(fd) })
+        };
+        let validate = |record: &fs::Metadata, temp: &fs::Metadata| -> Result<()> {
+            for metadata in [record, temp] {
+                if !metadata.is_file()
+                    || metadata.nlink() != 2
+                    || metadata.uid() != unsafe { libc::geteuid() }
+                    || metadata.mode() & 0o777 != 0o600
+                    || metadata.len() > max_bytes
+                {
+                    bail!("journal publication pair is not bounded owner-private two-link state");
+                }
+            }
+            if !same_file_generation(record, temp) {
+                bail!("journal publication pair does not share the same inode and generation");
+            }
+            Ok(())
+        };
+        let mut record = open(record_name)?;
+        let temp = open(temp_name)?;
+        let before = record.metadata()?;
+        validate(&before, &temp.metadata()?)?;
+        let mut contents = Vec::with_capacity(
+            usize::try_from(before.len()).context("journal record length overflowed")?,
+        );
+        (&mut record)
+            .take(max_bytes.saturating_add(1))
+            .read_to_end(&mut contents)
+            .context("failed to read journal publication pair")?;
+        let after = record.metadata()?;
+        validate(&after, &temp.metadata()?)?;
+        if !same_file_generation(&before, &after)
+            || u64::try_from(contents.len()).unwrap_or(u64::MAX) != before.len()
+        {
+            bail!("journal publication pair changed during bounded read");
+        }
+        // Reopen both names through the retained directory capability so a
+        // moved or replaced pathname cannot authorize the opened descriptor.
+        let rebound_record = open(record_name)?.metadata()?;
+        let rebound_temp = open(temp_name)?.metadata()?;
+        validate(&rebound_record, &rebound_temp)?;
+        if !same_file_generation(&after, &rebound_record) {
+            bail!("journal publication pair identity changed during bounded read");
+        }
+        root.verify()?;
+        Ok(contents)
+    }
+
     /// Opens a repository-relative file component-by-component without
     /// following a link in any descendant of `root`.
     pub fn read_relative(

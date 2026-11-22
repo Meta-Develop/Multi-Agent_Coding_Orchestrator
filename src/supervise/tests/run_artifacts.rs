@@ -2951,6 +2951,16 @@ fn interrupted_final_report_checkpoint_with_recovery_state(
     loaded: Option<LoadedSupervisorPlan>,
     stale_head: bool,
 ) -> (RunBudgetReport, PathBuf, PathClaim) {
+    interrupted_final_report_checkpoint_with_source(repo, run_id, loaded, stale_head, None)
+}
+
+fn interrupted_final_report_checkpoint_with_source(
+    repo: &Path,
+    run_id: &RunId,
+    loaded: Option<LoadedSupervisorPlan>,
+    stale_head: bool,
+    source_head: Option<Oid>,
+) -> (RunBudgetReport, PathBuf, PathClaim) {
     let write_snapshot = loaded.is_some();
     let LoadedSupervisorPlan {
         plan,
@@ -2999,7 +3009,8 @@ fn interrupted_final_report_checkpoint_with_recovery_state(
             &plan,
             writer.resume_binding().expect("prepared artifact binding"),
             ledger.report().expect("initial budget report"),
-        ),
+        )
+        .with_inbox_pr_source_head(source_head),
     )
     .expect("create authenticated supervise checkpoint");
     checkpoint
@@ -3235,6 +3246,103 @@ fn cascade_resume_recovers_transitional_checkpoint_while_status_is_read_only() {
 }
 
 #[test]
+fn generic_cascade_resume_refuses_parent_bound_transitional_source_without_mutation() {
+    for case in [
+        "stale-head",
+        "head-temp",
+        "record-temp",
+        "published-record-temp",
+    ] {
+        if case == "published-record-temp" && !cfg!(unix) {
+            continue;
+        }
+        let (temp, repo) = injected_repository();
+        let run_id = RunId::new(format!("parent-bound-transitional-{case}")).unwrap();
+        let options = injected_options(&repo, temp.path(), run_id.as_str());
+        fs::write(
+            &options.plan_file,
+            serde_json::to_vec(&injected_plan(injected_assignment(false), 0)).unwrap(),
+        )
+        .unwrap();
+        let (budget, side_effect, retained_claim) = interrupted_final_report_checkpoint_with_source(
+            &repo,
+            &run_id,
+            None,
+            true,
+            Some(current_head_oid(&repo).unwrap()),
+        );
+        let journal = checkpoint_journal_dir(&repo, &run_id);
+        let temp_path = match case {
+            "head-temp" => Some(journal.join(format!(".head-{}.tmp", "a".repeat(64)))),
+            "record-temp" => {
+                Some(journal.join(format!(".record-{:020}-{}.tmp", 6, "a".repeat(64))))
+            }
+            "published-record-temp" => {
+                Some(journal.join(format!(".record-{:020}-{}.tmp", 5, "a".repeat(64))))
+            }
+            _ => None,
+        };
+        if let Some(path) = &temp_path {
+            if case == "published-record-temp" {
+                fs::hard_link(journal.join(format!("{:020}.json", 5)), path).unwrap();
+            } else {
+                fs::write(path, b"partial publication\n").unwrap();
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+        }
+        let before = resume_state_inventory(&repo);
+        let error = resume_supervisor_plan_file_cascade_with_concurrency_policy(
+            options.clone(),
+            SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+        )
+        .expect_err("parent-bound source requires parent admission");
+        assert!(
+            format!("{error:#}").contains("source_head_not_execution_base"),
+            "{error:#}"
+        );
+        assert_eq!(
+            resume_state_inventory(&repo),
+            before,
+            "production mutated {case}"
+        );
+        let mut no_dispatch =
+            |_command: &ExternalAgentCommand| panic!("rejected source dispatched");
+        let error = resume_supervisor_plan_file_cascade_with_runner(options, &mut no_dispatch)
+            .expect_err("injected entrypoint must enforce the same admission");
+        assert!(
+            format!("{error:#}").contains("source_head_not_execution_base"),
+            "{error:#}"
+        );
+        assert_eq!(
+            resume_state_inventory(&repo),
+            before,
+            "injected mutated {case}"
+        );
+
+        // The admitted finalization path can still recover this same source.
+        skip_without_containment!();
+        let resumed = resume_supervisor_run(&repo, run_id.clone()).unwrap();
+        assert!(resumed.success && resumed.resumed, "{resumed:#?}");
+        assert_eq!(resumed.lifecycle, SupervisorRunLifecycle::Finalized);
+        assert_eq!(resumed.run_budget.as_ref(), Some(&budget));
+        assert_eq!(fs::read(side_effect).unwrap(), b"execution-count=1\n");
+        assert_eq!(
+            SyncStore::open(&repo).unwrap().snapshot().unwrap(),
+            vec![retained_claim]
+        );
+        if let Some(path) = temp_path {
+            assert!(!path.exists(), "authorized resume must clean {case}");
+        }
+        ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+            .expect("authorized resume publishes authenticated finalization");
+    }
+}
+
+#[test]
 fn cascade_resume_transitional_checkpoint_still_fails_closed() {
     for case in [
         "missing-head",
@@ -3242,7 +3350,24 @@ fn cascade_resume_transitional_checkpoint_still_fails_closed() {
         "contention",
         "corrupt-record",
         "corrupt-head",
+        "corrupt-head-residue",
+        "bad-mac-head-residue",
+        "external-record-link",
+        "mismatched-record-temp",
+        "extra-record-link",
+        "nonfinal-record-link",
+        "wrong-sequence-temp",
+        "corrupt-published-record",
+        "public-published-record",
     ] {
+        if !cfg!(unix)
+            && !matches!(
+                case,
+                "missing-head" | "missing-lock" | "contention" | "corrupt-record" | "corrupt-head"
+            )
+        {
+            continue;
+        }
         let (temp, repo) = injected_repository();
         let run_id = RunId::new(format!("cascade-recovery-refuses-{case}")).unwrap();
         let options = injected_options(&repo, temp.path(), run_id.as_str());
@@ -3273,8 +3398,63 @@ fn cascade_resume_transitional_checkpoint_still_fails_closed() {
                 fs::write(journal.join(format!("{:020}.json", 5)), b"{}\n").unwrap();
                 None
             }
-            "corrupt-head" => {
-                fs::write(journal.join(".head.json"), b"{}\n").unwrap();
+            "corrupt-head" | "corrupt-head-residue" | "bad-mac-head-residue" => {
+                if case != "corrupt-head" {
+                    fs::hard_link(
+                        journal.join(format!("{:020}.json", 5)),
+                        journal.join(format!(".record-{:020}-{}.tmp", 5, "a".repeat(64))),
+                    )
+                    .unwrap();
+                }
+                let head_path = journal.join(".head.json");
+                if case == "bad-mac-head-residue" {
+                    let mut head: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&head_path).unwrap()).unwrap();
+                    head["record_bytes"] = json!(0);
+                    fs::write(head_path, serde_json::to_vec(&head).unwrap()).unwrap();
+                } else {
+                    fs::write(head_path, b"{}\n").unwrap();
+                }
+                None
+            }
+            "external-record-link"
+            | "mismatched-record-temp"
+            | "extra-record-link"
+            | "nonfinal-record-link"
+            | "wrong-sequence-temp"
+            | "corrupt-published-record"
+            | "public-published-record" => {
+                let sequence = if case == "nonfinal-record-link" { 4 } else { 5 };
+                let record = journal.join(format!("{sequence:020}.json"));
+                let temp_sequence = sequence + u64::from(case == "wrong-sequence-temp");
+                let publish_temp = journal.join(format!(
+                    ".record-{temp_sequence:020}-{}.tmp",
+                    "a".repeat(64)
+                ));
+                let external = repo.join("external-record-link");
+                if matches!(case, "external-record-link" | "mismatched-record-temp") {
+                    fs::hard_link(&record, &external).unwrap();
+                } else {
+                    fs::hard_link(&record, &publish_temp).unwrap();
+                }
+                if case == "mismatched-record-temp" {
+                    fs::copy(&record, &publish_temp).unwrap();
+                }
+                if case == "extra-record-link" {
+                    fs::hard_link(&record, &external).unwrap();
+                }
+                if case == "corrupt-published-record" {
+                    let mut forged: serde_json::Value =
+                        serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+                    // Valid syntax and journal structure do not confer authority.
+                    forged["payload"]["forged"] = serde_json::json!(true);
+                    fs::write(&record, serde_json::to_vec(&forged).unwrap()).unwrap();
+                }
+                #[cfg(unix)]
+                if case == "public-published-record" {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(&record, fs::Permissions::from_mode(0o644)).unwrap();
+                }
                 None
             }
             _ => unreachable!(),
@@ -3300,7 +3480,13 @@ fn cascade_resume_transitional_checkpoint_still_fails_closed() {
             "missing-lock" => "state lock is missing",
             "contention" => "source run is active",
             "corrupt-record" => "malformed record",
-            "corrupt-head" => "head is truncated or malformed",
+            "corrupt-head" | "corrupt-head-residue" => "head is truncated or malformed",
+            "bad-mac-head-residue" => "authentication",
+            "external-record-link" | "wrong-sequence-temp" => "unbound extra hard link",
+            "mismatched-record-temp" => "hard link is not its crash temp",
+            "extra-record-link" | "public-published-record" => "not a bounded private regular file",
+            "nonfinal-record-link" => "non-final published checkpoint record",
+            "corrupt-published-record" => "authentication",
             _ => unreachable!(),
         };
         assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");

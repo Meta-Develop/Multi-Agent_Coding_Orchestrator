@@ -1012,6 +1012,16 @@ pub(super) fn open_supervisor_checkpoint_for_resume(
     checkpoint_writer_and_snapshot(journal, run_id)
 }
 
+pub(super) fn inspect_supervisor_checkpoint_for_resume(
+    repo: &Path,
+    run_id: &RunId,
+) -> Result<SupervisorCheckpointSnapshot> {
+    let authenticator = repository_authenticator_key_only(repo)?;
+    validate_repository_authenticated_state(repo, &authenticator)?;
+    let journal = StateJournal::inspect_published_instance(authenticator, run_id.as_str())?;
+    analyze_checkpoint_records(journal.records(), run_id)
+}
+
 fn checkpoint_writer_and_snapshot(
     journal: StateJournal,
     run_id: &RunId,

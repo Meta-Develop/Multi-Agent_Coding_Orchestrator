@@ -6438,13 +6438,15 @@ pub fn resume_supervisor_goal_spec_cascade_with_concurrency_policy(
     resume_generated_follow_up_cascade(repo, loaded, options, concurrency_policy)
 }
 
-fn refuse_inbox_pr_repair_generic_resume(
+pub(super) fn refuse_inbox_pr_repair_generic_resume(
     repo: &Path,
     run_id: &RunId,
     finalized: bool,
 ) -> Result<()> {
-    let checkpoint_head = match open_supervisor_checkpoint_for_resume(repo, run_id) {
-        Ok((_writer, snapshot)) => snapshot.inbox_pr_source_head_oid,
+    // Admission must inspect even a transitional authenticated tail before any
+    // recovery removes residue or republishes the head.
+    let checkpoint_head = match inspect_supervisor_checkpoint_for_resume(repo, run_id) {
+        Ok(snapshot) => snapshot.inbox_pr_source_head_oid,
         Err(_) if finalized => None,
         Err(error) => {
             return Err(error).context("failed to authenticate source checkpoint before resume");

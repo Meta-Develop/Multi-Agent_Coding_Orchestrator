@@ -302,13 +302,14 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,
     ) -> Result<Self> {
-        Self::open_for_recovery(authenticator, expected, false)
+        Self::open_for_recovery(authenticator, expected, false, true)
     }
 
     fn open_for_recovery(
         authenticator: RepositoryAuthenticator,
         expected: &JournalIdentity,
         require_published_head: bool,
+        recover: bool,
     ) -> Result<Self> {
         validate_spec::<S>()?;
         validate_identity::<S>(expected)?;
@@ -344,7 +345,11 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         if require_published_head && !journal.run_root.direct_child_exists(S::HEAD_FILE_NAME)? {
             bail!("authenticated journal head is missing; recovery is required");
         }
-        journal.load_and_recover()?;
+        if recover {
+            journal.load_and_recover()?;
+        } else {
+            journal.load_for_recovery()?;
+        }
         journal.verify_boundaries()?;
         Ok(journal)
     }
@@ -403,7 +408,17 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         instance_id: &str,
     ) -> Result<Self> {
         let identity = Self::locate_instance(&authenticator, instance_id)?;
-        Self::open_for_recovery(authenticator, &identity, true)
+        Self::open_for_recovery(authenticator, &identity, true, true)
+    }
+
+    /// Authenticate a recoverable published instance under its existing lock,
+    /// without removing residue or publishing a repaired head.
+    pub(crate) fn inspect_published_instance(
+        authenticator: RepositoryAuthenticator,
+        instance_id: &str,
+    ) -> Result<Self> {
+        let identity = Self::locate_instance(&authenticator, instance_id)?;
+        Self::open_for_recovery(authenticator, &identity, true, false)
     }
 
     pub(crate) fn open_instance_read_only(
@@ -539,6 +554,17 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
     }
 
     fn load_and_recover(&mut self) -> Result<()> {
+        let (inventory, head_needs_recovery) = self.load_for_recovery()?;
+        // Authenticate the head and its crash window before cleanup, but keep
+        // cleanup durable before publishing the recovered head.
+        self.recover_temporary_files(&inventory)?;
+        if head_needs_recovery {
+            self.write_head()?;
+        }
+        Ok(())
+    }
+
+    fn load_for_recovery(&mut self) -> Result<(RunInventory, bool)> {
         self.verify_boundaries()?;
         let inventory = inventory_run_directory::<S>(&self.run_root)?;
         let mut records = Vec::with_capacity(inventory.records.len());
@@ -552,8 +578,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             if *sequence != expected_sequence {
                 bail!("checkpoint journal has a missing, reordered, or duplicate sequence");
             }
-            let bytes =
-                BoundedRegularReader::read_direct(&self.run_root, name, S::MAX_RECORD_BYTES)?;
+            let bytes = self.read_record_for_recovery(&inventory, *sequence, name)?;
             total = total
                 .checked_add(u64::try_from(bytes.len()).context("record length overflowed")?)
                 .context("journal byte total overflowed")?;
@@ -576,9 +601,41 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         }
         self.records = records;
         self.record_bytes = total;
-        self.recover_temporary_files(&inventory)?;
-        self.verify_or_recover_head(inventory.head_exists)?;
-        Ok(())
+        let head_needs_recovery = self.validate_recoverable_head(inventory.head_exists)?;
+        Ok((inventory, head_needs_recovery))
+    }
+
+    fn read_record_for_recovery(
+        &self,
+        inventory: &RunInventory,
+        sequence: u64,
+        name: &std::ffi::OsStr,
+    ) -> Result<Vec<u8>> {
+        #[cfg(unix)]
+        if fs::symlink_metadata(self.run_root.direct_child(name)?)?.nlink() == 2 {
+            self.verify_boundaries()?;
+            // Inventory has proved that only the final published record has
+            // two links, both inside this run and bound to its matching temp.
+            // Read without unlinking: the complete MAC chain must authenticate
+            // before recover_temporary_files may remove the publication temp.
+            let [(temp_sequence, temp_name)] = inventory.record_temps.as_slice() else {
+                bail!("published checkpoint record has ambiguous crash residue");
+            };
+            if *temp_sequence != sequence
+                || inventory.records.keys().next_back().copied() != Some(sequence)
+            {
+                bail!("published checkpoint record has no matching final crash temp");
+            }
+            return BoundedRegularReader::read_direct_published_pair(
+                &self.run_root,
+                name,
+                temp_name,
+                S::MAX_RECORD_BYTES,
+            );
+        }
+        #[cfg(not(unix))]
+        let _ = (inventory, sequence);
+        BoundedRegularReader::read_direct(&self.run_root, name, S::MAX_RECORD_BYTES)
     }
 
     fn load_without_recovery(&mut self) -> Result<()> {
@@ -677,7 +734,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         Ok(())
     }
 
-    fn verify_or_recover_head(&self, head_exists: bool) -> Result<()> {
+    fn validate_recoverable_head(&self, head_exists: bool) -> Result<bool> {
         let last_sequence =
             u64::try_from(self.records.len()).context("checkpoint count overflowed")?;
         let last_mac = self
@@ -689,7 +746,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             if last_sequence != 1 {
                 bail!("checkpoint journal head is missing outside the recoverable first append");
             }
-            return self.write_head();
+            return Ok(true);
         }
         let bytes = BoundedRegularReader::read_direct(
             &self.run_root,
@@ -708,7 +765,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             if head.last_record_mac != last_mac || head.record_bytes != self.record_bytes {
                 bail!("checkpoint journal head does not match its published tail");
             }
-            return Ok(());
+            return Ok(false);
         }
         if head.sequence.saturating_add(1) != last_sequence {
             bail!("checkpoint journal head rollback exceeds the single crash window");
@@ -722,7 +779,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         if head.last_record_mac != expected_old_mac || head.record_bytes >= self.record_bytes {
             bail!("checkpoint journal head rollback evidence is inconsistent");
         }
-        self.write_head()
+        Ok(true)
     }
 
     fn publish_head(&mut self) -> Result<()> {
@@ -1707,6 +1764,184 @@ mod tests {
         assert_eq!(journal.records().len(), 2);
         assert!(!run.join(temp_name).exists());
         assert!(run.join(record_file_name(2)).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_hardlink_residue_recovers_under_existing_lock_with_stale_head() {
+        for stale_head in [false, true] {
+            let (_temp, repo_path, identity) = journal_with_two_records();
+            let run = repo_path
+                .join(".git/maco/state")
+                .join(JOURNAL_ROOT_NAME)
+                .join(&identity.run_id);
+            let prior_head = fs::read(run.join(HEAD_FILE_NAME)).unwrap();
+            let mut journal = reopen(&repo_path, &identity).unwrap();
+            journal
+                .append("command_finished", None, &serde_json::json!({"v": 3}))
+                .unwrap();
+            drop(journal);
+            if stale_head {
+                fs::write(run.join(HEAD_FILE_NAME), prior_head).unwrap();
+            }
+            let record_name = record_file_name(3);
+            let temp_name = record_temp_name(3, &"a".repeat(64));
+            let record = run.join(&record_name);
+            let temp = run.join(&temp_name);
+            fs::hard_link(&record, &temp).unwrap();
+            let bytes = fs::read(&record).unwrap();
+            let head = fs::read(run.join(HEAD_FILE_NAME)).unwrap();
+            let root = SafeRoot::open_existing(&run).unwrap();
+            // The generic reader remains single-link, and status cannot scavenge.
+            assert!(BoundedRegularReader::read_direct(
+                &root,
+                &record_name,
+                CheckpointJournalSpec::MAX_RECORD_BYTES,
+            )
+            .is_err());
+            let repository = crate::git_repository::open(&repo_path).unwrap();
+            let auth = || RepositoryAuthenticator::open_existing(repository.commondir()).unwrap();
+            assert!(StateJournal::open_instance_read_only(auth(), &identity.run_id).is_err());
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+            assert_eq!(fs::read(run.join(HEAD_FILE_NAME)).unwrap(), head);
+            assert!(temp.exists());
+
+            let lock =
+                BoundStateLock::try_acquire_existing_exclusive(&root, RUN_LOCK_NAME).unwrap();
+            assert!(StateJournal::open_published_instance(auth(), &identity.run_id).is_err());
+            assert!(temp.exists(), "contending opener must not clean residue");
+            assert_eq!(fs::read(run.join(HEAD_FILE_NAME)).unwrap(), head);
+            drop(lock);
+
+            let journal = StateJournal::open_published_instance(auth(), &identity.run_id).unwrap();
+            assert_eq!(journal.records().len(), 3);
+            assert_eq!(fs::read(&record).unwrap(), bytes);
+            assert!(!temp.exists());
+            assert_eq!(fs::symlink_metadata(&record).unwrap().nlink(), 1);
+            assert!(BoundStateLock::try_acquire_existing_exclusive(&root, RUN_LOCK_NAME).is_err());
+            drop(journal);
+            StateJournal::open_instance_read_only(auth(), &identity.run_id)
+                .expect("recovery leaves an authenticated exact head and no residue");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_residue_is_unchanged_when_head_authentication_or_range_fails() {
+        for case in ["malformed", "bad-mac", "ahead", "rollback", "inconsistent"] {
+            let (_temp, repo_path, identity) = journal_with_two_records();
+            let mut journal = reopen(&repo_path, &identity).unwrap();
+            journal
+                .append("command_finished", None, &serde_json::json!({"v": 3}))
+                .unwrap();
+            let run = journal.run_root.path().to_path_buf();
+            let head_path = run.join(HEAD_FILE_NAME);
+            let mut head: JournalHead =
+                serde_json::from_slice(&fs::read(&head_path).unwrap()).unwrap();
+            match case {
+                "ahead" => head.sequence = 4,
+                "rollback" => head.sequence = 1,
+                "inconsistent" => head.record_bytes = 1,
+                "bad-mac" => head.record_bytes -= 1,
+                "malformed" => {}
+                _ => unreachable!(),
+            }
+            if case != "bad-mac" {
+                head.mac = journal
+                    .authenticator
+                    .sign(HEAD_DOMAIN, &head_mac_payload(&head).unwrap())
+                    .unwrap();
+            }
+            let head_bytes = if case == "malformed" {
+                b"{}\n".to_vec()
+            } else {
+                serde_json::to_vec(&head).unwrap()
+            };
+            fs::write(&head_path, &head_bytes).unwrap();
+            drop(journal);
+            let record = run.join(record_file_name(3));
+            let temp = run.join(record_temp_name(3, &"a".repeat(64)));
+            fs::hard_link(&record, &temp).unwrap();
+            let record_bytes = fs::read(&record).unwrap();
+            let error = reopen(&repo_path, &identity)
+                .err()
+                .expect("invalid head must refuse");
+            let expected = match case {
+                "malformed" => "head is truncated or malformed",
+                "bad-mac" => "authentication tag verification failed",
+                "ahead" => "published tail was truncated",
+                "rollback" => "rollback exceeds the single crash window",
+                "inconsistent" => "head does not match its published tail",
+                _ => unreachable!(),
+            };
+            assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+            assert_eq!(fs::read(&head_path).unwrap(), head_bytes, "{case}");
+            assert_eq!(fs::read(&record).unwrap(), record_bytes, "{case}");
+            assert_eq!(fs::read(&temp).unwrap(), record_bytes, "{case}");
+            assert_eq!(fs::symlink_metadata(&record).unwrap().nlink(), 2, "{case}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn authorized_recovery_cleans_residue_before_head_publication() {
+        let (_temp, repo_path, identity) = journal_with_two_records();
+        let mut journal = reopen(&repo_path, &identity).unwrap();
+        let run = journal.run_root.path().to_path_buf();
+        let head_path = run.join(HEAD_FILE_NAME);
+        let old_head = fs::read(&head_path).unwrap();
+        journal
+            .append("command_finished", None, &serde_json::json!({"v": 3}))
+            .unwrap();
+        fs::write(&head_path, &old_head).unwrap();
+        let record = run.join(record_file_name(3));
+        let temp = run.join(record_temp_name(3, &"a".repeat(64)));
+        fs::hard_link(&record, &temp).unwrap();
+        set_journal_head_write_fault();
+        let error = journal.recover_failed_append().unwrap_err();
+        assert!(format!("{error:#}").contains("injected checkpoint journal head write failure"));
+        assert!(
+            !temp.exists(),
+            "cleanup must precede the attempted head write"
+        );
+        assert_eq!(fs::symlink_metadata(&record).unwrap().nlink(), 1);
+        assert_eq!(fs::read(&head_path).unwrap(), old_head);
+        journal
+            .recover_failed_append()
+            .expect("authorized retry repairs the head");
+        drop(journal);
+        let repository = crate::git_repository::open(&repo_path).unwrap();
+        let auth = RepositoryAuthenticator::open_existing(repository.commondir()).unwrap();
+        StateJournal::open_instance_read_only(auth, &identity.run_id)
+            .expect("authorized recovery leaves an exact authenticated head");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn published_hardlink_residue_is_not_removed_before_record_authentication() {
+        let (_temp, repo_path, identity) = journal_with_two_records();
+        let run = repo_path
+            .join(".git/maco/state")
+            .join(JOURNAL_ROOT_NAME)
+            .join(&identity.run_id);
+        let record = run.join(record_file_name(2));
+        let temp = run.join(record_temp_name(2, &"a".repeat(64)));
+        fs::hard_link(&record, &temp).unwrap();
+        let mut forged: JournalRecord =
+            serde_json::from_slice(&fs::read(&record).unwrap()).unwrap();
+        forged.payload = serde_json::json!({"forged": true});
+        let bytes = serde_json::to_vec(&forged).unwrap();
+        fs::write(&record, &bytes).unwrap();
+        let head = fs::read(run.join(HEAD_FILE_NAME)).unwrap();
+
+        let error = reopen(&repo_path, &identity)
+            .err()
+            .expect("forged record must fail authentication before cleanup");
+        assert!(format!("{error:#}").contains("repository authentication tag verification failed"));
+        assert_eq!(fs::read(&record).unwrap(), bytes);
+        assert_eq!(fs::read(&temp).unwrap(), bytes);
+        assert_eq!(fs::symlink_metadata(&record).unwrap().nlink(), 2);
+        assert_eq!(fs::read(run.join(HEAD_FILE_NAME)).unwrap(), head);
     }
 
     #[test]
