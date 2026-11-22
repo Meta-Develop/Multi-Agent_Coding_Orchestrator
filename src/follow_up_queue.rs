@@ -1166,17 +1166,43 @@ impl GeneratedFollowUpQueue {
         Ok(Self { journal, snapshot })
     }
 
-    /// Opens the queue identified by the immutable source execution identity,
-    /// if that queue has been durably created.
-    ///
-    /// This read path intentionally does not initialize an absent queue. It is
-    /// used after a cascade error to distinguish a conclusively pre-dispatch
-    /// failure from an already-started generated effect without manufacturing
-    /// new queue state while reporting the failure.
+    /// Opens an existing queue for authorized recovery, including interrupted
+    /// journal publication. Evidence inspections must use the read-only opener.
     pub(crate) fn open_existing_for_source_execution(
         authenticator: RepositoryAuthenticator,
         source_supervisor_run_id: &str,
         source_normalized_plan_sha256: &str,
+    ) -> Result<Option<Self>> {
+        Self::open_existing_source_execution(
+            authenticator,
+            source_supervisor_run_id,
+            source_normalized_plan_sha256,
+            false,
+        )
+    }
+
+    /// Authenticates existing queue evidence without creating locks, scavenging
+    /// residue, or repairing its head. Transitional state requires recovery.
+    /// Returns snapshot data only, with no journal or append capability.
+    pub(crate) fn inspect_existing_for_source_execution(
+        authenticator: RepositoryAuthenticator,
+        source_supervisor_run_id: &str,
+        source_normalized_plan_sha256: &str,
+    ) -> Result<Option<GeneratedFollowUpQueueSnapshot>> {
+        Self::open_existing_source_execution(
+            authenticator,
+            source_supervisor_run_id,
+            source_normalized_plan_sha256,
+            true,
+        )
+        .map(|queue| queue.map(|queue| queue.snapshot))
+    }
+
+    fn open_existing_source_execution(
+        authenticator: RepositoryAuthenticator,
+        source_supervisor_run_id: &str,
+        source_normalized_plan_sha256: &str,
+        read_only: bool,
     ) -> Result<Option<Self>> {
         validate_source_run_id(source_supervisor_run_id)?;
         validate_sha256_id(
@@ -1201,7 +1227,11 @@ impl GeneratedFollowUpQueue {
         if !journal_root.direct_child_exists(&journal_slot_id)? {
             return Ok(None);
         }
-        let journal = QueueJournal::open_instance(authenticator, &journal_slot_id)?;
+        let journal = if read_only {
+            QueueJournal::open_instance_read_only(authenticator, &journal_slot_id)?
+        } else {
+            QueueJournal::open_instance(authenticator, &journal_slot_id)?
+        };
         let snapshot = replay_queue_records(
             &journal_slot_id,
             journal.records(),
@@ -4384,6 +4414,198 @@ mod tests {
             reopened.snapshot().item(&ids[1]).expect("pending").phase(),
             GeneratedFollowUpQueuePhase::Enqueued
         );
+    }
+
+    #[test]
+    fn post_cascade_error_evidence_inspection_preserves_queue_state() {
+        use crate::artifacts::{
+            ArtifactFileDisposition, ArtifactRunReader, ArtifactRunWriter, RunArtifactFamily,
+        };
+        use crate::supervise::{
+            generated_follow_up_dispatch_evidence_after_cascade_error,
+            GeneratedFollowUpDispatchEvidence,
+        };
+
+        fn inventory(root: &Path) -> BTreeMap<std::path::PathBuf, Vec<u8>> {
+            fn visit(root: &Path, path: &Path, files: &mut BTreeMap<std::path::PathBuf, Vec<u8>>) {
+                let bytes = if path.is_dir() {
+                    for entry in fs::read_dir(path).unwrap() {
+                        visit(root, &entry.unwrap().path(), files);
+                    }
+                    Vec::new()
+                } else {
+                    fs::read(path).unwrap()
+                };
+                files.insert(path.strip_prefix(root).unwrap().to_path_buf(), bytes);
+            }
+            let mut files = BTreeMap::new();
+            visit(root, root, &mut files);
+            files
+        }
+
+        for case in [
+            "stable",
+            "started",
+            "missing-lock",
+            "lagging-head",
+            "head-temp",
+            "record-temp",
+        ] {
+            let (_temp, repo) = repository();
+            let mut source = source(&repo, &format!("error-evidence-{case}"));
+            source.outer_entrypoint = GeneratedFollowUpQueueEntrypoint::AutopilotRun;
+            let mut queue =
+                GeneratedFollowUpQueue::create(authenticator(&repo), source.clone(), bounds(1))
+                    .unwrap();
+            queue
+                .enqueue_all_before_dispatch(&[generated_task("01")])
+                .unwrap();
+            let journal = queue
+                .journal
+                .root()
+                .path()
+                .join(queue.journal.instance_id());
+            let item_id = queue.snapshot().pending_item_ids()[0].to_string();
+            let prior_head = fs::read(journal.join(".head.json")).unwrap();
+            queue.claim(&item_id).unwrap();
+            if case == "started" {
+                queue.mark_dispatch_started(&item_id).unwrap();
+            }
+            let next_sequence = queue.journal.records().len() + 1;
+            drop(queue);
+            match case {
+                "missing-lock" => {
+                    fs::remove_file(journal.join(".generated-follow-up-queue.lock")).unwrap();
+                }
+                "lagging-head" => fs::write(journal.join(".head.json"), prior_head).unwrap(),
+                "head-temp" | "record-temp" => {
+                    let name = if case == "head-temp" {
+                        format!(".head-{}.tmp", "a".repeat(64))
+                    } else {
+                        format!(".record-{next_sequence:020}-{}.tmp", "a".repeat(64))
+                    };
+                    let path = journal.join(name);
+                    fs::write(&path, b"partial publication\n").unwrap();
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt;
+                        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+                    }
+                }
+                _ => {}
+            }
+            // A safely finalized artifact from an unsupported runtime cannot be
+            // decoded as a supervisor report. Exercise the queue fallback without
+            // obstructing artifact directories or breaking writer authentication.
+            let source_run_id =
+                crate::orchestrator::RunId::new(source.source_supervisor_run_id()).unwrap();
+            let mut report: serde_json::Value = serde_json::from_str(include_str!(
+                "../fixtures/schemas/supervisor-final-report-v1.valid.json"
+            ))
+            .unwrap();
+            report["run_id"] = serde_json::json!(source_run_id.as_str());
+            report["run_dir"] = serde_json::json!(RunArtifactFamily::Supervise
+                .run_root()
+                .join(source_run_id.as_str()));
+            report["runtime"] = serde_json::json!("future-runtime");
+            let mut writer = ArtifactRunWriter::reserve(
+                &repo,
+                RunArtifactFamily::Supervise,
+                source_run_id.clone(),
+                "queue-evidence-test",
+            )
+            .unwrap();
+            let report_path = RunArtifactFamily::Supervise.final_report_relative_path();
+            writer
+                .write_json(
+                    &report_path,
+                    &report,
+                    ArtifactFileDisposition::PrivateEvidence,
+                )
+                .unwrap();
+            writer.finalize(&report_path, false).unwrap();
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &source_run_id)
+                .expect("source artifact must remain authenticated");
+            let status_error =
+                crate::supervise::supervisor_status(&repo, source_run_id.clone()).unwrap_err();
+            let status_error = format!("{status_error:#}");
+            assert!(
+                status_error.contains("unknown variant `future-runtime`"),
+                "{status_error}"
+            );
+            let before = inventory(&repo);
+            // The inspection API returns data only, even for a healthy queue.
+            let inspection: Result<Option<GeneratedFollowUpQueueSnapshot>> =
+                GeneratedFollowUpQueue::inspect_existing_for_source_execution(
+                    crate::artifacts::repository_authenticator_key_only(&repo)
+                        .expect("read-only repository authenticator"),
+                    source.source_supervisor_run_id(),
+                    source.source_normalized_plan_sha256(),
+                );
+            if matches!(case, "stable" | "started") {
+                let snapshot = inspection.unwrap().unwrap();
+                assert_eq!(
+                    snapshot.item(&item_id).unwrap().phase(),
+                    if case == "started" {
+                        GeneratedFollowUpQueuePhase::DispatchStarted
+                    } else {
+                        GeneratedFollowUpQueuePhase::Claimed
+                    }
+                );
+            } else {
+                assert!(inspection.is_err(), "{case} must require recovery");
+            }
+            assert_eq!(inventory(&repo), before, "inspection: {case}");
+            let evidence = generated_follow_up_dispatch_evidence_after_cascade_error(
+                &repo,
+                source.source_normalized_plan_sha256(),
+                &source_run_id,
+                &crate::orchestrator::RunId::new(source.outer_command_run_id()).unwrap(),
+            );
+            if case == "stable" {
+                assert_eq!(
+                    evidence.unwrap(),
+                    GeneratedFollowUpDispatchEvidence::NoDurableDispatchStart
+                );
+            } else if case == "started" {
+                assert!(matches!(
+                    evidence.unwrap(),
+                    GeneratedFollowUpDispatchEvidence::DurableDispatchStart { .. }
+                ));
+            } else {
+                assert!(evidence.is_err(), "{case} must require recovery");
+            }
+            assert_eq!(inventory(&repo), before, "{case}");
+
+            // Explicit resume still recovers interrupted publication.
+            let mut recovered = GeneratedFollowUpQueue::open_existing_for_source_execution(
+                authenticator(&repo),
+                source.source_supervisor_run_id(),
+                source.source_normalized_plan_sha256(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(
+                recovered.snapshot().item(&item_id).unwrap().phase(),
+                if case == "started" {
+                    GeneratedFollowUpQueuePhase::DispatchStarted
+                } else {
+                    GeneratedFollowUpQueuePhase::Claimed
+                }
+            );
+            if case != "started" {
+                recovered.mark_dispatch_started(&item_id).unwrap();
+                assert_eq!(
+                    recovered
+                        .replay_snapshot()
+                        .unwrap()
+                        .item(&item_id)
+                        .unwrap()
+                        .phase(),
+                    GeneratedFollowUpQueuePhase::DispatchStarted
+                );
+            }
+        }
     }
 
     #[test]

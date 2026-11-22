@@ -880,7 +880,7 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
             Err(_) => (pre_dispatch_source_plan_sha256.to_string(), false),
         };
     let authenticator = repository_authenticator_key_only(repo)?;
-    let Some(queue) = GeneratedFollowUpQueue::open_existing_for_source_execution(
+    let Some(snapshot) = GeneratedFollowUpQueue::inspect_existing_for_source_execution(
         authenticator,
         source_supervisor_run_id.as_str(),
         &source_plan_sha256,
@@ -894,7 +894,7 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
             }
         });
     };
-    let source = queue.snapshot().source();
+    let source = snapshot.source();
     if source.outer_entrypoint() != GeneratedFollowUpQueueEntrypoint::AutopilotRun
         || source.outer_command_run_id() != outer_command_run_id.as_str()
     {
@@ -903,7 +903,7 @@ pub(crate) fn generated_follow_up_dispatch_evidence_after_cascade_error(
 
     let mut authenticated_start = false;
     let mut started_but_not_process_observable = false;
-    for item in queue.snapshot().items().values() {
+    for item in snapshot.items().values() {
         if matches!(
             item.phase(),
             GeneratedFollowUpQueuePhase::Enqueued | GeneratedFollowUpQueuePhase::Claimed
