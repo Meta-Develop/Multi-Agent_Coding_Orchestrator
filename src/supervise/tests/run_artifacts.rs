@@ -2704,7 +2704,7 @@ fn supervise_scratch_rebind_is_refused_without_deleting_replacement() {
 
 #[test]
 fn status_and_resume_do_not_repair_an_incomplete_checkpoint_head() {
-    let (_temp, repo) = injected_repository();
+    let (temp, repo) = injected_repository();
     let run_id = RunId::new("read-only-status-checkpoint").expect("valid run id");
     let writer = ArtifactRunWriter::reserve(
         &repo,
@@ -2741,19 +2741,32 @@ fn status_and_resume_do_not_repair_an_incomplete_checkpoint_head() {
         .join(crate::state_journal::JOURNAL_ROOT_NAME)
         .join(run_id.as_str())
         .join(".head.json");
-    fs::remove_file(&head).expect("remove checkpoint head to require recovery");
+    let saved_head = temp.path().join("saved-head");
+    fs::rename(&head, &saved_head).expect("remove checkpoint head to require recovery");
 
     let status = supervisor_status(&repo, run_id.clone()).expect("typed read-only status");
     assert_eq!(status.lifecycle, SupervisorRunLifecycle::Interrupted);
     assert!(!head.exists(), "status must not repair checkpoint state");
 
-    let resume = resume_supervisor_run(&repo, run_id).expect("typed read-only resume refusal");
+    let resume =
+        resume_supervisor_run(&repo, run_id.clone()).expect("typed read-only resume refusal");
     assert_eq!(resume.lifecycle, SupervisorRunLifecycle::Interrupted);
     assert!(!resume.resumed);
     assert!(
         !head.exists(),
         "resume preflight must not repair before admission"
     );
+
+    fs::rename(saved_head, &head).expect("restore published head");
+    let lock = head.with_file_name(".resume.lock");
+    fs::remove_file(&lock).expect("remove the stable run lock");
+    let status = supervisor_status(&repo, run_id.clone()).expect("status with missing lock");
+    assert_eq!(status.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(!lock.exists());
+    let resume = resume_supervisor_run(&repo, run_id).expect("resume with missing lock");
+    assert_eq!(resume.lifecycle, SupervisorRunLifecycle::Interrupted);
+    assert!(!resume.resumed);
+    assert!(!lock.exists());
 }
 
 #[test]

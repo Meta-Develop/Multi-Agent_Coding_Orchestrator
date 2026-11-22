@@ -322,8 +322,12 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
         if run_root.identity() != &expected.run_directory_identity {
             bail!("authenticated checkpoint run directory identity changed");
         }
-        let run_lock = BoundStateLock::try_acquire_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
-            .with_context(|| format!("{} instance is active elsewhere", S::NAMESPACE))?;
+        let run_lock = if require_published_head {
+            BoundStateLock::try_acquire_existing_exclusive(&run_root, S::INSTANCE_LOCK_NAME)?
+        } else {
+            BoundStateLock::try_acquire_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
+                .with_context(|| format!("{} instance is active elsewhere", S::NAMESPACE))?
+        };
         let mut journal = Self {
             authenticator,
             journal_root,
@@ -365,13 +369,7 @@ impl<S: JournalSpec> AuthenticatedStateJournal<S> {
             bail!("authenticated checkpoint run directory identity changed");
         }
         let run_lock =
-            BoundStateLock::try_acquire_existing_exclusive(&run_root, S::INSTANCE_LOCK_NAME)
-                .with_context(|| {
-                    format!(
-                        "{} instance is active, incomplete, or missing its stable lock",
-                        S::NAMESPACE
-                    )
-                })?;
+            BoundStateLock::try_acquire_existing_exclusive(&run_root, S::INSTANCE_LOCK_NAME)?;
         let mut journal = Self {
             authenticator,
             journal_root,
