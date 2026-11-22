@@ -3936,12 +3936,10 @@ pub(crate) fn resume_supervisor_plan_file_cascade_with_runner(
         SupervisorRunLifecycle::Finalized => status
             .final_report
             .context("finalized injected cascade source report is missing")?,
-        SupervisorRunLifecycle::Resumable => {
+        SupervisorRunLifecycle::Resumable | SupervisorRunLifecycle::Interrupted => {
             plan_api::source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?
         }
-        SupervisorRunLifecycle::Active
-        | SupervisorRunLifecycle::Interrupted
-        | SupervisorRunLifecycle::Uncertain => {
+        SupervisorRunLifecycle::Active | SupervisorRunLifecycle::Uncertain => {
             bail!("injected cascade source is not safely finalized or finalization-resumable")
         }
     };

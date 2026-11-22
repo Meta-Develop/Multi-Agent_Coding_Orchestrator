@@ -2936,6 +2936,22 @@ fn interrupted_final_report_checkpoint_with_pricing(
     run_id: &RunId,
     loaded: Option<LoadedSupervisorPlan>,
 ) -> (RunBudgetReport, PathBuf, PathClaim) {
+    interrupted_final_report_checkpoint_with_recovery_state(repo, run_id, loaded, false)
+}
+
+fn checkpoint_journal_dir(repo: &Path, run_id: &RunId) -> PathBuf {
+    repo.join(".git/maco/state")
+        .join(crate::state_journal::JOURNAL_ROOT_NAME)
+        .join(run_id.as_str())
+}
+
+fn interrupted_final_report_checkpoint_with_recovery_state(
+    repo: &Path,
+    run_id: &RunId,
+    loaded: Option<LoadedSupervisorPlan>,
+    stale_head: bool,
+) -> (RunBudgetReport, PathBuf, PathClaim) {
+    let write_snapshot = loaded.is_some();
     let LoadedSupervisorPlan {
         plan,
         consultant,
@@ -2956,7 +2972,7 @@ fn interrupted_final_report_checkpoint_with_pricing(
         "resume-checkpoint-test",
     )
     .expect("reserve interrupted artifact run");
-    if plan_metadata.operator_pricing.is_some() {
+    if write_snapshot {
         write_plan_snapshot(
             &mut writer,
             Path::new("assignments/supervisor-plan.json"),
@@ -3051,6 +3067,8 @@ fn interrupted_final_report_checkpoint_with_pricing(
     let mut report = artifact_test_final_report(run_id);
     report.run_budget = Some(budget.clone());
     let report_bytes = encode_final_report(&report).expect("encode planned final report");
+    let head_path = checkpoint_journal_dir(repo, run_id).join(".head.json");
+    let prior_head = stale_head.then(|| fs::read(&head_path).expect("read pre-plan head"));
     install_checkpoint_failure(run_id.as_str(), "after:final_report_planned");
     let error = checkpoint
         .final_report_planned(
@@ -3062,7 +3080,240 @@ fn interrupted_final_report_checkpoint_with_pricing(
     assert!(format!("{error:#}").contains("after phase 'final_report_planned'"));
     drop(checkpoint);
     drop(writer);
+    if let Some(prior_head) = prior_head {
+        fs::write(head_path, prior_head).expect("restore authenticated head one record behind");
+    }
     (budget, side_effect, retained_claim)
+}
+
+type ResumeStateInventory = BTreeMap<
+    PathBuf,
+    (
+        crate::safe_state::FileIdentity,
+        std::time::SystemTime,
+        Vec<u8>,
+    ),
+>;
+
+// Include directories, identities and modification times so status cannot
+// silently create, remove, replace, or rewrite state.
+fn resume_state_inventory(root: &Path) -> ResumeStateInventory {
+    fn visit(root: &Path, path: &Path, files: &mut ResumeStateInventory) {
+        let metadata = fs::symlink_metadata(path).expect("stat resume state");
+        let contents = if metadata.is_dir() {
+            for entry in fs::read_dir(path).expect("list resume state") {
+                visit(root, &entry.expect("resume state entry").path(), files);
+            }
+            Vec::new()
+        } else {
+            fs::read(path).expect("read resume state")
+        };
+        files.insert(
+            path.strip_prefix(root).unwrap().to_path_buf(),
+            (
+                crate::safe_state::identity_for_path(path).unwrap(),
+                metadata.modified().unwrap(),
+                contents,
+            ),
+        );
+    }
+    let mut files = BTreeMap::new();
+    visit(root, root, &mut files);
+    files
+}
+
+#[test]
+fn cascade_resume_recovers_transitional_checkpoint_while_status_is_read_only() {
+    skip_without_containment!();
+    for injected in [false, true] {
+        for case in [
+            "stale-head",
+            "head-temp",
+            "record-temp",
+            "published-record-temp",
+        ] {
+            if case == "published-record-temp" && !cfg!(unix) {
+                continue;
+            }
+            let (temp, repo) = injected_repository();
+            let run_id = RunId::new(format!("cascade-recovery-{case}-{injected}")).unwrap();
+            let options = injected_options(&repo, temp.path(), run_id.as_str());
+            let plan = injected_plan(injected_assignment(false), 0);
+            let document = serde_json::to_string(&plan).unwrap();
+            fs::write(&options.plan_file, &document).unwrap();
+            let loaded = parse_supervisor_plan_with_consultant(&document).unwrap();
+            let (budget, side_effect, retained_claim) =
+                interrupted_final_report_checkpoint_with_recovery_state(
+                    &repo,
+                    &run_id,
+                    Some(loaded),
+                    case == "stale-head",
+                );
+            let journal = checkpoint_journal_dir(&repo, &run_id);
+            let head: serde_json::Value =
+                serde_json::from_slice(&fs::read(journal.join(".head.json")).unwrap()).unwrap();
+            let tail = head["sequence"].as_u64().unwrap() + u64::from(case == "stale-head");
+            let record: serde_json::Value = serde_json::from_slice(
+                &fs::read(journal.join(format!("{tail:020}.json"))).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(record["phase"], "final_report_planned");
+            let temp_path = match case {
+                "head-temp" => Some(journal.join(format!(".head-{}.tmp", "a".repeat(64)))),
+                "record-temp" => {
+                    Some(journal.join(format!(".record-{:020}-{}.tmp", tail + 1, "a".repeat(64))))
+                }
+                "published-record-temp" => {
+                    Some(journal.join(format!(".record-{tail:020}-{}.tmp", "a".repeat(64))))
+                }
+                _ => None,
+            };
+            if let Some(path) = &temp_path {
+                if case == "published-record-temp" {
+                    fs::hard_link(journal.join(format!("{tail:020}.json")), path).unwrap();
+                } else {
+                    fs::write(path, b"partial publication\n").unwrap();
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    fs::set_permissions(path, fs::Permissions::from_mode(0o600)).unwrap();
+                }
+            }
+            let before = resume_state_inventory(&repo);
+            let status = supervisor_status(&repo, run_id.clone()).unwrap();
+            assert_eq!(
+                status.lifecycle,
+                SupervisorRunLifecycle::Interrupted,
+                "{case}"
+            );
+            assert_eq!(
+                resume_state_inventory(&repo),
+                before,
+                "status mutated {case}"
+            );
+
+            let outcome = if injected {
+                let mut no_dispatch = |_command: &ExternalAgentCommand| {
+                    panic!("cascade finalization recovery must not redispatch completed work")
+                };
+                resume_supervisor_plan_file_cascade_with_runner(options, &mut no_dispatch)
+            } else {
+                // Exercise the production entrypoint and its Inbox PR admission
+                // guard, not just direct finalization or the injected wrapper.
+                resume_supervisor_plan_file_cascade_with_concurrency_policy(
+                    options,
+                    SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+                )
+            }
+            .unwrap_or_else(|error| panic!("cascade recovery failed for {case}: {error:#}"));
+            assert!(outcome.follow_up_cascade_success, "{outcome:#?}");
+            assert_eq!(outcome.source_report.run_budget.as_ref(), Some(&budget));
+            assert!(outcome.follow_up_reports.is_empty());
+            assert!(outcome.follow_up_gate_denials.is_empty());
+            assert_eq!(fs::read(side_effect).unwrap(), b"execution-count=1\n");
+            assert_eq!(
+                SyncStore::open(&repo).unwrap().snapshot().unwrap(),
+                vec![retained_claim]
+            );
+            if let Some(path) = temp_path {
+                assert!(
+                    !path.exists(),
+                    "resume must clean recoverable crash residue"
+                );
+            }
+            ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id)
+                .expect("cascade resume publishes authenticated finalization");
+            let before = resume_state_inventory(&repo);
+            assert_eq!(
+                supervisor_status(&repo, run_id).unwrap().lifecycle,
+                SupervisorRunLifecycle::Finalized
+            );
+            assert_eq!(resume_state_inventory(&repo), before);
+        }
+    }
+}
+
+#[test]
+fn cascade_resume_transitional_checkpoint_still_fails_closed() {
+    for case in [
+        "missing-head",
+        "missing-lock",
+        "contention",
+        "corrupt-record",
+        "corrupt-head",
+    ] {
+        let (temp, repo) = injected_repository();
+        let run_id = RunId::new(format!("cascade-recovery-refuses-{case}")).unwrap();
+        let options = injected_options(&repo, temp.path(), run_id.as_str());
+        fs::write(
+            &options.plan_file,
+            serde_json::to_vec(&injected_plan(injected_assignment(false), 0)).unwrap(),
+        )
+        .unwrap();
+        interrupted_final_report_checkpoint_with_recovery_state(&repo, &run_id, None, true);
+        let journal = checkpoint_journal_dir(&repo, &run_id);
+        let _lock = match case {
+            "missing-head" => {
+                fs::remove_file(journal.join(".head.json")).unwrap();
+                None
+            }
+            "missing-lock" => {
+                fs::remove_file(journal.join(".resume.lock")).unwrap();
+                None
+            }
+            "contention" => Some(
+                crate::artifacts::state_auth::BoundStateLock::try_acquire_existing_exclusive(
+                    &crate::safe_state::SafeRoot::open_existing(&journal).unwrap(),
+                    ".resume.lock",
+                )
+                .unwrap(),
+            ),
+            "corrupt-record" => {
+                fs::write(journal.join(format!("{:020}.json", 5)), b"{}\n").unwrap();
+                None
+            }
+            "corrupt-head" => {
+                fs::write(journal.join(".head.json"), b"{}\n").unwrap();
+                None
+            }
+            _ => unreachable!(),
+        };
+        let before = resume_state_inventory(&repo);
+        let status = supervisor_status(&repo, run_id.clone()).unwrap();
+        assert_eq!(
+            status.lifecycle,
+            if case == "contention" {
+                SupervisorRunLifecycle::Active
+            } else {
+                SupervisorRunLifecycle::Interrupted
+            }
+        );
+        assert_eq!(resume_state_inventory(&repo), before);
+        let error = resume_supervisor_plan_file_cascade_with_concurrency_policy(
+            options.clone(),
+            SupervisorConcurrencyPolicy::Fixed(NonZeroUsize::MIN),
+        )
+        .expect_err("production cascade must refuse unsafe checkpoint state");
+        let expected = match case {
+            "missing-head" => "head is missing",
+            "missing-lock" => "state lock is missing",
+            "contention" => "source run is active",
+            "corrupt-record" => "malformed record",
+            "corrupt-head" => "head is truncated or malformed",
+            _ => unreachable!(),
+        };
+        assert!(format!("{error:#}").contains(expected), "{case}: {error:#}");
+        let mut no_dispatch = |_command: &ExternalAgentCommand| panic!("unsafe resume dispatched");
+        resume_supervisor_plan_file_cascade_with_runner(options, &mut no_dispatch)
+            .expect_err("injected cascade must refuse unsafe checkpoint state");
+        assert_eq!(
+            resume_state_inventory(&repo),
+            before,
+            "refusal mutated {case}"
+        );
+        assert!(ArtifactRunReader::open(&repo, RunArtifactFamily::Supervise, &run_id).is_err());
+    }
 }
 
 #[test]

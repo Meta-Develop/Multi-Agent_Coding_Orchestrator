@@ -6443,7 +6443,7 @@ fn refuse_inbox_pr_repair_generic_resume(
     run_id: &RunId,
     finalized: bool,
 ) -> Result<()> {
-    let checkpoint_head = match open_supervisor_checkpoint(repo, run_id) {
+    let checkpoint_head = match open_supervisor_checkpoint_for_resume(repo, run_id) {
         Ok((_writer, snapshot)) => snapshot.inbox_pr_source_head_oid,
         Err(_) if finalized => None,
         Err(error) => {
@@ -6491,7 +6491,9 @@ fn resume_generated_follow_up_cascade(
     let status = supervisor_status(&repo, run_id.clone())?;
     if matches!(
         status.lifecycle,
-        SupervisorRunLifecycle::Finalized | SupervisorRunLifecycle::Resumable
+        SupervisorRunLifecycle::Finalized
+            | SupervisorRunLifecycle::Resumable
+            | SupervisorRunLifecycle::Interrupted
     ) {
         refuse_inbox_pr_repair_generic_resume(
             &repo,
@@ -6506,7 +6508,10 @@ fn resume_generated_follow_up_cascade(
                 .context("finalized supervise cascade source report is missing")?,
             true,
         ),
-        SupervisorRunLifecycle::Resumable => (
+        // Read-only status refuses transitional heads and crash residue. The
+        // resume opener authenticates and recovers those under the existing
+        // run lock, and still refuses missing state or an unsafe lifecycle.
+        SupervisorRunLifecycle::Resumable | SupervisorRunLifecycle::Interrupted => (
             source_report_from_resume(resume_supervisor_run(&repo, run_id.clone())?)?,
             false,
         ),
@@ -6515,9 +6520,6 @@ fn resume_generated_follow_up_cascade(
         }
         SupervisorRunLifecycle::Uncertain => {
             bail!("cannot resume generated follow-up cascade from an uncertain source run")
-        }
-        SupervisorRunLifecycle::Interrupted => {
-            bail!("cannot resume generated follow-up cascade from an interrupted source run")
         }
     };
     if source_was_finalized {
